@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Version tag to publish (e.g. v0.0.87)'
+        description: 'Version tag to publish (e.g. v0.0.87). Must match package.json version.'
         required: true
 
 permissions:
@@ -29,6 +29,22 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify version matches tag
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          # On tag push: GITHUB_REF_NAME = "v0.0.87"
+          # On workflow_dispatch: use the manual input
+          RAW_TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          TAG_VERSION="${RAW_TAG#v}"
+          echo "package.json: $PKG_VERSION"
+          echo "git tag:      $TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Version mismatch! package.json ($PKG_VERSION) != tag ($TAG_VERSION)"
+            echo "   Fix: update package.json version to $TAG_VERSION before tagging."
+            exit 1
+          fi
+          echo "✅ Versions match: $PKG_VERSION"
 
       - name: Build
         run: npm run build

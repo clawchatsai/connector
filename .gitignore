@@ -3,7 +3,7 @@ dist/
 server.js
 *.bak
 *.old
-config.js
+/config.js
 data/
 uploads/
 debug/
