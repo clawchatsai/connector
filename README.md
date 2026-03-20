@@ -9,9 +9,9 @@ This plugin runs a local HTTP + WebSocket server alongside the OpenClaw gateway.
 - Stores your conversation history in a local SQLite database (one per workspace)
 - Serves the ClawChats web UI from your machine
 - Relays messages between your browser and the OpenClaw gateway
-- Optionally connects to the ClawChats signaling server (`wss://login.clawchats.ai`) for P2P features — device pairing, cross-device sync, and multi-user collaboration via WebRTC data channels
+- Optionally connects to the ClawChats signaling server (`wss://login.clawchats.ai`) to coordinate a P2P WebRTC connection between your browser and gateway — for device pairing and cross-device access
 
-The signaling server connection is used **only** for P2P session coordination. Your conversation content and agent messages never pass through it — they go directly between your browser and the local OpenClaw gateway.
+The plugin runs entirely on your machine. Conversation data never leaves your device — P2P means your browser connects directly to your gateway over encrypted WebRTC (DTLS). The signaling server at `wss://login.clawchats.ai` is used only to coordinate the initial connection handshake. After that, it's out of the picture.
 
 ## Installation
 
