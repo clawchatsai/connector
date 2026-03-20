@@ -106,7 +106,8 @@ export class MessageController {
     let threadsImported = 0, messagesImported = 0;
     const insertThread = db.prepare('INSERT OR IGNORE INTO threads (id, session_key, title, pinned, pin_order, model, last_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
     const insertMsg = db.prepare('INSERT OR IGNORE INTO messages (id, thread_id, role, content, status, metadata, seq, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    db.transaction(() => {
+    db.exec('BEGIN');
+    try {
       for (const t of body.threads) {
         if (!t.id) continue;
         const sessionKey = t.session_key || `agent:main:${ws.active}:chat:${t.id}`;
@@ -117,7 +118,11 @@ export class MessageController {
           if (insertMsg.run(m.id, t.id, m.role, m.content || '', m.status || 'sent', meta, m.seq || null, m.timestamp || Date.now(), m.created_at || Date.now()).changes > 0) messagesImported++;
         }
       }
-    })();
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
     send(res, 200, { ok: true, threadsImported, messagesImported });
   }
 }

@@ -12,9 +12,8 @@ await build({
   outfile: resolve(__dirname, 'server.js'),
   // Native modules and packages that must remain as runtime requires
   external: [
-    'better-sqlite3',
     'ws',
-    // Node built-ins are automatically external with platform:node
+    // Node built-ins (including node:sqlite) are automatically external with platform:node
   ],
   // Preserve dynamic requires (e.g. native module rebuild)
   keepNames: true,

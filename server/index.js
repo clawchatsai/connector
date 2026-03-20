@@ -46,8 +46,8 @@ export function createApp(config = {}) {
   function getDb(workspaceName) {
     if (dbCache.has(workspaceName)) return dbCache.get(workspaceName);
     const db = new Database(path.join(DATA_DIR, `${workspaceName}.db`));
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
+    db.exec('PRAGMA journal_mode = WAL');
+    db.exec('PRAGMA foreign_keys = ON');
     migrate(db);
     dbCache.set(workspaceName, db);
     return db;
@@ -62,7 +62,7 @@ export function createApp(config = {}) {
     get() {
       if (_globalDb) return _globalDb;
       _globalDb = new Database(path.join(DATA_DIR, 'global.db'));
-      _globalDb.pragma('journal_mode = WAL');
+      _globalDb.exec('PRAGMA journal_mode = WAL');
       _globalDb.exec(`CREATE TABLE IF NOT EXISTS custom_emojis (name TEXT NOT NULL, pack TEXT NOT NULL DEFAULT 'slackmojis', url TEXT NOT NULL, mime_type TEXT, created_at INTEGER DEFAULT (strftime('%s','now')), PRIMARY KEY (name, pack))`);
       return _globalDb;
     },

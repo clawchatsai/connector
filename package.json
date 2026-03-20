@@ -15,17 +15,15 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5.0"
   },
   "scripts": {
     "prebuild": "node esbuild.config.mjs",
     "build": "tsc",
     "dev": "tsc --watch",
-    "prepublishOnly": "npm run build",
-    "postinstall": "npm rebuild better-sqlite3 2>/dev/null || true"
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "better-sqlite3": ">=9.0.0",
     "jose": "^5.10.0",
     "node-datachannel": "^0.32.1",
     "ws": "^8.0.0"

@@ -199,7 +199,6 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
      *  downloads prebuilt binaries). Use 'rebuild' for node-gyp based packages. */
     strategy: 'rebuild' | 'install-script';
   }> = [
-    { name: 'better-sqlite3', binding: 'build/Release/better_sqlite3.node', strategy: 'rebuild' },
     { name: 'node-datachannel', binding: 'build/Release/node_datachannel.node', strategy: 'install-script' },
   ];
 
