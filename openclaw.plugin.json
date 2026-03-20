@@ -1,0 +1,12 @@
+{
+  "id": "connector",
+  "name": "ClawChats",
+  "description": "Local chat backend and API bridge for OpenClaw.",
+  "kind": "integration",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {},
+    "required": []
+  }
+}

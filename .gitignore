@@ -1,0 +1,9 @@
+node_modules/
+dist/
+server.js
+*.bak
+*.old
+config.js
+data/
+uploads/
+debug/
