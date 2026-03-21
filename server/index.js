@@ -81,7 +81,7 @@ export function createApp(config = {}) {
   const { getWorkspaces, setWorkspaces } = createWorkspaceStore(WORKSPACES_FILE);
 
   const debugLogger = new DebugLogger(DATA_DIR);
-  const mediaStash = new Map();
+  const mediaStash = config.mediaStash ?? new Map();
 
   const memoryConfig = discoverMemoryConfig(config.memoryEnv || {});
   const memoryProvider = createMemoryProvider(memoryConfig);
