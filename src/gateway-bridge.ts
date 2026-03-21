@@ -40,6 +40,11 @@ export interface PluginConfig {
   };
   sessionSecret?: string;
   backupCodeHashes?: string[];
+  // Pending TOTP secret during agent-driven setup (cleared after verify-totp succeeds)
+  totpPending?: {
+    secret: string;
+    generatedAt: string;
+  };
 }
 
 export interface BridgeConfig {

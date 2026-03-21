@@ -948,7 +948,7 @@ function formatStatus(): string {
 // CLI handlers
 // ---------------------------------------------------------------------------
 
-async function handleSetup(token: string): Promise<void> {
+async function handleSetup(token: string, options: { skipTotp?: boolean } = {}): Promise<void> {
   // Decode base64 token
   let tokenData: { serverUrl: string; setupSecret: string; expiresAt: string };
   try {
@@ -1046,22 +1046,36 @@ async function handleSetup(token: string): Promise<void> {
 
         ws.close();
 
-        // Enroll TOTP (interactive — single readline for the whole flow)
-        const totpOk = await enrollTotp(config);
-        if (!totpOk) {
+        if (options.skipTotp) {
+          // Agent-driven flow: skip interactive TOTP enrollment.
+          // User will run setup-totp + verify-totp separately.
           console.log('');
-          console.log('  ⚠️  TOTP not configured. You can set it up later with: openclaw clawchats reauth');
-          console.log('  ClawChats will not allow browser connections until 2FA is enabled.');
-        }
+          console.log('  ✅ Setup complete!');
+          console.log('');
+          console.log('  2FA setup pending. Run these commands to enable it:');
+          console.log('    openclaw clawchats setup-totp');
+          console.log('    openclaw clawchats verify-totp <6-digit-code>');
+          console.log('');
+          console.log('  Then restart:  openclaw gateway restart');
+          console.log('');
+        } else {
+          // Interactive (human) flow: enroll TOTP now.
+          const totpOk = await enrollTotp(config);
+          if (!totpOk) {
+            console.log('');
+            console.log('  ⚠️  TOTP not configured. You can set it up later with: openclaw clawchats reauth');
+            console.log('  ClawChats will not allow browser connections until 2FA is enabled.');
+          }
 
-        console.log('  ✅ Setup complete!');
-        console.log('');
-        console.log('  Next steps:');
-        console.log('  1. Restart your gateway:   openclaw gateway restart');
-        console.log('     (or: systemctl --user restart openclaw-gateway)');
-        console.log('  2. Open ClawChats:         https://app.clawchats.ai');
-        console.log('');
-        console.log('  The gateway will connect automatically after restart.');
+          console.log('  ✅ Setup complete!');
+          console.log('');
+          console.log('  Next steps:');
+          console.log('  1. Restart your gateway:   openclaw gateway restart');
+          console.log('     (or: systemctl --user restart openclaw-gateway)');
+          console.log('  2. Open ClawChats:         https://app.clawchats.ai');
+          console.log('');
+          console.log('  The gateway will connect automatically after restart.');
+        }
         resolve();
       } else if (msg.type === 'setup-error') {
         clearTimeout(timeout);
@@ -1200,6 +1214,113 @@ async function handleShowTotp(): Promise<void> {
   console.log('  1. Generate a setup token at login.clawchats.ai/dashboard');
   console.log('  2. On the new machine: openclaw clawchats setup <token>');
   console.log('  3. When prompted for a TOTP secret, paste the value above');
+  console.log('');
+}
+
+// ---------------------------------------------------------------------------
+// Agent-driven TOTP setup (setup-totp + verify-totp)
+// ---------------------------------------------------------------------------
+
+async function handleSetupTotp(): Promise<void> {
+  const config = loadConfig();
+  if (!config) {
+    console.error('ClawChats not configured. Run: openclaw clawchats setup <token> --skip-totp');
+    return;
+  }
+  if (config.schemaVersion >= 2 && config.totp) {
+    console.error('TOTP already active. Use: openclaw clawchats reauth to reset.');
+    return;
+  }
+
+  // Idempotency: reuse pending secret if generated within the last 24 hours.
+  // Prevents stale-secret issues when the agent retries or the user reruns the command.
+  const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+  let totpSecret: string;
+  const existing = config.totpPending;
+  if (existing?.secret && existing.generatedAt) {
+    const age = Date.now() - new Date(existing.generatedAt).getTime();
+    if (age < PENDING_TTL_MS) {
+      totpSecret = existing.secret;
+    } else {
+      // Expired — generate a fresh one
+      totpSecret = generateTotpSecret();
+      config.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() };
+      saveConfig(config);
+    }
+  } else {
+    totpSecret = generateTotpSecret();
+    config.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() };
+    saveConfig(config);
+  }
+
+  const formatted = totpSecret.match(/.{1,4}/g)?.join(' ') || totpSecret;
+  const setupUrl = `${config.serverUrl.replace('wss://', 'https://').replace(/\/ws\/?$/, '')}/totp-setup#${totpSecret}`;
+
+  console.log('');
+  console.log('  🔐 ClawChats Two-Factor Authentication Setup');
+  console.log('');
+  console.log('  Open this URL to scan the QR code with your authenticator app:');
+  console.log(`  ${setupUrl}`);
+  console.log('');
+  console.log(`  Or enter manually: ${formatted}`);
+  console.log('');
+  console.log('  Once added, verify with:');
+  console.log('    openclaw clawchats verify-totp <6-digit-code>');
+  console.log('');
+}
+
+async function handleVerifyTotp(code: string): Promise<void> {
+  const config = loadConfig();
+  if (!config) {
+    console.error('ClawChats not configured. Run: openclaw clawchats setup <token> --skip-totp');
+    return;
+  }
+  if (config.schemaVersion >= 2 && config.totp) {
+    console.error('TOTP already active. Use: openclaw clawchats reauth to reset.');
+    return;
+  }
+  if (!config.totpPending?.secret) {
+    console.error('No pending TOTP secret. Run: openclaw clawchats setup-totp first.');
+    return;
+  }
+
+  const step = verifyTotp(code.trim(), config.totpPending.secret, 0);
+  if (step < 0) {
+    console.error('  ❌ Invalid code. Make sure you scanned the correct QR code and try again.');
+    console.error('     Run: openclaw clawchats verify-totp <new-code>');
+    process.exit(1);
+  }
+
+  // Generate backup codes
+  const { codes, hashes } = generateBackupCodes();
+  console.log('');
+  console.log('  🔑 Backup codes (save these somewhere safe — one-time use):');
+  for (const backupCode of codes) {
+    console.log(`     ${backupCode}`);
+  }
+  console.log('');
+  console.log('  ⚠️  These codes will NOT be shown again.');
+
+  // Generate session secret and finalize config
+  const sessionSecret = generateSessionSecret();
+  config.totp = {
+    secret: config.totpPending.secret,
+    algorithm: 'SHA1',
+    digits: 6,
+    period: 30,
+    enabledAt: new Date().toISOString(),
+  };
+  config.sessionSecret = sessionSecret;
+  config.backupCodeHashes = hashes;
+  config.schemaVersion = 2;
+  delete config.totpPending;
+  saveConfig(config);
+
+  console.log('');
+  console.log('  ✅ Two-factor authentication enabled!');
+  console.log('');
+  console.log('  Restart the gateway to apply:');
+  console.log('    openclaw gateway restart');
   console.log('');
 }
 
@@ -1409,12 +1530,20 @@ const plugin: OpenClawPluginDefinition = {
       const cmd = ctx.program.command('clawchats');
 
       cmd.command('setup <token>')
-        .description('Set up ClawChats with a setup token')
-        .action((token: unknown) => handleSetup(String(token)));
+        .description('Set up ClawChats with a setup token (use --skip-totp for agent-driven installs)')
+        .action((token: unknown) => handleSetup(String(token), { skipTotp: process.argv.includes('--skip-totp') }));
 
       cmd.command('status')
         .description('Show ClawChats connection status')
         .action(() => handleStatus());
+
+      cmd.command('setup-totp')
+        .description('Generate TOTP QR code for agent-driven 2FA setup (run after setup --skip-totp)')
+        .action(() => handleSetupTotp());
+
+      cmd.command('verify-totp <code>')
+        .description('Verify TOTP code and finalize 2FA setup (agent-driven flow)')
+        .action((code: unknown) => handleVerifyTotp(String(code)));
 
       cmd.command('reauth')
         .description('Reset two-factor authentication (new TOTP secret + invalidate sessions)')
