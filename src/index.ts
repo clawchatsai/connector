@@ -1529,8 +1529,9 @@ const plugin: OpenClawPluginDefinition = {
     api.registerCli((ctx) => {
       const cmd = ctx.program.command('clawchats');
 
-      cmd.command('setup <token>')
+      (cmd.command('setup <token>') as any)
         .description('Set up ClawChats with a setup token (use --skip-totp for agent-driven installs)')
+        .allowUnknownOption()
         .action((token: unknown) => handleSetup(String(token), { skipTotp: process.argv.includes('--skip-totp') }));
 
       cmd.command('status')
