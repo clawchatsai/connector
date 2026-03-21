@@ -75,7 +75,7 @@ export class GatewayClient {
       const parsed = parseSessionKey(sessionKey);
       if (parsed) {
         const existing = this.streamState.get(sessionKey) || { buffer: '', threadId: parsed.threadId, state: 'streaming', held: [] };
-        existing.buffer += extractContent(message);
+        existing.buffer = extractContent(message); // gateway sends full cumulative content per delta, not chunks
         if (isSilentReplyPrefix(existing.buffer, 'NO_REPLY') || isSilentReplyPrefix(existing.buffer, 'HEARTBEAT_OK')) {
           existing.held = existing.held || [];
           existing.held.push(rawData);
@@ -102,14 +102,35 @@ export class GatewayClient {
 
     if (state === 'final') {
       const rawContent = extractContent(message);
-      if (isSilentReplyExact(rawContent, 'NO_REPLY') || isSilentReplyExact(rawContent, 'HEARTBEAT_OK')) return;
+      if (isSilentReplyExact(rawContent, 'NO_REPLY') || isSilentReplyExact(rawContent, 'HEARTBEAT_OK')) {
+        this._cleanupSilentPending(sessionKey);
+        return;
+      }
       if (streamEntry?.held?.length > 0) for (const h of streamEntry.held) this.broadcastToBrowsers(h);
-      this.broadcastToBrowsers(rawData);
-      this.saveAssistantMessage(sessionKey, message, seq);
+      this.saveAssistantMessage(sessionKey, message, seq); // persist + broadcast message-saved first
+      this.broadcastToBrowsers(rawData);                   // then deliver final to browser
       return;
     }
-    if (state === 'aborted' || state === 'error') this.broadcastToBrowsers(rawData);
-    if (state === 'error') this.saveErrorMarker(sessionKey, message);
+    if (state === 'aborted') {
+      this.broadcastToBrowsers(rawData);
+    } else if (state === 'error') {
+      this.broadcastToBrowsers(rawData);
+      this.saveErrorMarker(sessionKey, message);
+    }
+  }
+
+  _cleanupSilentPending(sessionKey) {
+    const parsed = parseSessionKey(sessionKey);
+    if (!parsed) return;
+    const ws = this.getWorkspaces();
+    if (!ws.workspaces[parsed.workspace]) return;
+    const db = this.getDb(parsed.workspace);
+    if (!db) return;
+    const result = db.prepare(`DELETE FROM messages WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1`).run(parsed.threadId);
+    if (result.changes > 0) {
+      console.log(`[clawchats] silent-reply cleanup: removed ${result.changes} pending message(s) for ${parsed.threadId}`);
+      this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'pending-cancelled', threadId: parsed.threadId, workspace: parsed.workspace }));
+    }
   }
 
   saveAssistantMessage(sessionKey, message, seq) {
