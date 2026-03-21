@@ -228,9 +228,15 @@ export class GatewayClient {
     if (stream === 'assistant') {
       const text = data?.text || '';
       if (text) {
+        const offset = log._assistantTextOffset || 0;
         let seg = log._currentAssistantSegment;
-        if (!seg || seg._sealed) { seg = { type: 'assistant', timestamp: Date.now(), text, _sealed: false }; log._currentAssistantSegment = seg; log.steps.push(seg); }
-        else seg.text = text;
+        if (!seg || seg._sealed) {
+          seg = { type: 'assistant', timestamp: Date.now(), text: text.substring(offset), _sealed: false };
+          log._currentAssistantSegment = seg;
+          log.steps.push(seg);
+        } else {
+          seg.text = text.substring(offset);
+        }
       }
       return;
     }
@@ -243,7 +249,11 @@ export class GatewayClient {
       if (!log._lastThinkingBroadcast || now - log._lastThinkingBroadcast >= 300) { log._lastThinkingBroadcast = now; this._broadcastActivityUpdate(runId, log); }
     }
     if (stream === 'tool') {
-      if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) log._currentAssistantSegment._sealed = true;
+      if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
+        const seg = log._currentAssistantSegment;
+        seg._sealed = true;
+        log._assistantTextOffset = (log._assistantTextOffset || 0) + seg.text.length;
+      }
       const argsMeta = data?.args ? (data.args.command || data.args.path || data.args.query || data.args.url || Object.values(data.args).find(v => typeof v === 'string') || '') : '';
       const step = { type: 'tool', timestamp: Date.now(), name: data?.name || 'unknown', phase: data?.phase || 'start', toolCallId: data?.toolCallId, meta: data?.meta || (argsMeta ? String(argsMeta) : undefined), isError: data?.isError || false };
       if (data?.phase === 'result') {
@@ -258,7 +268,11 @@ export class GatewayClient {
       this._broadcastActivityUpdate(runId, log);
     }
     if (stream === 'lifecycle' && (data?.phase === 'end' || data?.phase === 'error')) {
-      if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) log._currentAssistantSegment._sealed = true;
+      if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
+        const seg = log._currentAssistantSegment;
+        seg._sealed = true;
+        log._assistantTextOffset = (log._assistantTextOffset || 0) + seg.text.length;
+      }
       const idx = log.steps.findLastIndex(s => s.type === 'assistant');
       if (idx >= 0) log.steps.splice(idx, 1);
       writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
