@@ -1529,10 +1529,13 @@ const plugin: OpenClawPluginDefinition = {
     api.registerCli((ctx) => {
       const cmd = ctx.program.command('clawchats');
 
-      (cmd.command('setup <token>') as any)
-        .description('Set up ClawChats with a setup token (use --skip-totp for agent-driven installs)')
-        .allowUnknownOption()
-        .action((token: unknown) => handleSetup(String(token), { skipTotp: process.argv.includes('--skip-totp') }));
+      cmd.command('setup <token>')
+        .description('Set up ClawChats with a setup token (interactive — prompts for TOTP)')
+        .action((token: unknown) => handleSetup(String(token), {}));
+
+      cmd.command('setup-agent <token>')
+        .description('Set up ClawChats non-interactively for agent-driven installs (skips TOTP — run setup-totp + verify-totp separately)')
+        .action((token: unknown) => handleSetup(String(token), { skipTotp: true }));
 
       cmd.command('status')
         .description('Show ClawChats connection status')
