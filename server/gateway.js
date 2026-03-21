@@ -260,6 +260,8 @@ export class GatewayClient {
     const now = Date.now();
     try {
       db.prepare('INSERT INTO messages (id, thread_id, role, content, status, metadata, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(`gw-error-${parsed.threadId}-${now}`, parsed.threadId, 'system', `[error] ${message?.error || message?.content || 'Unknown error'}`, 'sent', '{"transient":true}', now, now);
+      // Clear stale pending flag so browsers reloading the chat don't re-derive "thinking..." state.
+      db.prepare("UPDATE messages SET metadata = json_remove(metadata, '$.pending') WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1").run(parsed.threadId);
     } catch (e) { console.error('Failed to save error marker:', e.message); }
   }
 
