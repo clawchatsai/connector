@@ -23,13 +23,14 @@ export function parseConfigField(field) {
   return null;
 }
 
-// Auth token: env var → config.js → empty (open/unauthenticated mode)
-export const AUTH_TOKEN = process.env.CLAWCHATS_AUTH_TOKEN || parseConfigField('authToken') || '';
+// Auth token: config.js → empty (open/unauthenticated mode)
+// Note: CLAWCHATS_AUTH_TOKEN env var is read by the plugin host (src/index.ts) and passed via createApp().
+export const AUTH_TOKEN = parseConfigField('authToken') || '';
 
 // Gateway WebSocket URL — uses the internal/local gateway address, NOT config.js gatewayUrl
 // (that's the browser's external-facing URL and would cause a routing loop through Caddy)
+// Note: GATEWAY_WS_URL env var is read by the plugin host (src/index.ts) and passed via createApp().
 export function discoverGatewayWsUrl() {
-  if (process.env.GATEWAY_WS_URL) return process.env.GATEWAY_WS_URL;
   for (const cfgPath of [path.join(HOME, '.openclaw', 'openclaw.json'), '/etc/openclaw/openclaw.json']) {
     try {
       const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
@@ -43,8 +44,8 @@ export function discoverGatewayWsUrl() {
 export const GATEWAY_WS_URL = discoverGatewayWsUrl();
 
 // Sessions directory — where OpenClaw stores session .jsonl files
+// Note: OPENCLAW_SESSIONS_DIR env var is read by the plugin host (src/index.ts) and passed via createApp().
 export const OPENCLAW_SESSIONS_DIR =
-  process.env.OPENCLAW_SESSIONS_DIR ||
   parseConfigField('sessionsDir') ||
   path.join(HOME, '.openclaw', 'agents', 'main', 'sessions');
 

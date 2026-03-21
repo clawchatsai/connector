@@ -1,42 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
-
-// Discover memory backend configuration from env vars and OpenClaw config
-export function discoverMemoryConfig() {
-  const defaults = { provider: 'qdrant', host: 'localhost', port: 6333, collection: null };
-  let oc = null;
-  for (const cfgPath of [path.join(os.homedir(), '.openclaw', 'openclaw.json'), '/etc/openclaw/openclaw.json']) {
-    try { oc = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); break; } catch { /* try next */ }
-  }
-
-  let cfg = { ...defaults };
-  if (oc) {
-    const vs = oc.plugins?.slots?.memory ? oc.plugins?.entries?.[oc.plugins.slots.memory]?.config?.oss?.vectorStore : null;
-    if (vs) {
-      if (vs.provider) cfg.provider = vs.provider;
-      if (vs.config?.host) cfg.host = vs.config.host;
-      if (vs.config?.port) cfg.port = vs.config.port;
-      if (vs.config?.collectionName) cfg.collection = vs.config.collectionName;
-      if (vs.config?.user) cfg.pgUser = vs.config.user;
-      if (vs.config?.password) cfg.pgPassword = vs.config.password;
-      if (vs.config?.dbname) cfg.pgDbName = vs.config.dbname;
-    }
-    const wsDir = oc.agents?.defaults?.workspace;
-    if (wsDir) cfg.workspaceDir = wsDir;
-  }
-
-  if (process.env.MEMORY_PROVIDER) cfg.provider = process.env.MEMORY_PROVIDER;
-  if (process.env.MEMORY_HOST || process.env.QDRANT_HOST) cfg.host = process.env.MEMORY_HOST || process.env.QDRANT_HOST;
-  if (process.env.MEMORY_PORT || process.env.QDRANT_PORT) cfg.port = parseInt(process.env.MEMORY_PORT || process.env.QDRANT_PORT, 10);
-  if (process.env.MEMORY_COLLECTION || process.env.QDRANT_COLLECTION) cfg.collection = process.env.MEMORY_COLLECTION || process.env.QDRANT_COLLECTION;
-  if (process.env.MEMORY_PG_URL) cfg.pgUrl = process.env.MEMORY_PG_URL;
-  if (process.env.QDRANT_URL && !process.env.MEMORY_HOST) {
-    try { const u = new URL(process.env.QDRANT_URL); cfg.host = u.hostname; if (u.port) cfg.port = parseInt(u.port, 10); } catch { /* ignore */ }
-  }
-  if (!cfg.workspaceDir) cfg.workspaceDir = path.join(os.homedir(), '.openclaw', 'workspace');
-  return cfg;
-}
+// Config discovery (file reads only) lives in memory-config.js.
+// This file contains only provider implementations (network calls, no file reads).
+export { discoverMemoryConfig } from './memory-config.js';
 
 export async function autoDetectQdrantCollection(config) {
   if (config.collection) return config.collection;

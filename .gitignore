@@ -4,6 +4,7 @@ server.js
 *.bak
 *.old
 /config.js
+/prebuilds/
 data/
 uploads/
 debug/

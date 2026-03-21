@@ -13,6 +13,7 @@
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import type { PluginConfig } from './gateway-bridge.js';
 import { SignalingClient } from './signaling-client.js';
@@ -22,7 +23,7 @@ import { SignalingClient } from './signaling-client.js';
 import type { DataChannelLike } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
-import { checkForUpdates, performUpdate } from './updater.js';
+
 import { initAuth, handleAuthMessage, cleanupAuth, isAuthenticated, type AuthConfig } from './auth-handler.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
@@ -188,69 +189,59 @@ function saveConfig(config: PluginConfig): void {
 // Service lifecycle
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect musl libc (Alpine Linux) vs glibc.
+ * prebuildify/prebuild-install distinguishes linux vs linuxmusl.
+ */
+function detectLinuxLibc(): 'musl' | 'glibc' {
+  try {
+    const ldd = fs.readFileSync('/usr/bin/ldd', 'utf8');
+    if (ldd.includes('musl')) return 'musl';
+  } catch { /* not found */ }
+  try {
+    if (fs.readdirSync('/lib').some((f: string) => f.startsWith('libc.musl'))) return 'musl';
+  } catch { /* not found */ }
+  return 'glibc';
+}
+
+/**
+ * Returns the prebuild key for the current platform, matching the directory
+ * names we bundle under prebuilds/ (e.g. "linux-x64", "linuxmusl-arm64").
+ */
+function getPrebuildKey(): string {
+  const platform = process.platform;
+  const arch = process.arch;
+  if (platform === 'linux' && detectLinuxLibc() === 'musl') return `linuxmusl-${arch}`;
+  return `${platform}-${arch}`;
+}
+
 async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
-  // OpenClaw installs plugins with --ignore-scripts, which skips native module compilation.
-  // Check if native modules are usable; if not, rebuild them automatically.
   const pluginDir = path.resolve(__dirname, '..');
-  const modules: Array<{
-    name: string;
-    binding: string;
-    /** Use 'install-script' for packages that use prebuild-install (their install script
-     *  downloads prebuilt binaries). Use 'rebuild' for node-gyp based packages. */
-    strategy: 'rebuild' | 'install-script';
-  }> = [
-    { name: 'node-datachannel', binding: 'build/Release/node_datachannel.node', strategy: 'install-script' },
-  ];
+  const targetPath = path.join(pluginDir, 'node_modules', 'node-datachannel', 'build', 'Release', 'node_datachannel.node');
 
-  const missing = modules.filter(
-    m => !fs.existsSync(path.join(pluginDir, 'node_modules', m.name, m.binding)),
-  );
-  if (missing.length === 0) return; // all built
+  // Already built — nothing to do.
+  if (fs.existsSync(targetPath)) return;
 
-  ctx.logger.info(`Building native modules (first run): ${missing.map(m => m.name).join(', ')}...`);
-  const { execFileSync } = await import('node:child_process');
-  for (const mod of missing) {
-    try {
-      if (mod.strategy === 'install-script') {
-        // Packages using prebuild-install need their install script re-run (npm rebuild
-        // only triggers node-gyp, not prebuild-install). Run the install script directly
-        // from the package's directory.
-        const modDir = path.join(pluginDir, 'node_modules', mod.name);
-        const modPkg = JSON.parse(fs.readFileSync(path.join(modDir, 'package.json'), 'utf-8'));
-        const installCmd = modPkg.scripts?.install;
-        if (installCmd) {
-          // Add local .bin dirs to PATH so prebuild-install and other local binaries resolve.
-          // Check both the module's own node_modules/.bin (hoisted deps) and the plugin-level one.
-          const localBin = [
-            path.join(modDir, 'node_modules', '.bin'),
-            path.join(pluginDir, 'node_modules', '.bin'),
-          ].join(':');
-          execFileSync('sh', ['-c', installCmd], {
-            cwd: modDir,
-            stdio: 'pipe',
-            timeout: 120_000,
-            env: { ...process.env, PATH: `${localBin}:${process.env.PATH ?? ''}`, npm_config_node_gyp: '' },
-          });
-        } else {
-          // Fallback to rebuild if no install script found
-          execFileSync('npm', ['rebuild', mod.name], {
-            cwd: pluginDir,
-            stdio: 'pipe',
-            timeout: 120_000,
-          });
-        }
-      } else {
-        execFileSync('npm', ['rebuild', mod.name], {
-          cwd: pluginDir,
-          stdio: 'pipe',
-          timeout: 120_000,
-        });
-      }
-      ctx.logger.info(`${mod.name} ready.`);
-    } catch (e) {
-      ctx.logger.error(`Failed to build ${mod.name}: ${(e as Error).message}`);
-      ctx.logger.error(`Try manually: cd ~/.openclaw/extensions/connector && npm rebuild ${mod.name}`);
-    }
+  // Find the bundled prebuilt for this platform (shipped inside the npm package).
+  const prebuildKey = getPrebuildKey();
+  const prebuiltPath = path.join(pluginDir, 'prebuilds', prebuildKey, 'node_datachannel.node');
+
+  if (!fs.existsSync(prebuiltPath)) {
+    ctx.logger.error(
+      `[clawchats] No prebuilt binary for ${prebuildKey}. ` +
+      `WebRTC will be unavailable. To fix manually: ` +
+      `cd ~/.openclaw/extensions/connector && npm rebuild node-datachannel`,
+    );
+    return;
+  }
+
+  ctx.logger.info(`[clawchats] Installing node-datachannel prebuilt for ${prebuildKey}...`);
+  try {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(prebuiltPath, targetPath);
+    ctx.logger.info('[clawchats] node-datachannel ready.');
+  } catch (e) {
+    ctx.logger.error(`[clawchats] Failed to install prebuilt: ${(e as Error).message}`);
   }
 }
 
@@ -303,23 +294,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
     ctx.logger.info('Setup detected — connecting to ClawChats...');
   }
 
-  // 1. Check for updates
-  const update = await checkForUpdates();
-  if (update) {
-    ctx.logger.info(`Update available: ${update.current} → ${update.latest}`);
-    if (ctx._forceUpdate) {
-      try {
-        await performUpdate();
-        ctx.logger.info(`Updated to ${update.latest}. Requesting graceful restart...`);
-        api.runtime.requestRestart?.('clawchats update');
-        return; // will restart with new version
-      } catch (e) {
-        ctx.logger.error(`Auto-update failed: ${(e as Error).message}`);
-      }
-    }
-  }
-
-  // 2. Resolve gateway token: runtime API → config file → error
+  // 1. Resolve gateway token: runtime API → config file → error
   const gwCfg = api.config as Record<string, unknown> | undefined;
   const gwAuth = (gwCfg?.['gateway'] as Record<string, unknown> | undefined)?.['auth'] as Record<string, unknown> | undefined;
   const gatewayToken = (gwAuth?.['token'] as string | undefined) || config.gatewayToken || '';
@@ -357,15 +332,40 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   const uploadsDir = path.join(ctx.stateDir, 'clawchats', 'uploads');
   _uploadsDir = uploadsDir;
   // Dynamic import of server.js (plain JS, no type declarations)
-  // @ts-expect-error — server.js is plain JS with no .d.ts
-  const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server.js');
+  // @ts-expect-error — server/index.js is plain JS with no .d.ts
+  const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server/index.js');
+  // Read env vars here (plugin host) so server/ bundle stays process.env-free.
+  const memoryEnv = {
+    provider:   process.env.MEMORY_PROVIDER,
+    host:       process.env.MEMORY_HOST   || process.env.QDRANT_HOST,
+    port:       process.env.MEMORY_PORT   || process.env.QDRANT_PORT,
+    collection: process.env.MEMORY_COLLECTION || process.env.QDRANT_COLLECTION,
+    pgUrl:      process.env.MEMORY_PG_URL,
+    qdrantUrl:  process.env.QDRANT_URL,
+  };
+  // Filter out undefined values so discoverMemoryConfig only overrides what's set.
+  const memoryEnvFiltered = Object.fromEntries(
+    Object.entries(memoryEnv).filter(([, v]) => v !== undefined && v !== ''),
+  );
+
   app = serverModule.createApp({
     dataDir,
     uploadsDir,
-    gatewayUrl: 'ws://localhost:18789',
-    authToken: '', // P2P: DataChannel is the auth boundary (signaling authenticates both sides)
-    gatewayToken, // For WS auth to local OpenClaw gateway
-    mediaStash,   // Shared Map populated by after_tool_call hook (captures MEDIA: paths from exec)
+    port:          parseInt(process.env.PORT || '3001', 10),
+    gatewayUrl:    process.env.GATEWAY_WS_URL || 'ws://localhost:18789',
+    authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
+    gatewayToken,  // For WS auth to local OpenClaw gateway
+    openaiApiKey:  (() => {
+      // Resolve OpenAI API key: openclaw config → env var
+      try {
+        const oc = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'));
+        const fromConfig = oc?.skills?.entries?.['openai-whisper-api']?.apiKey;
+        if (fromConfig) return fromConfig;
+      } catch { /* ok */ }
+      return process.env.OPENAI_API_KEY || null;
+    })(),
+    memoryEnv:     memoryEnvFiltered,
+    mediaStash,    // Shared Map populated by after_tool_call hook (captures MEDIA: paths from exec)
   });
 
   // 4. Connect createApp's gateway client (handles persistence + event relay)
@@ -398,17 +398,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   });
 
   // version-rejected listener removed — version check is now client-side
-
-  signaling.on('force-update', async (targetVersion: string) => {
-    ctx.logger.info(`Force update to ${targetVersion} requested`);
-    try {
-      await performUpdate();
-      ctx.logger.info('Update complete, requesting restart');
-      api.runtime.requestRestart?.('forced update');
-    } catch (e) {
-      ctx.logger.error(`Force update failed: ${(e as Error).message}`);
-    }
-  });
 
   signaling.on('account-suspended', (reason: string) => {
     ctx.logger.error(`Account suspended: ${reason}`);

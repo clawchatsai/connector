@@ -7,9 +7,9 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "server.js",
     "server/",
-    "openclaw.plugin.json"
+    "openclaw.plugin.json",
+    "prebuilds/"
   ],
   "publishConfig": {
     "access": "public"
@@ -18,7 +18,6 @@
     "node": ">=22.5.0"
   },
   "scripts": {
-    "prebuild": "node esbuild.config.mjs",
     "build": "tsc",
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
