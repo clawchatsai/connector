@@ -21,22 +21,25 @@ import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 const HOME = os.homedir();
-const PORT = parseInt(process.env.PORT || '3001', 10);
+// PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
+const DEFAULT_PORT = 3001;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Resolve the plugin directory (parent of server/) for static file serving
 const PLUGIN_DIR = path.resolve(__dirname, '..');
 
 export function createApp(config = {}) {
-  const DATA_DIR         = config.dataDir       || path.join(PLUGIN_DIR, 'data');
+  const PORT             = config.port           || DEFAULT_PORT;
+  const DATA_DIR         = config.dataDir        || path.join(PLUGIN_DIR, 'data');
   const UPLOADS_DIR      = config.uploadsDir     || path.join(PLUGIN_DIR, 'uploads');
   const WORKSPACES_FILE  = path.join(DATA_DIR, 'workspaces.json');
   const SETTINGS_FILE    = path.join(DATA_DIR, 'settings.json');
   const INTELLIGENCE_DIR = path.join(DATA_DIR, 'intelligence');
 
-  const authToken    = config.authToken    !== undefined ? config.authToken    : AUTH_TOKEN;
-  const gatewayToken = config.gatewayToken !== undefined ? config.gatewayToken : authToken;
-  const gatewayUrl   = config.gatewayUrl   || GATEWAY_WS_URL;
+  const authToken      = config.authToken    !== undefined ? config.authToken    : AUTH_TOKEN;
+  const gatewayToken   = config.gatewayToken !== undefined ? config.gatewayToken : authToken;
+  const gatewayUrl     = config.gatewayUrl   || GATEWAY_WS_URL;
+  const openaiApiKey   = config.openaiApiKey || null;
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -83,7 +86,7 @@ export function createApp(config = {}) {
   const debugLogger = new DebugLogger(DATA_DIR);
   const mediaStash = new Map();
 
-  const memoryConfig = discoverMemoryConfig();
+  const memoryConfig = discoverMemoryConfig(config.memoryEnv || {});
   const memoryProvider = createMemoryProvider(memoryConfig);
   memoryProvider.init().catch(err => console.error('[createApp] Memory provider init error:', err.message));
   const MEMORY_FILES_DIR = path.join(memoryConfig.workspaceDir, 'memory');
@@ -216,7 +219,7 @@ export function createApp(config = {}) {
       // Settings & misc
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);
       if (method === 'PUT' && urlPath === '/api/settings') return await handleSaveSettings(req, res);
-      if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res);
+      if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res, { openaiApiKey });
       if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime() });
       if (method === 'GET' && urlPath === '/api/agents') {
         try { send(res, 200, { agents: fs.readdirSync(path.join(HOME, '.openclaw', 'agents'), { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name) }); }

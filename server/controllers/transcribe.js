@@ -3,7 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { send } from '../util/http.js';
 
-export async function handleTranscribe(req, res) {
+export async function handleTranscribe(req, res, opts = {}) {
   try {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -17,7 +17,7 @@ export async function handleTranscribe(req, res) {
       const ocConfig = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'));
       apiKey = ocConfig?.skills?.entries?.['openai-whisper-api']?.apiKey;
     } catch { /* ok */ }
-    if (!apiKey) apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) apiKey = opts.openaiApiKey;
     if (!apiKey) return send(res, 500, { error: 'No OpenAI API key configured' });
 
     const contentType = req.headers['content-type'] || 'audio/webm';

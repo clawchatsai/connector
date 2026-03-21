@@ -333,13 +333,30 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   // Dynamic import of server.js (plain JS, no type declarations)
   // @ts-expect-error — server.js is plain JS with no .d.ts
   const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server.js');
+  // Read env vars here (plugin host) so server/ bundle stays process.env-free.
+  const memoryEnv = {
+    provider:   process.env.MEMORY_PROVIDER,
+    host:       process.env.MEMORY_HOST   || process.env.QDRANT_HOST,
+    port:       process.env.MEMORY_PORT   || process.env.QDRANT_PORT,
+    collection: process.env.MEMORY_COLLECTION || process.env.QDRANT_COLLECTION,
+    pgUrl:      process.env.MEMORY_PG_URL,
+    qdrantUrl:  process.env.QDRANT_URL,
+  };
+  // Filter out undefined values so discoverMemoryConfig only overrides what's set.
+  const memoryEnvFiltered = Object.fromEntries(
+    Object.entries(memoryEnv).filter(([, v]) => v !== undefined && v !== ''),
+  );
+
   app = serverModule.createApp({
     dataDir,
     uploadsDir,
-    gatewayUrl: 'ws://localhost:18789',
-    authToken: '', // P2P: DataChannel is the auth boundary (signaling authenticates both sides)
-    gatewayToken, // For WS auth to local OpenClaw gateway
-    mediaStash,   // Shared Map populated by after_tool_call hook (captures MEDIA: paths from exec)
+    port:          parseInt(process.env.PORT || '3001', 10),
+    gatewayUrl:    process.env.GATEWAY_WS_URL || 'ws://localhost:18789',
+    authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
+    gatewayToken,  // For WS auth to local OpenClaw gateway
+    openaiApiKey:  process.env.OPENAI_API_KEY || null,
+    memoryEnv:     memoryEnvFiltered,
+    mediaStash,    // Shared Map populated by after_tool_call hook (captures MEDIA: paths from exec)
   });
 
   // 4. Connect createApp's gateway client (handles persistence + event relay)
