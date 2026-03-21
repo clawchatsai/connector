@@ -23,6 +23,17 @@ export class GatewayClient {
     this.activityLogs = new Map();
     this._pendingTitleGens = new Map();
 
+    // On startup: mark any pending activity log messages from previous crashed/restarted sessions
+    // as interrupted. Without this, stale pending=true rows survive gateway restarts and cause
+    // phantom "thinking..." indicators in the browser on reconnect.
+    try {
+      const workspaces = this.getWorkspaces();
+      for (const wsName of Object.keys(workspaces.workspaces || {})) {
+        const db = this.getDb(wsName);
+        if (db) db.prepare(`UPDATE messages SET content = '[Response interrupted]', metadata = json_remove(metadata, '$.pending') WHERE content = '' AND json_extract(metadata, '$.pending') = 1`).run();
+      }
+    } catch (e) { console.log('[clawchats] startup pending cleanup skipped:', e.message); }
+
     // Periodically clean up stale activity logs (>10 min old)
     setInterval(() => {
       const cutoff = Date.now() - 10 * 60 * 1000;
@@ -108,7 +119,10 @@ export class GatewayClient {
         }
         this.streamState.set(sessionKey, existing);
         this.broadcastToBrowsers(rawData); // dual-emit: raw chat event (old protocol)
-        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-delta', threadId: parsed.threadId, workspace: parsed.workspace, content: existing.buffer }));
+        // Broadcast only the final-answer portion (text after the last tool call offset).
+        // thoughtStartOffset is updated on each tool result; 0 means no tools yet → full buffer.
+        const visibleContent = existing.buffer.substring(existing.thoughtStartOffset || 0);
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-delta', threadId: parsed.threadId, workspace: parsed.workspace, content: visibleContent }));
       } else {
         this.broadcastToBrowsers(rawData); // non-clawchats session (discord, telegram, etc.)
       }
@@ -135,7 +149,7 @@ export class GatewayClient {
         return;
       }
       if (streamEntry?.held?.length > 0) for (const h of streamEntry.held) this.broadcastToBrowsers(h);
-      this.saveAssistantMessage(sessionKey, message, seq); // persist + broadcast message-saved first
+      this.saveAssistantMessage(sessionKey, message, seq, streamEntry?.thoughtStartOffset); // persist + broadcast message-saved first
       this.broadcastToBrowsers(rawData);                   // dual-emit: raw final event
       if (parsed) {
         const activity = this._popActivityLogForSession(sessionKey);
@@ -173,7 +187,7 @@ export class GatewayClient {
     // Caller broadcasts streaming-end { reason: 'silent' } — no event emitted here.
   }
 
-  saveAssistantMessage(sessionKey, message, seq) {
+  saveAssistantMessage(sessionKey, message, seq, thoughtStartOffset = 0) {
     const parsed = parseSessionKey(sessionKey);
     if (!parsed) return;
     const ws = this.getWorkspaces();
@@ -181,7 +195,10 @@ export class GatewayClient {
     const db = this.getDb(parsed.workspace);
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) { console.log(`Ignoring response for deleted thread: ${parsed.threadId}`); return; }
 
-    let content = sanitizeAssistantContent(extractContent(message));
+    // Trim to final-answer portion: only text after the last tool call offset.
+    // thoughtStartOffset is passed in from handleChatEvent (captured before streamState.delete).
+    // Intermediate narration lives in activityLog steps; message.content is the clean final answer.
+    let content = sanitizeAssistantContent(extractContent(message).substring(thoughtStartOffset));
 
     // Attach media (MEDIA: lines from exec stdout captured by after_tool_call hook).
     // Stash is read before the empty-content guard — media-only responses (no text) must not be dropped.
@@ -290,17 +307,21 @@ export class GatewayClient {
     const log = this.activityLogs.get(runId);
 
     if (stream === 'assistant') {
-      const text = data?.text || '';
-      if (text) {
-        const offset = log._assistantTextOffset || 0;
-        let seg = log._currentAssistantSegment;
-        if (!seg || seg._sealed) {
-          seg = { type: 'assistant', timestamp: Date.now(), text: text.substring(offset), _sealed: false };
-          log._currentAssistantSegment = seg;
-          log.steps.push(seg);
-        } else {
-          seg.text = text.substring(offset);
-        }
+      // Derive narration text from streamState.buffer (same source as thoughtStartOffset).
+      // This eliminates the _assistantTextOffset race: no longer depends on cumulative
+      // stream:assistant text which can arrive out of order relative to stream:tool start.
+      const streamEntry = this.streamState.get(sessionKey);
+      if (!streamEntry) return;
+      const narrationStart = log._lastNarrationStart ?? 0;
+      const narrationText = streamEntry.buffer.substring(narrationStart);
+      if (!narrationText) return;
+      let seg = log._currentAssistantSegment;
+      if (!seg || seg._sealed) {
+        seg = { type: 'assistant', timestamp: Date.now(), text: narrationText, _sealed: false };
+        log._currentAssistantSegment = seg;
+        log.steps.push(seg);
+      } else {
+        seg.text = narrationText;
       }
       return;
     }
@@ -314,9 +335,7 @@ export class GatewayClient {
     }
     if (stream === 'tool') {
       if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
-        const seg = log._currentAssistantSegment;
-        seg._sealed = true;
-        log._assistantTextOffset = (log._assistantTextOffset || 0) + seg.text.length;
+        log._currentAssistantSegment._sealed = true;
       }
       const argsMeta = data?.args ? (data.args.command || data.args.path || data.args.query || data.args.url || Object.values(data.args).find(v => typeof v === 'string') || '') : '';
       const step = { type: 'tool', timestamp: Date.now(), name: data?.name || 'unknown', phase: data?.phase || 'start', toolCallId: data?.toolCallId, meta: data?.meta || (argsMeta ? String(argsMeta) : undefined), isError: data?.isError || false };
@@ -324,6 +343,18 @@ export class GatewayClient {
         const existing = log.steps.findLast(s => s.toolCallId === data.toolCallId && (s.phase === 'start' || s.phase === 'running'));
         if (existing) { existing.phase = 'done'; existing.resultMeta = data?.meta; existing.isError = data?.isError || false; existing.durationMs = Date.now() - existing.timestamp; }
         else { step.phase = 'done'; log.steps.push(step); }
+        // Advance the visible content offset to the current buffer end.
+        // Future streaming-delta broadcasts and the saved message content start from here,
+        // so the response area always shows only the most recent thought / final answer.
+        const streamEntry = this.streamState.get(sessionKey);
+        if (streamEntry && log._parsed) {
+          streamEntry.thoughtStartOffset = streamEntry.buffer.length;
+          log._lastNarrationStart = streamEntry.buffer.length; // align activity log segments with buffer
+          // Signal the frontend to clear the response area — new thought is starting.
+          // streaming-reset fires before activity-updated so the typing-indicator is visible
+          // when startIndicatorTimer attaches to it in the allToolsDone handler.
+          this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-reset', threadId: log._parsed.threadId, workspace: log._parsed.workspace }));
+        }
       } else if (data?.phase === 'update') {
         const existing = log.steps.findLast(s => s.toolCallId === data.toolCallId);
         if (existing) { if (data?.meta) existing.resultMeta = data.meta; if (data?.isError) existing.isError = true; existing.phase = 'running'; }
@@ -333,9 +364,7 @@ export class GatewayClient {
     }
     if (stream === 'lifecycle' && (data?.phase === 'end' || data?.phase === 'error')) {
       if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
-        const seg = log._currentAssistantSegment;
-        seg._sealed = true;
-        log._assistantTextOffset = (log._assistantTextOffset || 0) + seg.text.length;
+        log._currentAssistantSegment._sealed = true;
       }
       const idx = log.steps.findLastIndex(s => s.type === 'assistant');
       if (idx >= 0) log.steps.splice(idx, 1);
