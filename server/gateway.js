@@ -70,7 +70,27 @@ export class GatewayClient {
 
   handleChatEvent(params, rawData) {
     const { sessionKey, state, message, seq } = params;
+    const bareSessionKey = sessionKey.replace(/^agent:[^:]+:/, '');
 
+    // --- Utility session routing (connector-side) ---
+    // Emits semantic utility-response events. Also forwards rawData for dual-emit compatibility
+    // during transition — browser handleChatEvent guards these and defers to utility-response handler.
+    const UTILITY_SESSIONS = { '__clawchats_summarizer': 'summarizer', '__clawchats_semantic': 'semantic', '__clawchats_intelligence': 'intelligence' };
+    const utilityName = UTILITY_SESSIONS[bareSessionKey];
+    if (utilityName) {
+      const content = extractContent(message);
+      if (state === 'delta' && content) {
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: 'delta', content }));
+      } else if (state === 'final' || state === 'aborted') {
+        if (content) this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: state === 'final' ? 'final' : 'aborted', content }));
+      } else if (state === 'error') {
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: 'error', errorMessage: message?.error || 'Unknown error' }));
+      }
+      this.broadcastToBrowsers(rawData); // dual-emit: browser guard skips raw handling for utility sessions
+      return;
+    }
+
+    // --- Delta path ---
     if (state === 'delta') {
       const parsed = parseSessionKey(sessionKey);
       if (parsed) {
@@ -87,35 +107,57 @@ export class GatewayClient {
           existing.held = [];
         }
         this.streamState.set(sessionKey, existing);
+        this.broadcastToBrowsers(rawData); // dual-emit: raw chat event (old protocol)
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-delta', threadId: parsed.threadId, workspace: parsed.workspace, content: existing.buffer }));
+      } else {
+        this.broadcastToBrowsers(rawData); // non-clawchats session (discord, telegram, etc.)
       }
-      this.broadcastToBrowsers(rawData);
       return;
     }
 
+    // --- End states ---
     const streamEntry = this.streamState.get(sessionKey);
     if (state === 'final' || state === 'aborted' || state === 'error') this.streamState.delete(sessionKey);
 
+    // Title sessions are handled server-side — intercept and skip browser delivery
     if (sessionKey?.includes('__clawchats_title_')) {
       if (state === 'final') { const content = extractContent(message); if (content && this.handleTitleResponse(sessionKey, content)) return; }
       else if (state === 'error' || state === 'aborted') { for (const key of this._pendingTitleGens.keys()) { if (sessionKey === key || sessionKey.includes(key)) { this._pendingTitleGens.delete(key); break; } } return; }
+      return;
     }
 
     if (state === 'final') {
       const rawContent = extractContent(message);
+      const parsed = parseSessionKey(sessionKey);
       if (isSilentReplyExact(rawContent, 'NO_REPLY') || isSilentReplyExact(rawContent, 'HEARTBEAT_OK')) {
         this._cleanupSilentPending(sessionKey);
+        if (parsed) this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'silent' }));
         return;
       }
       if (streamEntry?.held?.length > 0) for (const h of streamEntry.held) this.broadcastToBrowsers(h);
       this.saveAssistantMessage(sessionKey, message, seq); // persist + broadcast message-saved first
-      this.broadcastToBrowsers(rawData);                   // then deliver final to browser
+      this.broadcastToBrowsers(rawData);                   // dual-emit: raw final event
+      if (parsed) {
+        const activity = this._popActivityLogForSession(sessionKey);
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'complete', ...(activity || {}) }));
+      }
       return;
     }
     if (state === 'aborted') {
-      this.broadcastToBrowsers(rawData);
+      const parsed = parseSessionKey(sessionKey);
+      this.broadcastToBrowsers(rawData); // dual-emit
+      if (parsed) {
+        const activity = this._popActivityLogForSession(sessionKey);
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'aborted', ...(activity || {}) }));
+      }
     } else if (state === 'error') {
-      this.broadcastToBrowsers(rawData);
+      const parsed = parseSessionKey(sessionKey);
       this.saveErrorMarker(sessionKey, message);
+      this.broadcastToBrowsers(rawData); // dual-emit
+      if (parsed) {
+        const activity = this._popActivityLogForSession(sessionKey);
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'error', errorMessage: message?.error || 'Unknown error', ...(activity || {}) }));
+      }
     }
   }
 
@@ -127,10 +169,8 @@ export class GatewayClient {
     const db = this.getDb(parsed.workspace);
     if (!db) return;
     const result = db.prepare(`DELETE FROM messages WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1`).run(parsed.threadId);
-    if (result.changes > 0) {
-      console.log(`[clawchats] silent-reply cleanup: removed ${result.changes} pending message(s) for ${parsed.threadId}`);
-      this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'pending-cancelled', threadId: parsed.threadId, workspace: parsed.workspace }));
-    }
+    if (result.changes > 0) console.log(`[clawchats] silent-reply cleanup: removed ${result.changes} pending message(s) for ${parsed.threadId}`);
+    // Caller broadcasts streaming-end { reason: 'silent' } — no event emitted here.
   }
 
   saveAssistantMessage(sessionKey, message, seq) {
@@ -300,13 +340,26 @@ export class GatewayClient {
       const idx = log.steps.findLastIndex(s => s.type === 'assistant');
       if (idx >= 0) log.steps.splice(idx, 1);
       writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
-      // Broadcast final state so browser can clean up any in-flight timers (e.g. aborted runs)
-      if (log._parsed && log._messageId) {
-        const cleanSteps = log.steps.map(s => { const c = { ...s }; delete c._sealed; return c; });
-        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'activity-updated', workspace: log._parsed.workspace, threadId: log._parsed.threadId, messageId: log._messageId, activityLog: cleanSteps, activitySummary: generateActivitySummary(log.steps), final: true }));
-      }
-      this.activityLogs.delete(runId);
+      // Store finalized state — streaming-end (handleChatEvent) will pick it up and carry it
+      // as one atomic payload. Do NOT broadcast activity-updated here anymore.
+      const cleanSteps = log.steps.map(s => { const c = { ...s }; delete c._sealed; return c; });
+      log.finalized = true;
+      log.finalSteps = cleanSteps;
+      log.finalSummary = generateActivitySummary(log.steps);
+      // Note: activityLogs entry is kept until _popActivityLogForSession cleans it up
     }
+  }
+
+  // Returns and removes the finalized activity log for a given sessionKey, or null if none.
+  // Called by handleChatEvent so streaming-end carries the final activity state atomically.
+  _popActivityLogForSession(sessionKey) {
+    for (const [runId, log] of this.activityLogs) {
+      if (log.sessionKey === sessionKey && log.finalized) {
+        this.activityLogs.delete(runId);
+        return { activityLog: log.finalSteps, activitySummary: log.finalSummary };
+      }
+    }
+    return null;
   }
 
   _broadcastActivityUpdate(runId, log) {
@@ -344,7 +397,11 @@ export class GatewayClient {
       ws.send(JSON.stringify({ type: 'clawchats', event: 'gateway-status', connected: this.connected }));
       const streams = [];
       for (const [sessionKey, state] of this.streamState.entries()) {
-        if (state.state === 'streaming' && !(state.held?.length > 0)) streams.push({ sessionKey, threadId: state.threadId, buffer: state.buffer });
+        if (state.state === 'streaming' && !(state.held?.length > 0)) {
+          const parsed = parseSessionKey(sessionKey);
+          // Include both old shape (sessionKey/buffer) and new shape (workspace/content) for dual-emit compat
+          streams.push({ sessionKey, threadId: state.threadId, buffer: state.buffer, ...(parsed ? { workspace: parsed.workspace, content: state.buffer } : {}) });
+        }
       }
       if (streams.length > 0) ws.send(JSON.stringify({ type: 'clawchats', event: 'stream-sync', streams }));
     }
