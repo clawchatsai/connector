@@ -13,6 +13,7 @@
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import type { PluginConfig } from './gateway-bridge.js';
 import { SignalingClient } from './signaling-client.js';
@@ -331,8 +332,8 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   const uploadsDir = path.join(ctx.stateDir, 'clawchats', 'uploads');
   _uploadsDir = uploadsDir;
   // Dynamic import of server.js (plain JS, no type declarations)
-  // @ts-expect-error — server.js is plain JS with no .d.ts
-  const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server.js');
+  // @ts-expect-error — server/index.js is plain JS with no .d.ts
+  const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server/index.js');
   // Read env vars here (plugin host) so server/ bundle stays process.env-free.
   const memoryEnv = {
     provider:   process.env.MEMORY_PROVIDER,
@@ -354,7 +355,15 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
     gatewayUrl:    process.env.GATEWAY_WS_URL || 'ws://localhost:18789',
     authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
     gatewayToken,  // For WS auth to local OpenClaw gateway
-    openaiApiKey:  process.env.OPENAI_API_KEY || null,
+    openaiApiKey:  (() => {
+      // Resolve OpenAI API key: openclaw config → env var
+      try {
+        const oc = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'));
+        const fromConfig = oc?.skills?.entries?.['openai-whisper-api']?.apiKey;
+        if (fromConfig) return fromConfig;
+      } catch { /* ok */ }
+      return process.env.OPENAI_API_KEY || null;
+    })(),
     memoryEnv:     memoryEnvFiltered,
     mediaStash,    // Shared Map populated by after_tool_call hook (captures MEDIA: paths from exec)
   });

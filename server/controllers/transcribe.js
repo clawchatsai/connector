@@ -1,6 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
 import { send } from '../util/http.js';
 
 export async function handleTranscribe(req, res, opts = {}) {
@@ -12,12 +9,8 @@ export async function handleTranscribe(req, res, opts = {}) {
     if (audioBuffer.length === 0) return send(res, 400, { error: 'No audio data' });
     if (audioBuffer.length > 25 * 1024 * 1024) return send(res, 400, { error: 'Audio too large (max 25MB)' });
 
-    let apiKey;
-    try {
-      const ocConfig = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'));
-      apiKey = ocConfig?.skills?.entries?.['openai-whisper-api']?.apiKey;
-    } catch { /* ok */ }
-    if (!apiKey) apiKey = opts.openaiApiKey;
+    // API key is resolved by the plugin host (src/index.ts) and passed via opts.openaiApiKey.
+    const apiKey = opts.openaiApiKey;
     if (!apiKey) return send(res, 500, { error: 'No OpenAI API key configured' });
 
     const contentType = req.headers['content-type'] || 'audio/webm';

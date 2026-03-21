@@ -9,7 +9,8 @@ import { Database, requestDbStore } from './bootstrap/native.js';
 import { GATEWAY_WS_URL, AUTH_TOKEN, getSessionsDirForAgent } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
-import { discoverMemoryConfig, createMemoryProvider } from './providers/memory.js';
+import { discoverMemoryConfig } from './providers/memory-config.js';
+import { createMemoryProvider } from './providers/memory.js';
 import { WorkspaceController } from './controllers/workspaces.js';
 import { ThreadController } from './controllers/threads.js';
 import { MessageController } from './controllers/messages.js';
@@ -17,6 +18,10 @@ import { FileController } from './controllers/files.js';
 import { MemoryController } from './controllers/memory.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
+import { handleStatic } from './controllers/static.js';
+import { handleAgents } from './controllers/agents.js';
+import { createSettingsHandlers } from './controllers/settings.js';
+import { createWorkspaceStore } from './store/workspace-store.js';
 import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
@@ -72,16 +77,8 @@ export function createApp(config = {}) {
     close() { if (_globalDb) { _globalDb.close(); _globalDb = null; } }
   };
 
-  // Workspace config (JSON sidecar)
-  let workspacesConfig = null;
-  function getWorkspaces() {
-    if (!workspacesConfig) {
-      try { workspacesConfig = JSON.parse(fs.readFileSync(WORKSPACES_FILE, 'utf8')); }
-      catch { workspacesConfig = { active: 'default', workspaces: { default: { name: 'default', label: 'Default', createdAt: Date.now() } } }; fs.writeFileSync(WORKSPACES_FILE, JSON.stringify(workspacesConfig, null, 2)); }
-    }
-    return workspacesConfig;
-  }
-  function setWorkspaces(data) { workspacesConfig = data; fs.writeFileSync(WORKSPACES_FILE, JSON.stringify(data, null, 2)); }
+  // Workspace config (JSON sidecar) — file I/O lives in workspace-store.js
+  const { getWorkspaces, setWorkspaces } = createWorkspaceStore(WORKSPACES_FILE);
 
   const debugLogger = new DebugLogger(DATA_DIR);
   const mediaStash = new Map();
@@ -102,17 +99,8 @@ export function createApp(config = {}) {
   const files      = new FileController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
 
-  // Settings (simple key-value file store, no class needed)
-  function handleGetSettings(req, res) {
-    try { send(res, 200, fs.existsSync(SETTINGS_FILE) ? JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) : {}); }
-    catch { send(res, 200, {}); }
-  }
-  async function handleSaveSettings(req, res) {
-    const body = await parseBody(req);
-    fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
-    fs.writeFileSync(SETTINGS_FILE, JSON.stringify(body, null, 2));
-    send(res, 200, { ok: true });
-  }
+  // Settings — file I/O lives in settings.js
+  const { handleGetSettings, handleSaveSettings } = createSettingsHandlers(SETTINGS_FILE);
 
   // Auth middleware
   function checkAuth(req, res) {
@@ -139,21 +127,9 @@ export function createApp(config = {}) {
 
     if (method === 'OPTIONS') { setCors(res); res.writeHead(204); return res.end(); }
 
-    // Static file serving
+    // Static file serving — file I/O lives in static.js
     if (method === 'GET' && !urlPath.startsWith('/api/')) {
-      const STATIC = { '/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/style.css': 'style.css', '/error-handler.js': 'error-handler.js', '/manifest.json': 'manifest.json', '/favicon.ico': 'favicon.ico' };
-      const fileName = STATIC[urlPath];
-      const isAllowed = fileName || urlPath.startsWith('/icons/') || urlPath.startsWith('/lib/') || urlPath.startsWith('/frontend/') || urlPath.startsWith('/emoji/') || urlPath === '/config.js';
-      if (isAllowed) {
-        const staticPath = path.join(PLUGIN_DIR, fileName || urlPath.slice(1));
-        if (fs.existsSync(staticPath) && fs.statSync(staticPath).isFile()) {
-          const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.ico': 'image/x-icon', '.png': 'image/png', '.svg': 'image/svg+xml', '.gif': 'image/gif', '.webp': 'image/webp' };
-          const ext = path.extname(staticPath).toLowerCase();
-          const stat = fs.statSync(staticPath);
-          res.writeHead(200, { 'Content-Type': MIME[ext] || 'application/octet-stream', 'Content-Length': stat.size, 'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600' });
-          return fs.createReadStream(staticPath).pipe(res);
-        }
-      }
+      if (handleStatic(req, res, PLUGIN_DIR)) return;
     }
 
     // Unauthenticated routes
@@ -218,14 +194,10 @@ export function createApp(config = {}) {
 
       // Settings & misc
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);
-      if (method === 'PUT' && urlPath === '/api/settings') return await handleSaveSettings(req, res);
+      if (method === 'PUT' && urlPath === '/api/settings') return await handleSaveSettings(req, res, parseBody);
       if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res, { openaiApiKey });
       if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime() });
-      if (method === 'GET' && urlPath === '/api/agents') {
-        try { send(res, 200, { agents: fs.readdirSync(path.join(HOME, '.openclaw', 'agents'), { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name) }); }
-        catch { send(res, 200, { agents: ['main'] }); }
-        return;
-      }
+      if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
 
       // Workspaces
       if (method === 'GET' && urlPath === '/api/workspaces') return workspaces.getAll(req, res);
