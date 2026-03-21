@@ -121,9 +121,9 @@ export class GatewayClient {
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) { console.log(`Ignoring response for deleted thread: ${parsed.threadId}`); return; }
 
     let content = sanitizeAssistantContent(extractContent(message));
-    if (!content?.trim()) { console.log(`Skipping empty assistant response for thread ${parsed.threadId}`); return; }
 
-    // Attach media (MEDIA: lines from exec stdout captured by after_tool_call hook)
+    // Attach media (MEDIA: lines from exec stdout captured by after_tool_call hook).
+    // Stash is read before the empty-content guard — media-only responses (no text) must not be dropped.
     const pendingPaths = this.mediaStash?.get(sessionKey) ?? [];
     this.mediaStash?.delete(sessionKey);
     const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','webp','bmp','svg','ico','avif','tiff']);
@@ -134,8 +134,11 @@ export class GatewayClient {
       if (IMAGE_EXTS.has(ext)) imagePaths.push(p);
       else pendingAttachments.push({ path: p, name: p.split('/').pop(), type: AUDIO_EXTS.has(ext) ? 'audio' : 'file' });
     }
-    if (imagePaths.length > 0) content = content.trimEnd() + '\n\n' + imagePaths.map(p => `![image](${p})`).join('\n');
+    if (imagePaths.length > 0) content = (content?.trimEnd() || '') + '\n\n' + imagePaths.map(p => `![image](${p})`).join('\n');
     if (pendingPaths.length > 0) console.log(`[clawchats] media-attach: ${imagePaths.length} image(s), ${pendingAttachments.length} attachment(s) for ${sessionKey}`);
+
+    // Skip only if there is truly nothing to save — no text and no pending media.
+    if (!content?.trim() && pendingPaths.length === 0) { console.log(`Skipping empty assistant response for thread ${parsed.threadId}`); return; }
 
     const now = Date.now();
     const pendingMsg = db.prepare(`SELECT id, metadata FROM messages WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1 ORDER BY timestamp DESC LIMIT 1`).get(parsed.threadId);
