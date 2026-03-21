@@ -188,69 +188,59 @@ function saveConfig(config: PluginConfig): void {
 // Service lifecycle
 // ---------------------------------------------------------------------------
 
+/**
+ * Detect musl libc (Alpine Linux) vs glibc.
+ * prebuildify/prebuild-install distinguishes linux vs linuxmusl.
+ */
+function detectLinuxLibc(): 'musl' | 'glibc' {
+  try {
+    const ldd = fs.readFileSync('/usr/bin/ldd', 'utf8');
+    if (ldd.includes('musl')) return 'musl';
+  } catch { /* not found */ }
+  try {
+    if (fs.readdirSync('/lib').some((f: string) => f.startsWith('libc.musl'))) return 'musl';
+  } catch { /* not found */ }
+  return 'glibc';
+}
+
+/**
+ * Returns the prebuild key for the current platform, matching the directory
+ * names we bundle under prebuilds/ (e.g. "linux-x64", "linuxmusl-arm64").
+ */
+function getPrebuildKey(): string {
+  const platform = process.platform;
+  const arch = process.arch;
+  if (platform === 'linux' && detectLinuxLibc() === 'musl') return `linuxmusl-${arch}`;
+  return `${platform}-${arch}`;
+}
+
 async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
-  // OpenClaw installs plugins with --ignore-scripts, which skips native module compilation.
-  // Check if native modules are usable; if not, rebuild them automatically.
   const pluginDir = path.resolve(__dirname, '..');
-  const modules: Array<{
-    name: string;
-    binding: string;
-    /** Use 'install-script' for packages that use prebuild-install (their install script
-     *  downloads prebuilt binaries). Use 'rebuild' for node-gyp based packages. */
-    strategy: 'rebuild' | 'install-script';
-  }> = [
-    { name: 'node-datachannel', binding: 'build/Release/node_datachannel.node', strategy: 'install-script' },
-  ];
+  const targetPath = path.join(pluginDir, 'node_modules', 'node-datachannel', 'build', 'Release', 'node_datachannel.node');
 
-  const missing = modules.filter(
-    m => !fs.existsSync(path.join(pluginDir, 'node_modules', m.name, m.binding)),
-  );
-  if (missing.length === 0) return; // all built
+  // Already built — nothing to do.
+  if (fs.existsSync(targetPath)) return;
 
-  ctx.logger.info(`Building native modules (first run): ${missing.map(m => m.name).join(', ')}...`);
-  const { execFileSync } = await import('node:child_process');
-  for (const mod of missing) {
-    try {
-      if (mod.strategy === 'install-script') {
-        // Packages using prebuild-install need their install script re-run (npm rebuild
-        // only triggers node-gyp, not prebuild-install). Run the install script directly
-        // from the package's directory.
-        const modDir = path.join(pluginDir, 'node_modules', mod.name);
-        const modPkg = JSON.parse(fs.readFileSync(path.join(modDir, 'package.json'), 'utf-8'));
-        const installCmd = modPkg.scripts?.install;
-        if (installCmd) {
-          // Add local .bin dirs to PATH so prebuild-install and other local binaries resolve.
-          // Check both the module's own node_modules/.bin (hoisted deps) and the plugin-level one.
-          const localBin = [
-            path.join(modDir, 'node_modules', '.bin'),
-            path.join(pluginDir, 'node_modules', '.bin'),
-          ].join(':');
-          execFileSync('sh', ['-c', installCmd], {
-            cwd: modDir,
-            stdio: 'pipe',
-            timeout: 120_000,
-            env: { ...process.env, PATH: `${localBin}:${process.env.PATH ?? ''}`, npm_config_node_gyp: '' },
-          });
-        } else {
-          // Fallback to rebuild if no install script found
-          execFileSync('npm', ['rebuild', mod.name], {
-            cwd: pluginDir,
-            stdio: 'pipe',
-            timeout: 120_000,
-          });
-        }
-      } else {
-        execFileSync('npm', ['rebuild', mod.name], {
-          cwd: pluginDir,
-          stdio: 'pipe',
-          timeout: 120_000,
-        });
-      }
-      ctx.logger.info(`${mod.name} ready.`);
-    } catch (e) {
-      ctx.logger.error(`Failed to build ${mod.name}: ${(e as Error).message}`);
-      ctx.logger.error(`Try manually: cd ~/.openclaw/extensions/connector && npm rebuild ${mod.name}`);
-    }
+  // Find the bundled prebuilt for this platform (shipped inside the npm package).
+  const prebuildKey = getPrebuildKey();
+  const prebuiltPath = path.join(pluginDir, 'prebuilds', prebuildKey, 'node_datachannel.node');
+
+  if (!fs.existsSync(prebuiltPath)) {
+    ctx.logger.error(
+      `[clawchats] No prebuilt binary for ${prebuildKey}. ` +
+      `WebRTC will be unavailable. To fix manually: ` +
+      `cd ~/.openclaw/extensions/connector && npm rebuild node-datachannel`,
+    );
+    return;
+  }
+
+  ctx.logger.info(`[clawchats] Installing node-datachannel prebuilt for ${prebuildKey}...`);
+  try {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.copyFileSync(prebuiltPath, targetPath);
+    ctx.logger.info('[clawchats] node-datachannel ready.');
+  } catch (e) {
+    ctx.logger.error(`[clawchats] Failed to install prebuilt: ${(e as Error).message}`);
   }
 }
 

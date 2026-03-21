@@ -9,7 +9,8 @@
     "dist",
     "server.js",
     "server/",
-    "openclaw.plugin.json"
+    "openclaw.plugin.json",
+    "prebuilds/"
   ],
   "publishConfig": {
     "access": "public"

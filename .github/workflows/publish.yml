@@ -50,6 +50,47 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Bundle node-datachannel prebuilts
+        run: |
+          VERSION=$(node -p "require('./node_modules/node-datachannel/package.json').version")
+          echo "Bundling node-datachannel v${VERSION} prebuilts..."
+          mkdir -p prebuilds
+
+          PLATFORMS=(
+            "linux-x64"
+            "linux-arm64"
+            "linux-arm"
+            "linuxmusl-x64"
+            "linuxmusl-arm64"
+            "darwin-x64"
+            "darwin-arm64"
+            "win32-x64"
+            "win32-arm64"
+          )
+
+          for PLATFORM in "${PLATFORMS[@]}"; do
+            URL="https://github.com/murat-dogan/node-datachannel/releases/download/v${VERSION}/node-datachannel-v${VERSION}-napi-v8-${PLATFORM}.tar.gz"
+            echo "  Downloading ${PLATFORM}..."
+            if curl -fsSL "$URL" -o /tmp/ndc.tar.gz; then
+              mkdir -p /tmp/ndc-work
+              tar -xzf /tmp/ndc.tar.gz -C /tmp/ndc-work
+              BINARY=$(find /tmp/ndc-work -name "*.node" | head -1)
+              if [ -n "$BINARY" ]; then
+                mkdir -p "prebuilds/${PLATFORM}"
+                cp "$BINARY" "prebuilds/${PLATFORM}/node_datachannel.node"
+                echo "  ✅ ${PLATFORM}"
+              else
+                echo "  ⚠️  ${PLATFORM}: .node not found in tarball"
+              fi
+              rm -rf /tmp/ndc-work /tmp/ndc.tar.gz
+            else
+              echo "  ⚠️  ${PLATFORM}: download failed (skipping)"
+            fi
+          done
+
+          echo "Bundled prebuilts:"
+          find prebuilds -name "*.node" | sort
+
       - name: Build
         run: npm run build
 
