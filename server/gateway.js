@@ -262,6 +262,11 @@ export class GatewayClient {
       const idx = log.steps.findLastIndex(s => s.type === 'assistant');
       if (idx >= 0) log.steps.splice(idx, 1);
       writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
+      // Broadcast final state so browser can clean up any in-flight timers (e.g. aborted runs)
+      if (log._parsed && log._messageId) {
+        const cleanSteps = log.steps.map(s => { const c = { ...s }; delete c._sealed; return c; });
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'activity-updated', workspace: log._parsed.workspace, threadId: log._parsed.threadId, messageId: log._messageId, activityLog: cleanSteps, activitySummary: generateActivitySummary(log.steps), final: true }));
+      }
       this.activityLogs.delete(runId);
     }
   }
