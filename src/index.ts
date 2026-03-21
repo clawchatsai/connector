@@ -22,7 +22,7 @@ import { SignalingClient } from './signaling-client.js';
 import type { DataChannelLike } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
-import { checkForUpdates, performUpdate } from './updater.js';
+
 import { initAuth, handleAuthMessage, cleanupAuth, isAuthenticated, type AuthConfig } from './auth-handler.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
@@ -303,23 +303,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
     ctx.logger.info('Setup detected — connecting to ClawChats...');
   }
 
-  // 1. Check for updates
-  const update = await checkForUpdates();
-  if (update) {
-    ctx.logger.info(`Update available: ${update.current} → ${update.latest}`);
-    if (ctx._forceUpdate) {
-      try {
-        await performUpdate();
-        ctx.logger.info(`Updated to ${update.latest}. Requesting graceful restart...`);
-        api.runtime.requestRestart?.('clawchats update');
-        return; // will restart with new version
-      } catch (e) {
-        ctx.logger.error(`Auto-update failed: ${(e as Error).message}`);
-      }
-    }
-  }
-
-  // 2. Resolve gateway token: runtime API → config file → error
+  // 1. Resolve gateway token: runtime API → config file → error
   const gwCfg = api.config as Record<string, unknown> | undefined;
   const gwAuth = (gwCfg?.['gateway'] as Record<string, unknown> | undefined)?.['auth'] as Record<string, unknown> | undefined;
   const gatewayToken = (gwAuth?.['token'] as string | undefined) || config.gatewayToken || '';
@@ -398,17 +382,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   });
 
   // version-rejected listener removed — version check is now client-side
-
-  signaling.on('force-update', async (targetVersion: string) => {
-    ctx.logger.info(`Force update to ${targetVersion} requested`);
-    try {
-      await performUpdate();
-      ctx.logger.info('Update complete, requesting restart');
-      api.runtime.requestRestart?.('forced update');
-    } catch (e) {
-      ctx.logger.error(`Force update failed: ${(e as Error).message}`);
-    }
-  });
 
   signaling.on('account-suspended', (reason: string) => {
     ctx.logger.error(`Account suspended: ${reason}`);
