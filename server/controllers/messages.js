@@ -33,9 +33,7 @@ export class MessageController {
     const metadata = body.metadata ? JSON.stringify(body.metadata) : null;
     const existing = db.prepare('SELECT id, status, metadata FROM messages WHERE id = ?').get(body.id);
     if (existing) {
-      if (body.status && body.status !== existing.status) {
-        db.prepare('UPDATE messages SET status = ?, content = ?, metadata = ? WHERE id = ?').run(body.status, body.content, metadata || existing.metadata, body.id);
-      }
+      db.prepare('UPDATE messages SET status = ?, content = ?, metadata = ? WHERE id = ?').run(body.status || existing.status, body.content, metadata || existing.metadata, body.id);
     } else {
       db.prepare('INSERT INTO messages (id, thread_id, role, content, status, metadata, seq, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)').run(body.id, params.id, body.role, body.content, body.status || 'sent', metadata, body.seq || null, body.timestamp, Date.now());
       db.prepare('UPDATE threads SET updated_at = ? WHERE id = ?').run(Date.now(), params.id);
