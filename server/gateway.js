@@ -106,6 +106,7 @@ export class GatewayClient {
       const parsed = parseSessionKey(sessionKey);
       if (parsed) {
         const existing = this.streamState.get(sessionKey) || { buffer: '', threadId: parsed.threadId, state: 'streaming', held: [] };
+        const prevLen = existing.buffer.length; // capture before update — used to advance thoughtStartOffset on first post-tool delta
         existing.buffer = extractContent(message); // gateway sends full cumulative content per delta, not chunks
         if (isSilentReplyPrefix(existing.buffer, 'NO_REPLY') || isSilentReplyPrefix(existing.buffer, 'HEARTBEAT_OK')) {
           existing.held = existing.held || [];
@@ -119,8 +120,16 @@ export class GatewayClient {
         }
         this.streamState.set(sessionKey, existing);
         this.broadcastToBrowsers(rawData); // dual-emit: raw chat event (old protocol)
-        // Broadcast only the final-answer portion (text after the last tool call offset).
-        // thoughtStartOffset is updated on each tool result; 0 means no tools yet → full buffer.
+        // On the first delta after a tool result, advance the segment offset and signal the
+        // frontend to clear the bubble. Both happen here — right before the new-segment delta —
+        // so the clear and fill are atomic from the browser's perspective.
+        if (existing.pendingReset) {
+          existing.thoughtStartOffset = prevLen;
+          existing.pendingReset = false;
+          this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-reset', threadId: parsed.threadId, workspace: parsed.workspace }));
+        }
+        // Broadcast only the current-segment portion (text after the last tool call offset).
+        // thoughtStartOffset advances on first post-tool delta; 0 means no tools yet → full buffer.
         const visibleContent = existing.buffer.substring(existing.thoughtStartOffset || 0);
         this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-delta', threadId: parsed.threadId, workspace: parsed.workspace, content: visibleContent }));
       } else {
@@ -311,25 +320,6 @@ export class GatewayClient {
     if (!this.activityLogs.has(runId)) this.activityLogs.set(runId, { sessionKey, steps: [], startTime: Date.now() });
     const log = this.activityLogs.get(runId);
 
-    if (stream === 'assistant') {
-      // Derive narration text from streamState.buffer (same source as thoughtStartOffset).
-      // This eliminates the _assistantTextOffset race: no longer depends on cumulative
-      // stream:assistant text which can arrive out of order relative to stream:tool start.
-      const streamEntry = this.streamState.get(sessionKey);
-      if (!streamEntry) return;
-      const narrationStart = log._lastNarrationStart ?? 0;
-      const narrationText = streamEntry.buffer.substring(narrationStart);
-      if (!narrationText) return;
-      let seg = log._currentAssistantSegment;
-      if (!seg || seg._sealed) {
-        seg = { type: 'assistant', timestamp: Date.now(), text: narrationText, _sealed: false };
-        log._currentAssistantSegment = seg;
-        log.steps.push(seg);
-      } else {
-        seg.text = narrationText;
-      }
-      return;
-    }
     if (stream === 'thinking') {
       let step = log.steps.find(s => s.type === 'thinking');
       if (step) step.text = data?.text || '';
@@ -339,7 +329,22 @@ export class GatewayClient {
       if (!log._lastThinkingBroadcast || now - log._lastThinkingBroadcast >= 300) { log._lastThinkingBroadcast = now; this._broadcastActivityUpdate(runId, log); }
     }
     if (stream === 'tool') {
-      if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
+      // At phase:start the gateway has already flushed the text buffer, so the buffer is
+      // complete. Capture the full inter-tool narration now — no race, no stale snapshots.
+      // For result/update phases, just defensively seal any still-open segment.
+      if (data?.phase !== 'result' && data?.phase !== 'update') {
+        const streamEntry = this.streamState.get(sessionKey);
+        const narrationStart = log._lastNarrationStart ?? 0;
+        const narrationText = streamEntry ? streamEntry.buffer.substring(narrationStart) : '';
+        if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
+          if (narrationText.trim()) log._currentAssistantSegment.text = narrationText;
+          log._currentAssistantSegment._sealed = true;
+        } else if (narrationText.trim()) {
+          const seg = { type: 'assistant', timestamp: Date.now(), text: narrationText, _sealed: true };
+          log._currentAssistantSegment = seg;
+          log.steps.push(seg);
+        }
+      } else if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
         log._currentAssistantSegment._sealed = true;
       }
       const argsMeta = data?.args ? (data.args.command || data.args.path || data.args.query || data.args.url || Object.values(data.args).find(v => typeof v === 'string') || '') : '';
@@ -353,12 +358,15 @@ export class GatewayClient {
         // so the response area always shows only the most recent thought / final answer.
         const streamEntry = this.streamState.get(sessionKey);
         if (streamEntry && log._parsed) {
-          streamEntry.thoughtStartOffset = streamEntry.buffer.length;
+          // Don't advance thoughtStartOffset or broadcast streaming-reset yet.
+          // Wait for the first post-tool delta before doing either:
+          //   (a) No post-tool text: thoughtStartOffset stays at the current segment start,
+          //       bubble retains the last segment text as the final answer.
+          //   (b) Post-tool text arrives: delta handler advances the offset and broadcasts
+          //       streaming-reset immediately before the first new-segment delta, so the
+          //       bubble clears at exactly the right moment.
+          streamEntry.pendingReset = true;
           log._lastNarrationStart = streamEntry.buffer.length; // align activity log segments with buffer
-          // Signal the frontend to clear the response area — new thought is starting.
-          // streaming-reset fires before activity-updated so the typing-indicator is visible
-          // when startIndicatorTimer attaches to it in the allToolsDone handler.
-          this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-reset', threadId: log._parsed.threadId, workspace: log._parsed.workspace }));
         }
       } else if (data?.phase === 'update') {
         const existing = log.steps.findLast(s => s.toolCallId === data.toolCallId);
@@ -371,8 +379,6 @@ export class GatewayClient {
       if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
         log._currentAssistantSegment._sealed = true;
       }
-      const idx = log.steps.findLastIndex(s => s.type === 'assistant');
-      if (idx >= 0) log.steps.splice(idx, 1);
       writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
       // Store finalized state — streaming-end (handleChatEvent) will pick it up and carry it
       // as one atomic payload. Do NOT broadcast activity-updated here anymore.
@@ -434,7 +440,7 @@ export class GatewayClient {
         if (state.state === 'streaming' && !(state.held?.length > 0)) {
           const parsed = parseSessionKey(sessionKey);
           // Include both old shape (sessionKey/buffer) and new shape (workspace/content) for dual-emit compat
-          streams.push({ sessionKey, threadId: state.threadId, buffer: state.buffer, ...(parsed ? { workspace: parsed.workspace, content: state.buffer } : {}) });
+          streams.push({ sessionKey, threadId: state.threadId, buffer: state.buffer, ...(parsed ? { workspace: parsed.workspace, content: state.buffer.substring(state.thoughtStartOffset || 0) } : {}) });
         }
       }
       if (streams.length > 0) ws.send(JSON.stringify({ type: 'clawchats', event: 'stream-sync', streams }));
