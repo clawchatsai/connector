@@ -1,6 +1,6 @@
 {
   "name": "@clawchatsai/connector",
-  "version": "0.0.94",
+  "version": "0.0.95",
   "type": "module",
   "description": "ClawChats OpenClaw plugin — P2P tunnel + local API bridge",
   "main": "dist/index.js",
