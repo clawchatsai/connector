@@ -215,11 +215,14 @@ export class GatewayClient {
     if (imagePaths.length > 0) content = (content?.trimEnd() || '') + '\n\n' + imagePaths.map(p => `![image](${p})`).join('\n');
     if (pendingPaths.length > 0) console.log(`[clawchats] media-attach: ${imagePaths.length} image(s), ${pendingAttachments.length} attachment(s) for ${sessionKey}`);
 
-    // Skip only if there is truly nothing to save — no text and no pending media.
-    if (!content?.trim() && pendingPaths.length === 0) { console.log(`Skipping empty assistant response for thread ${parsed.threadId}`); return; }
-
     const now = Date.now();
     const pendingMsg = db.prepare(`SELECT id, metadata FROM messages WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1 ORDER BY timestamp DESC LIMIT 1`).get(parsed.threadId);
+
+    // Skip only if there is truly nothing to save AND no pending row to resolve.
+    // If a pending row exists, always proceed to update it (even with empty content) so the
+    // pending flag is cleared. Without this, tool-only responses (no post-tool text) leave
+    // pending=true forever, and the startup cleanup marks them '[Response interrupted]'.
+    if (!content?.trim() && pendingPaths.length === 0 && !pendingMsg) { console.log(`Skipping empty assistant response for thread ${parsed.threadId}`); return; }
     let messageId;
 
     if (pendingMsg) {
