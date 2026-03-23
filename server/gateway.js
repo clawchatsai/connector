@@ -80,7 +80,7 @@ export class GatewayClient {
   }
 
   handleChatEvent(params, rawData) {
-    const { sessionKey, state, message, seq } = params;
+    const { sessionKey, state, message, seq, errorMessage: gwErrorMessage } = params;
     const bareSessionKey = sessionKey.replace(/^agent:[^:]+:/, '');
 
     // --- Utility session routing (connector-side) ---
@@ -95,7 +95,7 @@ export class GatewayClient {
       } else if (state === 'final' || state === 'aborted') {
         if (content) this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: state === 'final' ? 'final' : 'aborted', content }));
       } else if (state === 'error') {
-        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: 'error', errorMessage: message?.error || 'Unknown error' }));
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: 'error', errorMessage: gwErrorMessage || message?.error || message?.content || 'Unknown error' }));
       }
       this.broadcastToBrowsers(rawData); // dual-emit: browser guard skips raw handling for utility sessions
       return;
@@ -179,7 +179,7 @@ export class GatewayClient {
       this.broadcastToBrowsers(rawData); // dual-emit
       if (parsed) {
         const activity = this._popActivityLogForSession(sessionKey);
-        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'error', errorMessage: message?.error || 'Unknown error', ...(activity || {}) }));
+        this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'error', errorMessage: gwErrorMessage || message?.error || message?.content || 'Unknown error', ...(activity || {}) }));
       }
     }
   }
@@ -271,7 +271,7 @@ export class GatewayClient {
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) return;
     const now = Date.now();
     try {
-      db.prepare('INSERT INTO messages (id, thread_id, role, content, status, metadata, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(`gw-error-${parsed.threadId}-${now}`, parsed.threadId, 'system', `[error] ${message?.error || message?.content || 'Unknown error'}`, 'sent', '{"transient":true}', now, now);
+      db.prepare('INSERT INTO messages (id, thread_id, role, content, status, metadata, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(`gw-error-${parsed.threadId}-${now}`, parsed.threadId, 'system', `[error] ${gwErrorMessage || message?.error || message?.content || 'Unknown error'}`, 'sent', '{"transient":true}', now, now);
       // Clear stale pending flag so browsers reloading the chat don't re-derive "thinking..." state.
       db.prepare("UPDATE messages SET metadata = json_remove(metadata, '$.pending') WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1").run(parsed.threadId);
     } catch (e) { console.error('Failed to save error marker:', e.message); }
