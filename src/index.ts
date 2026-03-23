@@ -789,7 +789,17 @@ function processAuthenticatedMessage(
 
     case 'gateway-msg':
       if (app?.gatewayClient && typeof msg['payload'] === 'string') {
-        app.gatewayClient.sendToGateway(normalizeGatewayPayload(msg['payload'] as string));
+        const _gwPayload = msg['payload'] as string;
+        // Persist model when sessions.patch is called
+        try {
+          const _gwMsg = JSON.parse(_gwPayload);
+          if (_gwMsg.method === 'sessions.patch' && _gwMsg.params?.model && _gwMsg.params?.key) {
+            const _db = app.getActiveDb() as any;
+            _db.prepare('UPDATE threads SET model = ?, updated_at = ? WHERE session_key = ?')
+              .run(_gwMsg.params.model, Date.now(), _gwMsg.params.key);
+          }
+        } catch { /* ignore parse/db errors */ }
+        app.gatewayClient.sendToGateway(normalizeGatewayPayload(_gwPayload));
       }
       break;
 

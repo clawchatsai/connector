@@ -86,6 +86,7 @@ export class ThreadController {
     if (body.pinned !== undefined) { fields.push('pinned = ?'); values.push(body.pinned ? 1 : 0); }
     if (body.pin_order !== undefined) { fields.push('pin_order = ?'); values.push(body.pin_order); }
     if (body.sort_order !== undefined) { fields.push('sort_order = ?'); values.push(body.sort_order); }
+    if (body.metadata !== undefined) { fields.push('metadata = ?'); values.push(typeof body.metadata === 'string' ? body.metadata : JSON.stringify(body.metadata)); }
     if (fields.length) {
       fields.push('updated_at = ?');
       values.push(Date.now(), params.id);
