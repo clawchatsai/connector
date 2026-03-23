@@ -89,6 +89,8 @@ let _stopRequested = false;
 
 /** Model IDs that have 'input' explicitly set without 'image' support. */
 let _imageRestrictedModels: string[] = [];
+/** True if session.reset config risks wiping ClawChats history (daily reset or short idle). */
+let _sessionResetWarning = false;
 let _uploadsDir: string | null = null;
 
 // ---------------------------------------------------------------------------
@@ -302,6 +304,22 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   if (!gatewayToken) {
     ctx.logger.error('No gateway token available. Re-run: openclaw clawchats setup <token>');
     return;
+  }
+
+  // Check session.reset config — warn if daily reset or short idle could wipe ClawChats history.
+  _sessionResetWarning = false;
+  try {
+    const sessionReset = (gwCfg?.['session'] as Record<string, unknown> | undefined)?.['reset'] as Record<string, unknown> | undefined;
+    if (sessionReset) {
+      const mode = sessionReset['mode'] as string | undefined;
+      const idleMinutes = sessionReset['idleMinutes'] as number | undefined;
+      if (mode === 'daily' || (mode === 'idle' && typeof idleMinutes === 'number' && idleMinutes < 43200)) {
+        _sessionResetWarning = true;
+        ctx.logger.warn(`[clawchats] session.reset may wipe chat history (mode=${mode}, idleMinutes=${idleMinutes ?? 'unset'}) — set mode=idle + idleMinutes=999999`);
+      }
+    }
+  } catch {
+    // Non-fatal
   }
 
   // Check for model definitions with 'input' set but missing 'image' — they silently drop attachments.
@@ -648,6 +666,14 @@ function setupDataChannelHandler(
             dc.send(JSON.stringify({
               type: 'gateway-event',
               payload: JSON.stringify({ type: 'clawchats', event: 'image-capability-warning', models: _imageRestrictedModels }),
+            }));
+          }
+
+          // Warn if session.reset config risks wiping ClawChats history
+          if (_sessionResetWarning) {
+            dc.send(JSON.stringify({
+              type: 'gateway-event',
+              payload: JSON.stringify({ type: 'clawchats', event: 'session-reset-warning' }),
             }));
           }
 
