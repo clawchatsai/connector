@@ -22,6 +22,7 @@ import { handleStatic } from './controllers/static.js';
 import { handleAgents } from './controllers/agents.js';
 import { createSettingsHandlers } from './controllers/settings.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
+import { cleanGatewaySession } from './gateway-cleanup.js';
 import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
@@ -238,6 +239,13 @@ export function createApp(config = {}) {
       if (method === 'POST' && urlPath === '/api/active-thread') {
         const body = await parseBody(req);
         if (body.threadId && body.workspace) gatewayClient.setActiveThread(null, body.workspace, body.threadId);
+        return send(res, 200, { ok: true });
+      }
+
+      if (method === 'POST' && urlPath === '/api/incognito/cleanup') {
+        const { sessionKey, threadId } = await parseBody(req);
+        if (sessionKey) cleanGatewaySession(sessionKey);
+        if (threadId) { try { fs.rmSync(path.join(UPLOADS_DIR, threadId), { recursive: true }); } catch { /* ok */ } }
         return send(res, 200, { ok: true });
       }
 
