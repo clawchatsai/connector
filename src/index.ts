@@ -132,7 +132,7 @@ interface PluginApi {
     start: (ctx: PluginServiceContext) => Promise<void>;
     stop: (ctx: PluginServiceContext) => Promise<void>;
   }) => void;
-  registerCli: (handler: (ctx: PluginCliContext) => void) => void;
+  registerCli: (handler: (ctx: PluginCliContext) => void, opts?: { commands?: string[] }) => void;
   registerCommand: (opts: {
     name: string;
     description: string;
@@ -1600,7 +1600,7 @@ const plugin: OpenClawPluginDefinition = {
       cmd.command('import <path>')
         .description('Import databases and config from a folder (e.g. migrate from old data directory)')
         .action((srcPath: unknown) => handleImport(String(srcPath)));
-    });
+    }, { commands: ['clawchats'] });
 
     // Slash command for status from any channel
     api.registerCommand({
