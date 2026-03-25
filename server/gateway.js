@@ -168,6 +168,12 @@ export class GatewayClient {
     }
     if (state === 'aborted') {
       const parsed = parseSessionKey(sessionKey);
+      // Clear pending flag from DB so a stale pending:true doesn't survive page reloads
+      // and trigger phantom "thinking..." state on next visit to this thread.
+      if (parsed) {
+        const db = this.getDb(parsed.workspace);
+        if (db) this._clearPendingFlag(db, parsed.threadId);
+      }
       this.broadcastToBrowsers(rawData); // dual-emit
       if (parsed) {
         const activity = this._popActivityLogForSession(sessionKey);
@@ -182,6 +188,15 @@ export class GatewayClient {
         this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'error', errorMessage: gwErrorMessage || message?.error || message?.content || 'Unknown error', ...(activity || {}) }));
       }
     }
+  }
+
+  // Removes metadata.pending flag from any pending assistant message for a thread.
+  // Called on abort and by _cleanupSilentPending — keeps the SQL in one place.
+  _clearPendingFlag(db, threadId) {
+    db.prepare(
+      "UPDATE messages SET metadata = json_remove(metadata, '$.pending') " +
+      "WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1"
+    ).run(threadId);
   }
 
   _cleanupSilentPending(sessionKey) {
