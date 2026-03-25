@@ -27,6 +27,10 @@ import { dispatchRpc, type RpcRequest } from './shim.js';
 import { initAuth, handleAuthMessage, cleanupAuth, isAuthenticated, type AuthConfig } from './auth-handler.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
+import { fileURLToPath } from 'node:url';
+// ESM __dirname polyfill (package.json has "type":"module")
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 // Inline from shared/api-version.ts to avoid rootDir conflict
 const CURRENT_API_VERSION = 1;
 
@@ -161,11 +165,7 @@ interface OpenClawPluginDefinition {
 // Config helpers
 // ---------------------------------------------------------------------------
 
-const CONFIG_DIR = path.join(
-  process.env.HOME || '/root',
-  '.openclaw',
-  'clawchats',
-);
+const CONFIG_DIR = path.join(os.homedir(), '.openclaw', 'clawchats');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const RUNTIME_FILE = path.join(CONFIG_DIR, 'runtime.json');
 
@@ -401,7 +401,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
   });
 
   // 5. Connect to signaling server
-  const _hostname = (() => { try { return require('os').hostname(); } catch { return undefined; } })();
+  const _hostname = os.hostname();
   signaling = new SignalingClient(config.serverUrl, config.userId, config.apiKey, {
     gatewayId: config.gatewayId,
     hostname: _hostname,
@@ -1010,7 +1010,7 @@ async function handleSetup(token: string, options: { skipTotp?: boolean } = {}):
   // Read gateway token from OpenClaw config
   let gatewayToken = '';
   try {
-    const openclawConfigPath = path.join(process.env.HOME || '/root', '.openclaw', 'openclaw.json');
+    const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
     const openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf8'));
     gatewayToken = openclawConfig.gateway?.auth?.token || openclawConfig.auth?.token || openclawConfig.token || '';
   } catch {
@@ -1035,7 +1035,7 @@ async function handleSetup(token: string, options: { skipTotp?: boolean } = {}):
     }, 30_000);
 
     ws.on('open', () => {
-      const setupHostname = (() => { try { return require('os').hostname(); } catch { return undefined; } })();
+      const setupHostname = os.hostname();
       ws.send(JSON.stringify({
         type: 'setup',
         setupSecret: tokenData.setupSecret,
