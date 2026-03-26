@@ -26,11 +26,11 @@ export class ThreadController {
         if (!matchingIds.length) return send(res, 200, { threads: [], total: 0, page });
         const ph = matchingIds.map(() => '?').join(',');
         total = db.prepare(`SELECT COUNT(*) as c FROM threads WHERE id IN (${ph})`).get(...matchingIds).c;
-        threads = db.prepare(`SELECT * FROM threads WHERE id IN (${ph}) ORDER BY pinned DESC, sort_order DESC, updated_at DESC LIMIT ? OFFSET ?`).all(...matchingIds, limit, offset);
+        threads = db.prepare(`SELECT t.*, EXISTS(SELECT 1 FROM messages WHERE thread_id = t.id AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1) as has_pending FROM threads t WHERE t.id IN (${ph}) ORDER BY t.pinned DESC, t.sort_order DESC, t.updated_at DESC LIMIT ? OFFSET ?`).all(...matchingIds, limit, offset);
       } catch { return send(res, 200, { threads: [], total: 0, page }); }
     } else {
       total = db.prepare('SELECT COUNT(*) as c FROM threads').get().c;
-      threads = db.prepare('SELECT * FROM threads ORDER BY pinned DESC, sort_order DESC, updated_at DESC LIMIT ? OFFSET ?').all(limit, offset);
+      threads = db.prepare(`SELECT t.*, EXISTS(SELECT 1 FROM messages WHERE thread_id = t.id AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1) as has_pending FROM threads t ORDER BY t.pinned DESC, t.sort_order DESC, t.updated_at DESC LIMIT ? OFFSET ?`).all(limit, offset);
     }
     send(res, 200, { threads, total, page });
   }
