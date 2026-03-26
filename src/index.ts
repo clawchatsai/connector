@@ -984,6 +984,32 @@ function formatStatus(): string {
 // CLI handlers
 // ---------------------------------------------------------------------------
 
+/**
+ * Patch OpenClaw gateway config to disable daily session reset for webchat channel.
+ * This prevents ClawChats conversation history from being wiped at 6am.
+ * Additive-only: existing custom webchat config is never overwritten.
+ * Returns true if the config was patched, false if already configured or on error.
+ */
+function configureSessionPersistence(openclawConfigPath: string): boolean {
+  try {
+    const raw = fs.readFileSync(openclawConfigPath, 'utf8');
+    const cfg = JSON.parse(raw);
+    // Don't overwrite if user already has a custom webchat reset policy
+    if (cfg.session?.resetByChannel?.webchat) {
+      return false;
+    }
+    if (!cfg.session) cfg.session = {};
+    if (!cfg.session.resetByChannel) cfg.session.resetByChannel = {};
+    cfg.session.resetByChannel.webchat = { mode: 'idle', idleMinutes: 999999 };
+    fs.writeFileSync(openclawConfigPath, JSON.stringify(cfg, null, 2), 'utf8');
+    console.log('  Session persistence enabled for ClawChats sessions ✅');
+    return true;
+  } catch (e: unknown) {
+    console.log(`  ⚠️  Could not configure session persistence: ${(e as Error).message}`);
+    return false;
+  }
+}
+
 async function handleSetup(token: string, options: { skipTotp?: boolean } = {}): Promise<void> {
   // Decode base64 token
   let tokenData: { serverUrl: string; setupSecret: string; expiresAt: string };
@@ -1009,8 +1035,8 @@ async function handleSetup(token: string, options: { skipTotp?: boolean } = {}):
 
   // Read gateway token from OpenClaw config
   let gatewayToken = '';
+  const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
   try {
-    const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
     const openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf8'));
     gatewayToken = openclawConfig.gateway?.auth?.token || openclawConfig.auth?.token || openclawConfig.token || '';
   } catch {
@@ -1081,6 +1107,9 @@ async function handleSetup(token: string, options: { skipTotp?: boolean } = {}):
         fs.mkdirSync(uploadsDir, { recursive: true });
 
         ws.close();
+
+        // Auto-configure session persistence (additive, skipped if already set)
+        configureSessionPersistence(openclawConfigPath);
 
         if (options.skipTotp) {
           // Agent-driven flow: skip interactive TOTP enrollment.
