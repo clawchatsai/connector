@@ -77,6 +77,69 @@ Config is read in priority order:
 2. `~/.openclaw/openclaw.json` (OpenClaw gateway config)
 3. `config.js` in the plugin directory (local override, gitignored)
 
+## Development
+
+To work on the connector locally alongside the ClawChats frontend:
+
+### Prerequisites
+
+- Node.js 22+
+- OpenClaw installed and on your `PATH`
+- The `clawchats` repo cloned at `~/clawchats` (or set `CONNECTOR_DIR` when calling its `dev.sh`)
+
+### Build
+
+```bash
+npm install
+npm run build        # tsc — compiles src/ → dist/
+node esbuild.config.mjs   # bundles server/ → server.js (production deploy only)
+```
+
+Or use the dev script:
+
+```bash
+./dev.sh             # watch-mode tsc (recompiles on save)
+./dev.sh --once      # single build
+./dev.sh --server    # esbuild bundle (for deploy)
+```
+
+### Running the full stack
+
+The connector runs as an OpenClaw plugin — it can't run standalone. Use the ClawChats dev stack to run everything together:
+
+```bash
+# From the clawchats repo:
+cd ~/clawchats && ./dev.sh --skip-build
+```
+
+See the ClawChats frontend repo for the full dev stack setup flow.
+
+### Hot-reload loop
+
+```bash
+# Terminal 1 — watch-mode compiler
+cd ~/connector && ./dev.sh
+
+# Terminal 2 — full stack (no rebuild)
+cd ~/clawchats && ./dev.sh --skip-build
+```
+
+After each tsc rebuild, reload the plugin:
+```bash
+openclaw --dev gateway restart
+```
+
+### Publishing
+
+Releases are automated via GitHub Actions. Push a tag to trigger:
+
+```bash
+git tag v0.1.3
+git push origin main --tags
+```
+
+The workflow runs `npm publish` to `@clawchatsai/connector` automatically. Do not run `npm publish` manually.
+
 ## License
 
 [AGPL-3.0-only](LICENSE) — source is open for audit and contribution.
