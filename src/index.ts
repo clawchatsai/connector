@@ -1279,12 +1279,12 @@ async function handleSetupTotp(): Promise<void> {
       totpSecret = existing.secret;
     } else {
       // Expired — generate a fresh one
-      totpSecret = generateTotpSecret();
+      totpSecret = process.env.CLAWCHATS_DEV_TOTP_SECRET || generateTotpSecret();
       config.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() };
       saveConfig(config);
     }
   } else {
-    totpSecret = generateTotpSecret();
+    totpSecret = process.env.CLAWCHATS_DEV_TOTP_SECRET || generateTotpSecret();
     config.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() };
     saveConfig(config);
   }
