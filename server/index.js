@@ -344,6 +344,7 @@ export function createApp(config = {}) {
     closeAllDbs: closeAll,
     gatewayClient,
     setupBrowserWs,
+    debugLogger,
     dataDir: DATA_DIR,
   };
 }

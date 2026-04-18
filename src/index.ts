@@ -60,6 +60,11 @@ interface AppInstance {
     removeBroadcastTarget: (fn: (data: string) => void) => void;
   };
   setupBrowserWs: (wss: unknown) => void;
+  debugLogger: {
+    start: (ts: string, originatingClient: unknown) => { sessionId: string | null; error?: string };
+    saveDump: (payload: Record<string, unknown>) => { sessionId: string | null; files: string[] };
+    handleClientDisconnect: (ws: unknown) => void;
+  };
   dataDir: string;
 }
 
@@ -732,6 +737,7 @@ function setupDataChannelHandler(
   dc.onClosed(() => {
     connectedClients.delete(connectionId);
     cleanupAuth(connectionId);
+    app?.debugLogger.handleClientDisconnect(dc);
   });
 }
 
@@ -841,6 +847,25 @@ function processAuthenticatedMessage(
     case 'ping':
       dc.send(JSON.stringify({ type: 'pong' }));
       break;
+
+    case 'clawchats':
+    case 'shellchat': {
+      if (!app) break;
+      const action = msg['action'];
+      if (action === 'debug-start') {
+        const ts = typeof msg['ts'] === 'string' ? msg['ts'] : new Date().toISOString();
+        const r = app.debugLogger.start(ts, dc);
+        dc.send(JSON.stringify(
+          r.error === 'already-active'
+            ? { type: 'clawchats', event: 'debug-error', error: 'Recording already active in another tab', sessionId: r.sessionId }
+            : { type: 'clawchats', event: 'debug-started', sessionId: r.sessionId }
+        ));
+      } else if (action === 'debug-dump') {
+        const r = app.debugLogger.saveDump(msg);
+        dc.send(JSON.stringify({ type: 'clawchats', event: 'debug-saved', sessionId: r.sessionId, files: r.files }));
+      }
+      break;
+    }
 
     default:
       // Unknown message type — ignore silently.
