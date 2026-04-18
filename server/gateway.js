@@ -22,6 +22,10 @@ export class GatewayClient {
     this.streamState = new Map();
     this.activityLogs = new Map();
     this._pendingTitleGens = new Map();
+    // Runs we've already synthesized a streaming-end{reason:'error'} for
+    // (agent lifecycle:error emitted but no chat state:error ever will). Prevents
+    // double-fires across retries and cross-path dedup with handleChatEvent.
+    this._syntheticErrorRuns = new Set();
 
     // On startup: mark any pending activity log messages from previous crashed/restarted sessions
     // as interrupted. Without this, stale pending=true rows survive gateway restarts and cause
@@ -402,6 +406,29 @@ export class GatewayClient {
       log.finalSteps = cleanSteps;
       log.finalSummary = generateActivitySummary(log.steps);
       // Note: activityLogs entry is kept until _popActivityLogForSession cleans it up
+      //
+      // Fallback: if the gateway never emitted any chat.* events for this session
+      // (e.g. pre-reply provider error on a non-webchat surface where the chat
+      // broadcast is gated off upstream), handleChatEvent won't fire a
+      // streaming-end and the UI stays locked on "thinking…" forever. Synthesize
+      // one here so the frontend's existing error path (`reason: 'error'`) runs.
+      if (data?.phase === 'error' && !this.streamState.has(sessionKey) && !this._syntheticErrorRuns.has(runId)) {
+        this._syntheticErrorRuns.add(runId);
+        const parsed = parseSessionKey(sessionKey);
+        if (parsed) {
+          this.broadcastToBrowsers(JSON.stringify({
+            type: 'clawchats',
+            event: 'streaming-end',
+            threadId: parsed.threadId,
+            workspace: parsed.workspace,
+            reason: 'error',
+            errorMessage: data?.error || 'Agent failed before reply',
+          }));
+        }
+        // Bound the set — auto-evict after the retry window so long-lived
+        // processes don't leak. 5 min is far longer than any retry chain.
+        setTimeout(() => this._syntheticErrorRuns.delete(runId), 5 * 60 * 1000);
+      }
     }
   }
 
