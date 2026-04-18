@@ -271,7 +271,7 @@ Notes:
 - Output each path once — duplicates are ignored automatically
 `;
 
-async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaStash: Map<string, string[]>): Promise<void> {
+async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<void> {
   _stopRequested = false;
 
   // Bootstrap CLAWCHATS.md in the agent workspace so the agent always knows the MEDIA: protocol.
@@ -388,7 +388,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi, mediaSt
       return process.env.OPENAI_API_KEY || null;
     })(),
     memoryEnv:     memoryEnvFiltered,
-    mediaStash,    // Shared Map populated by after_tool_call hook (captures MEDIA: paths from exec)
   });
 
   // 4. Connect createApp's gateway client (handles persistence + event relay)
@@ -1542,47 +1541,23 @@ const plugin: OpenClawPluginDefinition = {
   description: 'Connects your gateway to ClawChats via WebRTC P2P',
 
   register(api: PluginApi) {
-    // Shared stash: after_tool_call hook populates this; saveAssistantMessage reads + clears it.
-    // Keyed by sessionKey → absolute paths extracted from MEDIA: lines in exec stdout.
-    const mediaStash = new Map<string, string[]>();
-
     // Inject MEDIA: capability note into the system prompt via before_prompt_build.
     // Appended to system context (trusted, not user-turn) so it's always present and
     // never flagged as prompt injection. Survives compaction automatically.
+    //
+    // Path parsing lives in server/gateway.js handleAgentEvent (stable singleton) —
+    // do NOT hold state in this closure; OpenClaw may call register() multiple times
+    // during the plugin lifecycle and each call creates a fresh closure.
     api.on('before_prompt_build', (_event, _ctx) => {
       return {
         appendSystemContext: 'ClawChats inline preview: after writing a file with the Write tool, run `echo "MEDIA:/absolute/path/to/file"` via the exec tool to display it inline in the chat UI.',
       };
     }, { name: 'clawchats-media-hint', description: 'Appends MEDIA: file preview capability note to system prompt' });
 
-    api.on('after_tool_call', (event, ctx) => {
-      if (event.toolName !== 'exec' && event.toolName !== 'process') return;
-      // result is { content: [{ type: 'text', text: '...' }] } — extract text defensively
-      const result = event.result as Record<string, unknown> | null;
-      let text = '';
-      if (typeof result?.text === 'string') {
-        text = result.text;
-      } else if (Array.isArray((result as any)?.content)) {
-        text = ((result as any).content as Array<{type: string; text?: string}>)
-          .filter(c => c.type === 'text' && typeof c.text === 'string')
-          .map(c => c.text as string)
-          .join('\n');
-      } else if (result != null) {
-        text = String(result);
-      }
-      const paths = [...text.matchAll(/^MEDIA:\s*(\S+)/gm)].map(m => m[1].trim());
-      if (paths.length === 0) return;
-      const sessionKey = ctx.sessionKey as string;
-      if (!sessionKey) return;
-      const existing = mediaStash.get(sessionKey) ?? [];
-      mediaStash.set(sessionKey, [...new Set([...existing, ...paths])]);
-      console.log(`[clawchats] media-capture: stashed ${paths.length} path(s) for ${sessionKey}:`, paths);
-    }, { name: 'clawchats-media-capture', description: 'Captures MEDIA: paths from exec results for inline image rendering' });
-
     // Background service: signaling + gateway bridge + future WebRTC
     api.registerService({
       id: 'connector-service',
-      start: (ctx) => startClawChats(ctx, api, mediaStash),
+      start: (ctx) => startClawChats(ctx, api),
       stop: (ctx) => stopClawChats(ctx),
     });
 

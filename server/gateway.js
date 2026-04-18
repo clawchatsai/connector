@@ -4,14 +4,16 @@ import { loadOrCreateDeviceIdentity, buildDeviceAuth } from './bootstrap/identit
 import { parseSessionKey, extractContent, isSilentReplyExact, isSilentReplyPrefix, sanitizeAssistantContent, syncThreadUnreadCount, generateActivitySummary, writeActivityToDb } from './util/helpers.js';
 
 export class GatewayClient {
-  constructor({ getDb, getWorkspaces, dataDir, debugLogger, gatewayWsUrl, authToken, mediaStash }) {
+  constructor({ getDb, getWorkspaces, dataDir, debugLogger, gatewayWsUrl, authToken }) {
     this.getDb = getDb;
     this.getWorkspaces = getWorkspaces;
     this.dataDir = dataDir;
     this.debugLogger = debugLogger;
     this.gatewayWsUrl = gatewayWsUrl;
     this.authToken = authToken;
-    this.mediaStash = mediaStash;
+    // Per-session buffer of MEDIA: paths extracted from exec tool args (echo "MEDIA:/...").
+    // Lives on the stable singleton — safe from plugin re-registration that broke the old closure-based stash.
+    this._runMediaPaths = new Map();
 
     this.ws = null;
     this.connected = false;
@@ -228,10 +230,10 @@ export class GatewayClient {
     // Intermediate narration lives in activityLog steps; message.content is the clean final answer.
     let content = sanitizeAssistantContent(extractContent(message).substring(thoughtStartOffset));
 
-    // Attach media (MEDIA: lines from exec stdout captured by after_tool_call hook).
-    // Stash is read before the empty-content guard — media-only responses (no text) must not be dropped.
-    const pendingPaths = this.mediaStash?.get(sessionKey) ?? [];
-    this.mediaStash?.delete(sessionKey);
+    // Attach media (MEDIA: paths extracted from exec tool args by handleAgentEvent).
+    // Buffer is read before the empty-content guard — media-only responses (no text) must not be dropped.
+    const pendingPaths = this._runMediaPaths.get(sessionKey) ?? [];
+    this._runMediaPaths.delete(sessionKey);
     const IMAGE_EXTS = new Set(['png','jpg','jpeg','gif','webp','bmp','svg','ico','avif','tiff']);
     const AUDIO_EXTS = new Set(['mp3','wav','ogg','m4a','flac','aac','opus','wma']);
     const imagePaths = [], pendingAttachments = [];
@@ -367,6 +369,16 @@ export class GatewayClient {
         log._currentAssistantSegment._sealed = true;
       }
       const argsMeta = data?.args ? (data.args.command || data.args.path || data.args.query || data.args.url || Object.values(data.args).find(v => typeof v === 'string') || '') : '';
+      // Extract MEDIA: paths from exec tool's echo command at phase:start.
+      // The agent signals inline media with `echo "MEDIA:/absolute/path"` (see plugin's before_prompt_build hint).
+      // Parsing the tool args here keeps state on this stable singleton instead of the plugin's re-registered closure.
+      if (sessionKey && (data?.name === 'exec' || data?.name === 'process') && data?.phase === 'start' && typeof data?.args?.command === 'string') {
+        const paths = [...data.args.command.matchAll(/MEDIA:([^\s"'`]+)/g)].map(m => m[1]).filter(Boolean);
+        if (paths.length > 0) {
+          const existing = this._runMediaPaths.get(sessionKey) ?? [];
+          this._runMediaPaths.set(sessionKey, [...new Set([...existing, ...paths])]);
+        }
+      }
       const step = { type: 'tool', timestamp: Date.now(), name: data?.name || 'unknown', phase: data?.phase || 'start', toolCallId: data?.toolCallId, meta: data?.meta || (argsMeta ? String(argsMeta) : undefined), isError: data?.isError || false };
       if (data?.phase === 'result') {
         const existing = log.steps.findLast(s => s.toolCallId === data.toolCallId && (s.phase === 'start' || s.phase === 'running'));

@@ -83,7 +83,6 @@ export function createApp(config = {}) {
   const { getWorkspaces, setWorkspaces } = createWorkspaceStore(WORKSPACES_FILE);
 
   const debugLogger = new DebugLogger(DATA_DIR);
-  const mediaStash = config.mediaStash ?? new Map();
 
   const memoryConfig = discoverMemoryConfig(config.memoryEnv || {});
   const memoryProvider = createMemoryProvider(memoryConfig);
@@ -91,7 +90,7 @@ export function createApp(config = {}) {
   const MEMORY_FILES_DIR = path.join(memoryConfig.workspaceDir, 'memory');
 
   // Instantiate the gateway client with all dependencies injected
-  const gatewayClient = new GatewayClient({ getDb, getWorkspaces, dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken, mediaStash });
+  const gatewayClient = new GatewayClient({ getDb, getWorkspaces, dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken });
   const broadcast = msg => gatewayClient.broadcastToBrowsers(msg);
 
   // Instantiate controllers
