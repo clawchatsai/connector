@@ -292,7 +292,7 @@ export class GatewayClient {
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) return;
     const now = Date.now();
     try {
-      db.prepare('INSERT INTO messages (id, thread_id, role, content, status, metadata, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(`gw-error-${parsed.threadId}-${now}`, parsed.threadId, 'system', `[error] ${gwErrorMessage || message?.error || message?.content || 'Unknown error'}`, 'sent', '{"transient":true}', now, now);
+      db.prepare('INSERT INTO messages (id, thread_id, role, content, status, metadata, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(`gw-error-${parsed.threadId}-${now}`, parsed.threadId, 'system', `[error] ${message?.error || message?.content || 'Unknown error'}`, 'sent', '{"transient":true}', now, now);
       // Clear stale pending flag so browsers reloading the chat don't re-derive "thinking..." state.
       db.prepare("UPDATE messages SET metadata = json_remove(metadata, '$.pending') WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1").run(parsed.threadId);
     } catch (e) { console.error('Failed to save error marker:', e.message); }
@@ -428,6 +428,11 @@ export class GatewayClient {
         this._syntheticErrorRuns.add(runId);
         const parsed = parseSessionKey(sessionKey);
         if (parsed) {
+          // Mirror the state:'error' path — writeActivityToDb just set metadata.pending=true,
+          // and without this the flag survives: loadHistory re-derives has_pending on reconnect,
+          // "thinking…" sticks, and sendMessage's isStreaming() guard queues future sends into
+          // _pendingSend forever.
+          this.saveErrorMarker(sessionKey, { error: data?.error || 'Agent failed before reply' });
           this.broadcastToBrowsers(JSON.stringify({
             type: 'clawchats',
             event: 'streaming-end',
