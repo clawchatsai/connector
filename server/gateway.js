@@ -11,9 +11,13 @@ export class GatewayClient {
     this.debugLogger = debugLogger;
     this.gatewayWsUrl = gatewayWsUrl;
     this.authToken = authToken;
-    // Per-session buffer of MEDIA: paths extracted from exec tool args (echo "MEDIA:/...").
+    // Per-session buffer of attachment paths captured during a run. Drained by saveAssistantMessage.
+    // Sources: (1) MEDIA: paths from exec tool's echo args, (2) Write/Edit tool args.path.
     // Lives on the stable singleton — safe from plugin re-registration that broke the old closure-based stash.
     this._runMediaPaths = new Map();
+    // Per-toolCallId staging for Write/Edit: path captured at phase:start, promoted to _runMediaPaths
+    // at phase:result if the call succeeded. Keyed by toolCallId; value: { sessionKey, path }.
+    this._runWriteBuffers = new Map();
 
     this.ws = null;
     this.connected = false;
@@ -377,6 +381,31 @@ export class GatewayClient {
         if (paths.length > 0) {
           const existing = this._runMediaPaths.get(sessionKey) ?? [];
           this._runMediaPaths.set(sessionKey, [...new Set([...existing, ...paths])]);
+        }
+      }
+      // Capture Write/Edit tool paths. The split pane (and existing attachment chip render) handles
+      // any text-ish or PDF file, so allow that broad set; image/audio extensions also flow through
+      // — saveAssistantMessage routes them by ext (image → markdown, audio → audio chip).
+      // Buffer at phase:start when args.path is present; promote to _runMediaPaths at phase:result
+      // only if the call succeeded — failed writes shouldn't surface a chip for a file that may not exist.
+      const VIEWABLE_EXTS = new Set([
+        'pdf','md','mdx','rst','txt','log',
+        'csv','tsv','json','xml','yaml','yml','toml','ini','env','conf',
+        'js','jsx','mjs','cjs','ts','tsx','py','rb','go','rs','java','c','cpp','h','hpp','cs','php',
+        'html','htm','css','scss','sass','less','sh','bash','zsh','sql','pl','lua','r','swift','kt','dart',
+        'png','jpg','jpeg','gif','webp','bmp','svg','ico','avif','tiff',
+        'mp3','wav','ogg','m4a','flac','aac','opus','wma'
+      ]);
+      if (sessionKey && data?.toolCallId && /^(write|edit|multiedit|notebookedit)$/i.test(data?.name || '') && data?.phase === 'start' && typeof data?.args?.path === 'string' && data.args.path.length > 0) {
+        const ext = (data.args.path.split('.').pop() || '').toLowerCase();
+        if (VIEWABLE_EXTS.has(ext)) this._runWriteBuffers.set(data.toolCallId, { sessionKey, path: data.args.path });
+      }
+      if (data?.toolCallId && data?.phase === 'result' && this._runWriteBuffers.has(data.toolCallId)) {
+        const buf = this._runWriteBuffers.get(data.toolCallId);
+        this._runWriteBuffers.delete(data.toolCallId);
+        if (!data.isError && buf.sessionKey === sessionKey) {
+          const existing = this._runMediaPaths.get(buf.sessionKey) ?? [];
+          this._runMediaPaths.set(buf.sessionKey, [...new Set([...existing, buf.path])]);
         }
       }
       const step = { type: 'tool', timestamp: Date.now(), name: data?.name || 'unknown', phase: data?.phase || 'start', toolCallId: data?.toolCallId, meta: data?.meta || (argsMeta ? String(argsMeta) : undefined), isError: data?.isError || false };
