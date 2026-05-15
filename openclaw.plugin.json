@@ -3,6 +3,9 @@
   "name": "ClawChats",
   "description": "Local chat backend and API bridge for OpenClaw.",
   "kind": "integration",
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": true,
