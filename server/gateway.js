@@ -77,7 +77,7 @@ export class GatewayClient {
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
       const identity = loadOrCreateDeviceIdentity(path.join(this.dataDir, 'device-identity.json'));
       const device = buildDeviceAuth(identity, { clientId: 'gateway-client', clientMode: 'backend', role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], token: this.authToken, nonce: msg.payload?.nonce || '' });
-      this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: { minProtocol: 3, maxProtocol: 3, client: { id: 'gateway-client', version: '0.1.0', platform: 'node', mode: 'backend' }, role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], device, auth: { token: this.authToken }, caps: ['tool-events'] } }));
+      this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: { minProtocol: 3, maxProtocol: 4, client: { id: 'gateway-client', version: '0.1.0', platform: 'node', mode: 'backend' }, role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], device, auth: { token: this.authToken }, caps: ['tool-events'] } }));
       return;
     }
     if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); }
