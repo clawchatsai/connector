@@ -15,6 +15,7 @@ import * as http from 'node:http';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createRequire } from 'node:module';
 import type { PluginConfig } from './gateway-bridge.js';
 import { SignalingClient } from './signaling-client.js';
 // Lazy-imported after ensureNativeModules() builds the native binary.
@@ -224,7 +225,20 @@ function getPrebuildKey(): string {
 
 async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   const pluginDir = path.resolve(__dirname, '..');
-  const targetPath = path.join(pluginDir, 'node_modules', 'node-datachannel', 'build', 'Release', 'node_datachannel.node');
+
+  // Resolve node-datachannel's actual install root (handles npm hoisting).
+  // Writing to <pluginDir>/node_modules/node-datachannel/ would create a
+  // package-shaped directory that lacks package.json + JS, shadowing the
+  // hoisted copy and breaking subpath imports like 'node-datachannel/polyfill'.
+  const require = createRequire(import.meta.url);
+  let ndcRoot: string;
+  try {
+    ndcRoot = path.dirname(require.resolve('node-datachannel/package.json'));
+  } catch {
+    ctx.logger.error('[clawchats] node-datachannel package not resolvable; WebRTC unavailable.');
+    return;
+  }
+  const targetPath = path.join(ndcRoot, 'build', 'Release', 'node_datachannel.node');
 
   // Already built — nothing to do.
   if (fs.existsSync(targetPath)) return;
