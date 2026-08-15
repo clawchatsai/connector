@@ -33,6 +33,16 @@ export class GatewayClient {
     // double-fires across retries and cross-path dedup with handleChatEvent.
     this._syntheticErrorRuns = new Set();
 
+    // Runs that already delivered a reply the user can see (persisted + broadcast).
+    // The gateway may report a run-level fault AFTER the reply is delivered — a retried
+    // tool call, or a post_turn/gateway_draining fault (see OpenClaw's
+    // AGENT_RUN_TERMINAL_RETRY_GRACE_MS deferral). Those describe the run, not the reply,
+    // and must never overwrite a message the user already read. Keyed by runId because
+    // sessionKey is stable for the whole thread — a late error from turn N must not be
+    // confused with a live error from turn N+1. Mirrors the OCPlatform TUI's
+    // finalizedRunsWithDisplay guard.
+    this._runsWithDeliveredReply = new Set();
+
     // On startup: mark any pending activity log messages from previous crashed/restarted sessions
     // as interrupted. Without this, stale pending=true rows survive gateway restarts and cause
     // phantom "thinking..." indicators in the browser on reconnect.
@@ -90,7 +100,7 @@ export class GatewayClient {
   }
 
   handleChatEvent(params, rawData) {
-    const { sessionKey, state, message, seq, errorMessage: gwErrorMessage } = params;
+    const { sessionKey, state, message, seq, runId, errorMessage: gwErrorMessage } = params;
     const bareSessionKey = sessionKey.replace(/^agent:[^:]+:/, '');
 
     // --- Utility session routing (connector-side) ---
@@ -168,7 +178,8 @@ export class GatewayClient {
         return;
       }
       if (streamEntry?.held?.length > 0) for (const h of streamEntry.held) this.broadcastToBrowsers(h);
-      this.saveAssistantMessage(sessionKey, message, seq, streamEntry?.thoughtStartOffset); // persist + broadcast message-saved first
+      const delivered = this.saveAssistantMessage(sessionKey, message, seq, streamEntry?.thoughtStartOffset); // persist + broadcast message-saved first
+      if (delivered && runId) this._runsWithDeliveredReply.add(runId);
       this.broadcastToBrowsers(rawData);                   // dual-emit: raw final event
       if (parsed) {
         const activity = this._popActivityLogForSession(sessionKey);
@@ -190,6 +201,13 @@ export class GatewayClient {
         this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'aborted', ...(activity || {}) }));
       }
     } else if (state === 'error') {
+      // Late run-level fault for a run that already delivered its reply — drop it.
+      // Emitting streaming-end{reason:'error'} here makes the browser replace the
+      // rendered answer with an error bubble, destroying a message the user already read.
+      if (runId && this._runsWithDeliveredReply.has(runId)) {
+        console.log(`[clawchats] ignoring late error for run ${runId} — reply already delivered`);
+        return;
+      }
       const parsed = parseSessionKey(sessionKey);
       this.saveErrorMarker(sessionKey, message);
       this.broadcastToBrowsers(rawData); // dual-emit
@@ -221,13 +239,16 @@ export class GatewayClient {
     // Caller broadcasts streaming-end { reason: 'silent' } — no event emitted here.
   }
 
+  // Returns true when a reply was actually persisted for this run, false on every
+  // early-out. handleChatEvent uses the result to decide whether the run counts as
+  // having delivered a visible reply.
   saveAssistantMessage(sessionKey, message, seq, thoughtStartOffset = 0) {
     const parsed = parseSessionKey(sessionKey);
-    if (!parsed) return;
+    if (!parsed) return false;
     const ws = this.getWorkspaces();
-    if (!ws.workspaces[parsed.workspace]) { console.log(`Ignoring response for deleted workspace: ${parsed.workspace}`); return; }
+    if (!ws.workspaces[parsed.workspace]) { console.log(`Ignoring response for deleted workspace: ${parsed.workspace}`); return false; }
     const db = this.getDb(parsed.workspace);
-    if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) { console.log(`Ignoring response for deleted thread: ${parsed.threadId}`); return; }
+    if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) { console.log(`Ignoring response for deleted thread: ${parsed.threadId}`); return false; }
 
     // Trim to final-answer portion: only text after the last tool call offset.
     // thoughtStartOffset is passed in from handleChatEvent (captured before streamState.delete).
@@ -256,7 +277,7 @@ export class GatewayClient {
     // If a pending row exists, always proceed to update it (even with empty content) so the
     // pending flag is cleared. Without this, tool-only responses (no post-tool text) leave
     // pending=true forever, and the startup cleanup marks them '[Response interrupted]'.
-    if (!content?.trim() && pendingPaths.length === 0 && !pendingMsg) { console.log(`Skipping empty assistant response for thread ${parsed.threadId}`); return; }
+    if (!content?.trim() && pendingPaths.length === 0 && !pendingMsg) { console.log(`Skipping empty assistant response for thread ${parsed.threadId}`); return false; }
     let messageId;
 
     if (pendingMsg) {
@@ -285,6 +306,9 @@ export class GatewayClient {
       const msgCount = db.prepare('SELECT COUNT(*) as c FROM messages WHERE thread_id = ?').get(parsed.threadId).c;
       if (msgCount === 2 || threadInfo?.title === 'New chat') this.generateThreadTitle(db, parsed.threadId, parsed.workspace, true);
     } catch (e) { console.error('Failed to save assistant message:', e.message); }
+    // The message row is written above the try block, so it is persisted even if the
+    // follow-up bookkeeping/broadcast throws — the reply was delivered either way.
+    return true;
   }
 
   saveErrorMarker(sessionKey, message) {
@@ -453,7 +477,10 @@ export class GatewayClient {
       // broadcast is gated off upstream), handleChatEvent won't fire a
       // streaming-end and the UI stays locked on "thinking…" forever. Synthesize
       // one here so the frontend's existing error path (`reason: 'error'`) runs.
-      if (data?.phase === 'error' && !this.streamState.has(sessionKey) && !this._syntheticErrorRuns.has(runId)) {
+      // `!streamState.has(sessionKey)` is also true for a run that finished cleanly (the entry
+      // is deleted on every terminal state), so the delivered-reply check is what distinguishes
+      // "never produced a reply" from "already delivered one".
+      if (data?.phase === 'error' && !this.streamState.has(sessionKey) && !this._syntheticErrorRuns.has(runId) && !this._runsWithDeliveredReply.has(runId)) {
         this._syntheticErrorRuns.add(runId);
         const parsed = parseSessionKey(sessionKey);
         if (parsed) {
