@@ -24,13 +24,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.14.0'          # Minimum required for npm Trusted Publishing
+          node-version: '22.22.2'          # Minimum Node that satisfies the pinned npm below
           registry-url: 'https://registry.npmjs.org'
           # NOTE: Do NOT set NODE_AUTH_TOKEN — OIDC handles auth automatically
 
       - name: Upgrade npm (Trusted Publishing requires 11.5.1+)
         run: |
-          npm install -g npm@latest
+          # Pinned, not @latest: 11.5.1 is the floor for Trusted Publishing, and an
+          # unpinned npm silently upgrades into new majors. npm@12 requires Node
+          # >=22.22.2, which broke the v0.1.13 publish on a workflow nobody had touched
+          # since May. Bump this deliberately, together with node-version above.
+          npm install -g npm@11.5.1
           echo "npm version: $(npm --version)"
 
       - name: Verify version matches tag
