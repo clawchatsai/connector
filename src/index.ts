@@ -223,6 +223,26 @@ function getPrebuildKey(): string {
   return `${platform}-${arch}`;
 }
 
+/**
+ * Resolve a package's install root without relying on subpath access to its
+ * package.json. Node treats an "exports" map as an allowlist, so
+ * require.resolve('<pkg>/package.json') throws for any package that does not
+ * explicitly export it. Resolving the main entry is always permitted, so walk
+ * up from there to the directory named after the package.
+ */
+function resolvePackageRoot(require: NodeRequire, pkgName: string): string | undefined {
+  let entry: string;
+  try {
+    entry = require.resolve(pkgName);
+  } catch {
+    return undefined;
+  }
+  const marker = `${path.sep}${pkgName}${path.sep}`;
+  const idx = entry.lastIndexOf(marker);
+  if (idx === -1) return undefined;
+  return entry.slice(0, idx + marker.length - 1);
+}
+
 async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   const pluginDir = path.resolve(__dirname, '..');
 
@@ -230,11 +250,15 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   // Writing to <pluginDir>/node_modules/node-datachannel/ would create a
   // package-shaped directory that lacks package.json + JS, shadowing the
   // hoisted copy and breaking subpath imports like 'node-datachannel/polyfill'.
+  //
+  // Resolve via the package's main entry, NOT 'node-datachannel/package.json':
+  // node-datachannel's exports map declares only "." and "./polyfill", so asking
+  // for the package.json subpath always throws ERR_PACKAGE_PATH_NOT_EXPORTED.
+  // That made this function bail out before copying anything on every install;
+  // it only appeared to work where a binary already existed from a source build.
   const require = createRequire(import.meta.url);
-  let ndcRoot: string;
-  try {
-    ndcRoot = path.dirname(require.resolve('node-datachannel/package.json'));
-  } catch {
+  const ndcRoot = resolvePackageRoot(require, 'node-datachannel');
+  if (!ndcRoot) {
     ctx.logger.error('[clawchats] node-datachannel package not resolvable; WebRTC unavailable.');
     return;
   }
@@ -262,7 +286,14 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
     fs.copyFileSync(prebuiltPath, targetPath);
     ctx.logger.info('[clawchats] node-datachannel ready.');
   } catch (e) {
-    ctx.logger.error(`[clawchats] Failed to install prebuilt: ${(e as Error).message}`);
+    // Surface the manual remedy: the service import fails moments later with an
+    // opaque "Cannot find module '../../../build/Release/node_datachannel.node'",
+    // which says nothing about what to actually do.
+    ctx.logger.error(
+      `[clawchats] Failed to install prebuilt: ${(e as Error).message}\n` +
+      `  To fix manually:\n    mkdir -p ${path.dirname(targetPath)}\n` +
+      `    cp ${prebuiltPath} ${targetPath}`,
+    );
   }
 }
 
