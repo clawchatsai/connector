@@ -7,6 +7,10 @@ export class GatewayClient {
   constructor({ getDb, getWorkspaces, dataDir, debugLogger, gatewayWsUrl, authToken }) {
     this.getDb = getDb;
     this.getWorkspaces = getWorkspaces;
+    // Every path where a gateway-supplied workspace name reaches storage must go through
+    // this instead of getDb(). Bound as a field so it can be handed to writeActivityToDb()
+    // in place of the raw getDb it used to receive. See _isRegisteredWorkspace().
+    this._registeredDb = name => (this._isRegisteredWorkspace(name) ? this.getDb(name) : null);
     this.dataDir = dataDir;
     this.debugLogger = debugLogger;
     this.gatewayWsUrl = gatewayWsUrl;
@@ -55,18 +59,37 @@ export class GatewayClient {
     } catch (e) { console.log('[clawchats] startup pending cleanup skipped:', e.message); }
 
     // Periodically clean up stale activity logs (>10 min old)
-    setInterval(() => {
-      const cutoff = Date.now() - 10 * 60 * 1000;
-      for (const [runId, log] of this.activityLogs) {
-        if (log.startTime < cutoff) {
-          if (log._messageId) {
-            const db = this.getDb(log._parsed?.workspace);
-            if (db) db.prepare(`UPDATE messages SET content = '[Response interrupted]', metadata = json_remove(metadata, '$.pending') WHERE id = ? AND content = ''`).run(log._messageId);
-          }
-          this.activityLogs.delete(runId);
+    setInterval(() => this._sweepStaleActivityLogs(), 5 * 60 * 1000).unref(); // housekeeping only — must not hold the process open
+  }
+
+  // Body of the housekeeping interval, named so a test can drive one sweep instead of
+  // waiting five minutes for the timer.
+  _sweepStaleActivityLogs() {
+    const cutoff = Date.now() - 10 * 60 * 1000;
+    for (const [runId, log] of this.activityLogs) {
+      if (log.startTime < cutoff) {
+        if (log._messageId) {
+          const db = this._registeredDb(log._parsed?.workspace);
+          if (db) db.prepare(`UPDATE messages SET content = '[Response interrupted]', metadata = json_remove(metadata, '$.pending') WHERE id = ? AND content = ''`).run(log._messageId);
         }
+        this.activityLogs.delete(runId);
       }
-    }, 5 * 60 * 1000).unref(); // housekeeping only — must not hold the process open
+    }
+  }
+
+  // workspaces.json is the register of what exists, and getDb() creates the file it cannot
+  // open — so a name nobody registered mints data/<name>.db, storage that
+  // GET /api/workspaces never lists (it iterates the register) and
+  // DELETE /api/workspaces/:name refuses to remove (it 404s on an unregistered name).
+  // Session keys arrive from the gateway and name a workspace that may have been deleted
+  // mid-run, so every storage path here has to check first.
+  //
+  // Object.hasOwn, not a bare property read: "constructor", "toString" and friends read as
+  // present on a plain object. Same check the request boundary makes in index.js
+  // handleRequest() — the two must not drift. The typeof guard keeps a null/undefined name
+  // from being coerced to the key "undefined", which is a registrable workspace name.
+  _isRegisteredWorkspace(name) {
+    return typeof name === 'string' && Object.hasOwn(this.getWorkspaces().workspaces || {}, name);
   }
 
   connect() {
@@ -192,7 +215,7 @@ export class GatewayClient {
       // Clear pending flag from DB so a stale pending:true doesn't survive page reloads
       // and trigger phantom "thinking..." state on next visit to this thread.
       if (parsed) {
-        const db = this.getDb(parsed.workspace);
+        const db = this._registeredDb(parsed.workspace);
         if (db) this._clearPendingFlag(db, parsed.threadId);
       }
       this.broadcastToBrowsers(rawData); // dual-emit
@@ -230,9 +253,7 @@ export class GatewayClient {
   _cleanupSilentPending(sessionKey) {
     const parsed = parseSessionKey(sessionKey);
     if (!parsed) return;
-    const ws = this.getWorkspaces();
-    if (!ws.workspaces[parsed.workspace]) return;
-    const db = this.getDb(parsed.workspace);
+    const db = this._registeredDb(parsed.workspace);
     if (!db) return;
     const result = db.prepare(`DELETE FROM messages WHERE thread_id = ? AND role = 'assistant' AND json_extract(metadata, '$.pending') = 1`).run(parsed.threadId);
     if (result.changes > 0) console.log(`[clawchats] silent-reply cleanup: removed ${result.changes} pending message(s) for ${parsed.threadId}`);
@@ -245,9 +266,8 @@ export class GatewayClient {
   saveAssistantMessage(sessionKey, message, seq, thoughtStartOffset = 0) {
     const parsed = parseSessionKey(sessionKey);
     if (!parsed) return false;
-    const ws = this.getWorkspaces();
-    if (!ws.workspaces[parsed.workspace]) { console.log(`Ignoring response for deleted workspace: ${parsed.workspace}`); return false; }
-    const db = this.getDb(parsed.workspace);
+    const db = this._registeredDb(parsed.workspace);
+    if (!db) { console.log(`Ignoring response for deleted workspace: ${parsed.workspace}`); return false; }
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) { console.log(`Ignoring response for deleted thread: ${parsed.threadId}`); return false; }
 
     // Trim to final-answer portion: only text after the last tool call offset.
@@ -314,9 +334,8 @@ export class GatewayClient {
   saveErrorMarker(sessionKey, message) {
     const parsed = parseSessionKey(sessionKey);
     if (!parsed) return;
-    const ws = this.getWorkspaces();
-    if (!ws.workspaces[parsed.workspace]) return;
-    const db = this.getDb(parsed.workspace);
+    const db = this._registeredDb(parsed.workspace);
+    if (!db) return;
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(parsed.threadId)) return;
     const now = Date.now();
     try {
@@ -371,7 +390,9 @@ export class GatewayClient {
     let title = content.trim().replace(/^["']|["']$/g, '').replace(/^Title:\s*/i, '').replace(/\n.*/s, '').trim();
     if (title.length > 50) title = title.substring(0, 47) + '...';
     if (!title || title.length >= 100) return true;
-    const db = this.getDb(pending.workspace);
+    // The workspace can be deleted inside the 30s the title request is in flight.
+    const db = this._registeredDb(pending.workspace);
+    if (!db) return true;
     db.prepare('UPDATE threads SET title = ? WHERE id = ?').run(title, pending.threadId);
     this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'thread-title-updated', threadId: pending.threadId, workspace: pending.workspace, title }));
     console.log(`AI title generated for ${pending.threadId}: "${title}"`);
@@ -388,7 +409,7 @@ export class GatewayClient {
       let step = log.steps.find(s => s.type === 'thinking');
       if (step) step.text = data?.text || '';
       else log.steps.push({ type: 'thinking', timestamp: Date.now(), text: data?.text || '' });
-      writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
+      writeActivityToDb(this._registeredDb, this.broadcastToBrowsers.bind(this), runId, log);
       const now = Date.now();
       if (!log._lastThinkingBroadcast || now - log._lastThinkingBroadcast >= 300) { log._lastThinkingBroadcast = now; this._broadcastActivityUpdate(runId, log); }
     }
@@ -471,14 +492,14 @@ export class GatewayClient {
         const existing = log.steps.findLast(s => s.toolCallId === data.toolCallId);
         if (existing) { if (data?.meta) existing.resultMeta = data.meta; if (data?.isError) existing.isError = true; existing.phase = 'running'; }
       } else log.steps.push(step);
-      writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
+      writeActivityToDb(this._registeredDb, this.broadcastToBrowsers.bind(this), runId, log);
       this._broadcastActivityUpdate(runId, log);
     }
     if (stream === 'lifecycle' && (data?.phase === 'end' || data?.phase === 'error')) {
       if (log._currentAssistantSegment && !log._currentAssistantSegment._sealed) {
         log._currentAssistantSegment._sealed = true;
       }
-      writeActivityToDb(this.getDb, this.broadcastToBrowsers.bind(this), runId, log);
+      writeActivityToDb(this._registeredDb, this.broadcastToBrowsers.bind(this), runId, log);
       // Store finalized state — streaming-end (handleChatEvent) will pick it up and carry it
       // as one atomic payload. Do NOT broadcast activity-updated here anymore.
       const cleanSteps = log.steps.map(s => { const c = { ...s }; delete c._sealed; return c; });
@@ -584,9 +605,8 @@ export class GatewayClient {
     if (client) { client.activeWorkspace = workspace; client.activeThreadId = threadId; }
     if (!workspace || !threadId) return;
     try {
-      const wsData = this.getWorkspaces();
-      if (!wsData.workspaces[workspace]) return;
-      const db = this.getDb(workspace);
+      const db = this._registeredDb(workspace);
+      if (!db) return;
       if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(threadId)) return;
       const deleted = db.prepare('DELETE FROM unread_messages WHERE thread_id = ?').run(threadId);
       if (deleted.changes > 0) {
