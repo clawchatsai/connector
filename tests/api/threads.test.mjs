@@ -5,6 +5,8 @@
 // must not be swallowed by `GET /api/threads/:id`.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { startTestServer, createThread } from '../helpers/harness.mjs';
 import { syncThreadUnreadCount } from '../../server/util/helpers.js';
 
@@ -296,6 +298,104 @@ describe('DELETE /api/threads/:id', () => {
 
     assert.equal(db.prepare('SELECT COUNT(*) as c FROM messages WHERE thread_id = ?').get(id).c, 0);
     assert.equal(db.prepare('SELECT id FROM threads WHERE id = ?').get(id), undefined);
+  });
+});
+
+// uploads/ is keyed by thread id alone — uploadsDir/<threadId>, no workspace segment —
+// but thread ids are not unique across workspaces, so one thread's delete could take
+// another workspace's live attachments with it (CLA-1419).
+describe('DELETE /api/threads/:id — uploads shared by a same-id thread', () => {
+  let srv;
+  before(async () => {
+    srv = await startTestServer();
+    const created = await srv.api('POST', '/api/workspaces', { body: { name: 'second' } });
+    assert.equal(created.status, 201, 'workspace setup: second');
+  });
+  after(async () => { await srv.close(); });
+
+  /** Put one attachment on disk for `id` and return its path. */
+  function seedUpload(id, name = 'attachment.txt') {
+    const dir = path.join(srv.uploadsDir, id);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, 'payload');
+    return file;
+  }
+
+  /** Import a thread with a caller-supplied id into `workspace` — the path that mints the collision. */
+  async function importThread(id, workspace) {
+    const res = await srv.api('POST', '/api/import', {
+      body: { threads: [{ id, title: 'Shared id', messages: [] }] },
+      headers: { 'x-workspace': workspace },
+    });
+    assert.equal(res.status, 200, `import into ${workspace}`);
+    assert.equal(res.body.threadsImported, 1, `import into ${workspace} inserted no row`);
+  }
+
+  test('keeps the attachments when the same id is still live in another workspace', async () => {
+    const id = 'shared-id-two-workspaces';
+    await importThread(id, 'default');
+    await importThread(id, 'second');
+    const file = seedUpload(id);
+
+    const res = await srv.api('DELETE', `/api/threads/${id}`, { headers: { 'x-workspace': 'default' } });
+    assert.equal(res.status, 200);
+
+    // The copy in "second" is untouched and its attachment is still readable.
+    assert.equal(srv.app.getDb('second').prepare('SELECT id FROM threads WHERE id = ?').get(id).id, id);
+    assert.equal(fs.existsSync(file), true, 'the surviving thread\'s attachment was destroyed');
+    const served = await srv.api('GET', `/api/uploads/${id}/attachment.txt`);
+    assert.equal(served.status, 200);
+  });
+
+  // The arm check for the test above: without it, a guard that simply stopped deleting
+  // uploads altogether would pass, and the leak it introduces would be invisible.
+  test('still deletes the attachments when no other workspace holds the id', async () => {
+    const id = 'sole-copy-of-the-id';
+    await importThread(id, 'default');
+    const file = seedUpload(id);
+
+    const res = await srv.api('DELETE', `/api/threads/${id}`, { headers: { 'x-workspace': 'default' } });
+    assert.equal(res.status, 200);
+
+    assert.equal(fs.existsSync(file), false, 'the sole copy\'s attachments were left behind');
+    assert.equal(fs.existsSync(path.join(srv.uploadsDir, id)), false);
+  });
+
+  test('keeps the attachments when another workspace\'s database cannot be read', async () => {
+    const id = 'unreadable-neighbour';
+    await importThread(id, 'default');
+    const file = seedUpload(id);
+
+    // A workspace that cannot be queried cannot rule the duplicate out. Deleting on
+    // that basis is unrecoverable, so the guard has to fail towards keeping the files.
+    const second = srv.app.getDb('second');
+    const real = second.prepare.bind(second);
+    second.prepare = sql => {
+      if (/FROM threads WHERE id = \?/.test(sql)) throw new Error('injected: database disk image is malformed');
+      return real(sql);
+    };
+    try {
+      const res = await srv.api('DELETE', `/api/threads/${id}`, { headers: { 'x-workspace': 'default' } });
+      assert.equal(res.status, 200, 'an unreadable neighbour must not turn the delete into a 500');
+    } finally {
+      second.prepare = real;
+    }
+
+    assert.equal(fs.existsSync(file), true, 'the guard must fail towards keeping the attachments');
+  });
+
+  test('the last workspace to delete the id reclaims the attachments', async () => {
+    const id = 'shared-id-deleted-twice';
+    await importThread(id, 'default');
+    await importThread(id, 'second');
+    const file = seedUpload(id);
+
+    await srv.api('DELETE', `/api/threads/${id}`, { headers: { 'x-workspace': 'default' } });
+    assert.equal(fs.existsSync(file), true, 'the first delete must not touch the shared directory');
+
+    await srv.api('DELETE', `/api/threads/${id}`, { headers: { 'x-workspace': 'second' } });
+    assert.equal(fs.existsSync(path.join(srv.uploadsDir, id)), false, 'the last delete must reclaim the directory');
   });
 });
 
