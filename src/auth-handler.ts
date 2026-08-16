@@ -15,6 +15,7 @@ import * as crypto from 'node:crypto';
 import { verifyTotp, verifyBackupCode } from './totp.js';
 import { verifyGoogleIdToken, clearJWKSCache } from './google-jwt.js';
 import { issueSessionToken, verifySessionToken } from './session-token.js';
+import type { PluginConfig } from './gateway-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -43,6 +44,15 @@ export interface AuthConfig {
 export interface DataChannelSend {
   send: (data: string) => void;
 }
+
+/**
+ * Whether a plugin config is complete enough to gate the DataChannel.
+ * `missing` names the absent config fields for the gateway log — it is never
+ * sent to the browser, which gets only the generic setup prompt.
+ */
+export type AuthGate =
+  | { mode: 'enabled' }
+  | { mode: 'blocked'; missing: string[] };
 
 type AuthState = 'awaiting-auth' | 'authenticated' | 'failed';
 
@@ -78,6 +88,32 @@ const BLOCK_DURATION_MS = 60_000;
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * Decide the DataChannel auth posture for a plugin config.
+ *
+ * Fails closed: only a complete schemaVersion >= 2 auth config enables the
+ * DataChannel. Everything else blocks — no config at all, a v1 config, and
+ * (the case this exists for) a v2 config carrying a partial auth block, which
+ * an interrupted migration, a hand edit or a setup path that writes TOTP
+ * before the session secret can all produce. Such a config looks fully
+ * 2FA-configured and used to fall through to unauthenticated access.
+ *
+ * Spec: datachannel-auth-totp.md §13 issue 5.
+ */
+export function resolveAuthGate(config: PluginConfig | null): AuthGate {
+  if (!config) {
+    return { mode: 'blocked', missing: ['config'] };
+  }
+
+  const missing: string[] = [];
+  const version = typeof config.schemaVersion === 'number' ? config.schemaVersion : 0;
+  if (version < 2) missing.push('schemaVersion >= 2');
+  if (!config.totp?.secret) missing.push('totp.secret');
+  if (!config.sessionSecret) missing.push('sessionSecret');
+
+  return missing.length === 0 ? { mode: 'enabled' } : { mode: 'blocked', missing };
+}
 
 /**
  * Initialize auth for a new DataChannel connection.
