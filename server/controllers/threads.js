@@ -6,9 +6,10 @@ import { getSessionsDirForAgent } from '../config.js';
 import { cleanGatewaySession } from '../gateway-cleanup.js';
 
 export class ThreadController {
-  constructor({ getActiveDb, getWorkspaces, uploadsDir, broadcast }) {
+  constructor({ getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir, broadcast }) {
     this.getActiveDb = getActiveDb;
     this.getWorkspaces = getWorkspaces;
+    this.getRequestWorkspace = getRequestWorkspace;
     this.uploadsDir = uploadsDir;
     this.broadcast = broadcast;
   }
@@ -59,9 +60,13 @@ export class ThreadController {
     const ws = this.getWorkspaces();
     const id = body.id || uuid();
     const now = Date.now();
-    const agent = ws.workspaces[ws.active]?.agent || 'main';
+    // Key the thread to the workspace this request targets (x-workspace), not the
+    // process-global active one — the row is written to the targeted workspace's db,
+    // and parseSessionKey() routes gateway events back by this key.
+    const workspace = this.getRequestWorkspace();
+    const agent = ws.workspaces[workspace]?.agent || 'main';
     try {
-      db.prepare('INSERT INTO threads (id, session_key, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(id, `agent:${agent}:${ws.active}:chat:${id}`, 'New chat', now, now);
+      db.prepare('INSERT INTO threads (id, session_key, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(id, `agent:${agent}:${workspace}:chat:${id}`, 'New chat', now, now);
     } catch (e) {
       if (e.message.includes('UNIQUE constraint')) return sendError(res, 409, 'Thread already exists');
       throw e;

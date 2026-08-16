@@ -60,9 +60,15 @@ export function createApp(config = {}) {
     db.exec('PRAGMA foreign_keys = ON');
     migrate(db);
     dbCache.set(workspaceName, db);
+    // After caching, so a failed repair cannot leave the handle uncached and
+    // re-run on every subsequent request.
+    repairSessionKeyWorkspace(db, workspaceName, getWorkspaces().workspaces[workspaceName]?.agent || 'main');
     return db;
   }
-  function getActiveDb() { return requestDbStore.getStore() || getDb(getWorkspaces().active); }
+  // The per-request store carries { db, workspace }: the database alone is not
+  // enough, because a session_key has to name the workspace the request targets.
+  function getActiveDb() { return requestDbStore.getStore()?.db || getDb(getWorkspaces().active); }
+  function getRequestWorkspace() { return requestDbStore.getStore()?.workspace || getWorkspaces().active; }
   function closeDb(name) { const db = dbCache.get(name); if (db) { db.close(); dbCache.delete(name); } }
   function closeAll() { for (const db of dbCache.values()) db.close(); dbCache.clear(); globalDbCache.close?.(); }
 
@@ -96,8 +102,8 @@ export function createApp(config = {}) {
 
   // Instantiate controllers
   const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast });
-  const threads    = new ThreadController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, broadcast });
-  const messages   = new MessageController({ getActiveDb, getWorkspaces, broadcast });
+  const threads    = new ThreadController({ getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir: UPLOADS_DIR, broadcast });
+  const messages   = new MessageController({ getActiveDb, getWorkspaces, getRequestWorkspace, broadcast });
   const files      = new FileController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
 
@@ -121,8 +127,8 @@ export function createApp(config = {}) {
     try {
       const wsName = req.headers?.['x-workspace'];
       if (wsName && !isValidWorkspaceName(wsName)) return sendError(res, 400, 'Invalid x-workspace header');
-      const db = wsName ? getDb(wsName) : getActiveDb();
-      return await requestDbStore.run(db, () => route(req, res));
+      const workspace = wsName || getWorkspaces().active;
+      return await requestDbStore.run({ db: getDb(workspace), workspace }, () => route(req, res));
     } catch (e) {
       console.error('Unhandled error resolving request:', e);
       if (!res.headersSent) sendError(res, 500, 'Internal server error');
@@ -387,6 +393,39 @@ function migrate(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS unread_messages (thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (thread_id, message_id), FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_unread_thread ON unread_messages(thread_id)');
   ensureFts(db);
+}
+
+// CLA-1274: threads created while a different workspace was active were keyed to
+// that active workspace instead of the one they were written to. The database file
+// a row lives in is ground truth for which workspace owns it, so re-key any row
+// whose key disagrees. Rows whose workspace segment is already correct are left
+// untouched, including their agent segment, which PATCH /api/workspaces/:name owns.
+//
+// The gateway session minted under the stale key is deliberately left alone. Unlike
+// SQLite, the gateway session store is not per-workspace: sessions.json is resolved
+// per *agent* (getSessionsDirForAgent) and keyed by the full session key, so entries
+// for every workspace sharing an agent live in one file. A stale key here may there-
+// fore be a session another workspace still legitimately owns — exporting a thread
+// from one workspace and importing it into another reproduces exactly that, since
+// export emits session_key and import preserves it. Deleting it would destroy a live
+// transcript belonging to a workspace nobody asked us to touch. Leaving the entry is
+// inert: the re-keyed thread simply opens a new gateway session under its new key.
+function repairSessionKeyWorkspace(db, workspace, agent) {
+  if (!workspace) return;
+  const stale = db.prepare('SELECT id, session_key FROM threads').all().filter(row => {
+    const parts = (row.session_key || '').split(':');
+    return parts.length >= 5 && parts[0] === 'agent' && parts[3] === 'chat' && parts[2] !== workspace;
+  });
+  if (!stale.length) return;
+  const update = db.prepare('UPDATE threads SET session_key = ? WHERE id = ?');
+  let repaired = 0;
+  for (const row of stale) {
+    try { update.run(`agent:${agent}:${workspace}:chat:${row.id}`, row.id); }
+    catch (e) { console.warn(`[DB] session_key repair skipped for thread ${row.id}:`, e.message); continue; }
+    console.warn(`[DB] Thread ${row.id} re-keyed to workspace "${workspace}"; gateway session "${row.session_key}" left in place (may belong to another workspace)`);
+    repaired++;
+  }
+  if (repaired) console.log(`[DB] Re-keyed ${repaired} thread(s) to workspace "${workspace}"`);
 }
 
 function createFts(db) {
