@@ -140,6 +140,10 @@ git push origin main --tags
 
 The workflow runs `npm publish` to `@clawchatsai/connector` automatically. Do not run `npm publish` manually.
 
+### Review and merge
+
+`main` requires a pull request. See [docs/review-and-merge.md](docs/review-and-merge.md) for the branch protection rules and where review is recorded.
+
 ## License
 
 [AGPL-3.0-only](LICENSE) — source is open for audit and contribution.
