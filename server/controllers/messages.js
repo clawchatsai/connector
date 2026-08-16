@@ -44,7 +44,7 @@ export class MessageController {
           const title = body.content.replace(/\n.*/s, '').slice(0, 40).trim() + (body.content.length > 40 ? '...' : '');
           if (title) {
             db.prepare('UPDATE threads SET title = ? WHERE id = ?').run(title, params.id);
-            this.broadcast(JSON.stringify({ type: 'clawchats', event: 'thread-title-updated', threadId: params.id, workspace: this.getWorkspaces().active, title }));
+            this.broadcast(JSON.stringify({ type: 'clawchats', event: 'thread-title-updated', threadId: params.id, workspace: this.getRequestWorkspace(), title }));
           }
         }
       }
@@ -84,10 +84,11 @@ export class MessageController {
 
   export(req, res) {
     const db = this.getActiveDb();
-    const ws = this.getWorkspaces();
     const threads = db.prepare('SELECT * FROM threads ORDER BY updated_at DESC').all();
     send(res, 200, {
-      workspace: ws.active,
+      // The dump is of the targeted workspace's database, so it must name that
+      // workspace — import() mints session keys from this label — see CLA-1279.
+      workspace: this.getRequestWorkspace(),
       exportedAt: Date.now(),
       threads: threads.map(t => {
         const messages = db.prepare('SELECT * FROM messages WHERE thread_id = ? ORDER BY timestamp ASC').all(t.id);

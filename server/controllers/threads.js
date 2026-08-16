@@ -50,7 +50,10 @@ export class ThreadController {
     const ph = messageIds.map(() => '?').join(',');
     db.prepare(`DELETE FROM unread_messages WHERE thread_id = ? AND message_id IN (${ph})`).run(params.id, ...messageIds);
     const remaining = syncThreadUnreadCount(db, params.id);
-    this.broadcast(JSON.stringify({ type: 'clawchats', event: 'unread-update', workspace: this.getWorkspaces().active, threadId: params.id, action: 'read', messageIds, unreadCount: remaining, timestamp: Date.now() }));
+    // Name the workspace this request targeted: app.js routes unread-update by the
+    // `workspace` field (`workspace === this.activeWorkspace`), so labelling it with
+    // the process-global active workspace clears the wrong badge — see CLA-1279.
+    this.broadcast(JSON.stringify({ type: 'clawchats', event: 'unread-update', workspace: this.getRequestWorkspace(), threadId: params.id, action: 'read', messageIds, unreadCount: remaining, timestamp: Date.now() }));
     send(res, 200, { unread_count: remaining });
   }
 
