@@ -3,14 +3,42 @@ import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { syncThreadUnreadCount } from '../util/helpers.js';
 import { getSessionsDirForAgent } from '../config.js';
-import { cleanGatewaySession } from '../gateway-cleanup.js';
+import { cleanGatewaySession, renameGatewaySession } from '../gateway-cleanup.js';
+import { intelligencePath } from './files.js';
+import { isValidWorkspaceName } from '../util/workspace-name.js';
+
+// How many times move() re-tries withdrawing its target-side copy when the source
+// delete fails. Small and synchronous — see the invariant note on move().
+const UNDO_ATTEMPTS = 3;
+
+// node:sqlite's DatabaseSync has no better-sqlite3-style db.transaction(); drive it
+// explicitly, as POST /api/prompts does.
+function inTransaction(db, fn) {
+  db.exec('BEGIN');
+  try { const out = fn(); db.exec('COMMIT'); return out; }
+  // A throwing ROLLBACK would replace the error that actually caused the failure with
+  // a much less useful one, so it never escapes.
+  catch (e) { try { db.exec('ROLLBACK'); } catch { /* keep the original error */ } throw e; }
+}
+
+// Both workspace databases are built by the same migrate(), so a row's own keys are
+// the column list. Hardcoding one rots the moment a migration adds a column — the
+// threads table has already grown sort_order, unread_count and metadata that way.
+function copyRows(db, table, rows) {
+  if (!rows.length) return;
+  const cols = Object.keys(rows[0]);
+  const insert = db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`);
+  for (const row of rows) insert.run(...cols.map(c => row[c]));
+}
 
 export class ThreadController {
-  constructor({ getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir, broadcast }) {
+  constructor({ getDb, getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir, intelligenceDir, broadcast }) {
+    this.getDb = getDb;
     this.getActiveDb = getActiveDb;
     this.getWorkspaces = getWorkspaces;
     this.getRequestWorkspace = getRequestWorkspace;
     this.uploadsDir = uploadsDir;
+    this.intelligenceDir = intelligenceDir;
     this.broadcast = broadcast;
   }
 
@@ -101,6 +129,126 @@ export class ThreadController {
       db.prepare(`UPDATE threads SET ${fields.join(', ')} WHERE id = ?`).run(...values);
     }
     send(res, 200, { thread: db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id) });
+  }
+
+  // Move a thread, its messages and its unread bookkeeping into another workspace's
+  // database. Body key is `workspace`, matching what the frontend already sends
+  // (clawchats PR #164, `moveChat()`).
+  //
+  // parseBody() is the only `await` in this handler, and it is taken before any state
+  // is read. Everything from the source lookup to the source delete is therefore one
+  // uninterrupted synchronous block, which is the only reason two concurrent moves of
+  // the same thread cannot interleave: the second request cannot observe the first
+  // mid-move. Do not add an `await` below this line — it would silently reopen that
+  // window and turn the id-collision check at :164 into a TOCTOU race.
+  async move(req, res, params) {
+    const body = await parseBody(req);
+    const target = body.workspace;
+    if (typeof target !== 'string' || !target) return sendError(res, 400, 'workspace is required');
+
+    // The name reaches path.join() twice below — getDb()'s `<name>.db` and the
+    // intelligence directory — so it goes through the shared validator rather than
+    // trusting the registry to hold only names POST /api/workspaces vetted.
+    // getWorkspaces() parses workspaces.json without validating its keys, so a
+    // hand-edited, restored or older-version registry is enough to put "../../etc/foo"
+    // in front of both. This is the third entry point for a workspace name; the other
+    // two (the x-workspace header, workspace creation) already check here.
+    if (!isValidWorkspaceName(target)) return sendError(res, 400, 'Invalid workspace name');
+
+    // Object.hasOwn, not a plain read: "constructor" resolves on the prototype, and
+    // getDb() would then mint a database for a workspace nobody registered (CLA-1331).
+    const ws = this.getWorkspaces();
+    if (!Object.hasOwn(ws.workspaces, target)) return sendError(res, 404, 'Target workspace not found');
+
+    // The workspace this request targets (x-workspace), never the process-global
+    // active one: moving a thread out of A while B happens to be active has to read
+    // and delete from A. Same reasoning as CLA-1279.
+    const source = this.getRequestWorkspace();
+    if (source === target) return sendError(res, 400, 'Thread is already in this workspace');
+
+    const srcDb = this.getActiveDb();
+    const thread = srcDb.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
+    if (!thread) return sendError(res, 404, 'Thread not found');
+
+    const tgtDb = this.getDb(target);
+    // Thread ids are not unique across workspaces — POST /api/import preserves
+    // caller-supplied ids — so refuse rather than overwrite the target's thread.
+    if (tgtDb.prepare('SELECT id FROM threads WHERE id = ?').get(params.id)) {
+      return sendError(res, 409, 'A thread with this id already exists in the target workspace');
+    }
+
+    const messages = srcDb.prepare('SELECT * FROM messages WHERE thread_id = ?').all(params.id);
+    const unread = srcDb.prepare('SELECT * FROM unread_messages WHERE thread_id = ?').all(params.id);
+    // Re-key to the target, or parseSessionKey() would keep routing this thread's
+    // gateway events at the workspace it just left.
+    const newSessionKey = `agent:${ws.workspaces[target].agent || 'main'}:${target}:chat:${params.id}`;
+
+    // SQLite offers no cross-database atomicity: a transaction spanning two ATTACHed
+    // databases is documented as non-atomic once either is in WAL mode, and both of
+    // ours are. So the halves run in order, each in its own transaction, ordered so
+    // that any failure leaves the thread intact in exactly one workspace — the target
+    // write commits first, and only then is the source deleted.
+    inTransaction(tgtDb, () => {
+      copyRows(tgtDb, 'threads', [{ ...thread, session_key: newSessionKey }]);
+      copyRows(tgtDb, 'messages', messages);
+      copyRows(tgtDb, 'unread_messages', unread);
+    });
+    try {
+      // Messages and unread rows go with it: both cascade off threads.id, and the
+      // cascade fires the messages_ad trigger, so the source FTS index is cleaned too.
+      // delete() relies on the same cascade.
+      srcDb.prepare('DELETE FROM threads WHERE id = ?').run(params.id);
+    } catch (e) {
+      // The target half has already committed, so the copy has to come back out or the
+      // thread is live in both workspaces at once. Both databases are WAL files on the
+      // same disk, so whatever broke the source delete — a full disk, a read-only
+      // remount, SQLITE_BUSY under checkpoint pressure — is quite likely to break the
+      // first undo attempt too. Hence the retry.
+      //
+      // The retry is deliberately synchronous: awaiting a backoff here would break the
+      // single-`await` invariant documented above this method.
+      let undoErr = null;
+      for (let attempt = 0; attempt < UNDO_ATTEMPTS; attempt++) {
+        try { tgtDb.prepare('DELETE FROM threads WHERE id = ?').run(params.id); undoErr = null; break; }
+        catch (err) { undoErr = err; }
+      }
+      // Confirm by reading the row back rather than inferring success from a statement
+      // that did not throw. Only a positive readback clears this: if the check itself
+      // throws we cannot prove the copy is gone, and a duplicate we cannot rule out has
+      // to be reported exactly like one we have confirmed.
+      let undone = false;
+      try { undone = !tgtDb.prepare('SELECT id FROM threads WHERE id = ?').get(params.id); }
+      catch { /* unprovable — leave undone false */ }
+
+      if (!undone) {
+        // Say so loudly and in the response. Reporting this as a plain failure is the
+        // one genuinely misleading outcome: the caller would drop the thread back into
+        // the source list and never learn that the target holds a live copy too. Both
+        // copies carry valid, distinct session keys, so repairSessionKeyWorkspace()
+        // considers neither stale and nothing reconciles them on restart.
+        const why = undoErr ? undoErr.message : `still present after ${UNDO_ATTEMPTS} attempts`;
+        console.error(`[move] DUPLICATE: thread ${params.id} is live in both "${source}" and "${target}". The source delete failed (${e.message}) and the copy could not be withdrawn (${why}). "${source}" holds the authoritative copy; the one in "${target}" is an unintended duplicate and should be removed once the underlying fault is cleared.`);
+        return sendError(res, 500, `Move failed and left a duplicate: thread ${params.id} is now in both "${source}" and "${target}". The copy in "${source}" is authoritative.`);
+      }
+      throw e;
+    }
+
+    // Sidecars that are keyed by workspace have to follow the thread. Uploads do not:
+    // they live under uploadsDir/<threadId>, which no workspace name enters.
+    // Surfaced in the response: the rename refuses when the workspaces run different
+    // agents or the new key is taken, and the thread then starts a fresh transcript.
+    // The move still succeeded, so this is a qualification on success rather than a
+    // failure, and the caller can say so instead of claiming an unqualified move.
+    const sessionMoved = renameGatewaySession(thread.session_key, newSessionKey);
+    const fromPath = intelligencePath(this.intelligenceDir, source, params.id);
+    if (fs.existsSync(fromPath)) {
+      const toPath = intelligencePath(this.intelligenceDir, target, params.id);
+      try { fs.mkdirSync(path.dirname(toPath), { recursive: true }); fs.renameSync(fromPath, toPath); }
+      catch (err) { console.warn(`[move] intelligence for thread ${params.id} left in "${source}":`, err.message); }
+    }
+
+    this.broadcast(JSON.stringify({ type: 'clawchats', event: 'thread-moved', threadId: params.id, fromWorkspace: source, toWorkspace: target, timestamp: Date.now() }));
+    send(res, 200, { ok: true, sessionMoved, thread: tgtDb.prepare('SELECT * FROM threads WHERE id = ?').get(params.id) });
   }
 
   delete(req, res, params) {
