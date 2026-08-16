@@ -66,7 +66,7 @@ export class GatewayClient {
           this.activityLogs.delete(runId);
         }
       }
-    }, 5 * 60 * 1000);
+    }, 5 * 60 * 1000).unref(); // housekeeping only — must not hold the process open
   }
 
   connect() {

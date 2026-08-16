@@ -25,6 +25,7 @@ import { createWorkspaceStore } from './store/workspace-store.js';
 import { cleanGatewaySession } from './gateway-cleanup.js';
 import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
+import { isValidWorkspaceName } from './util/workspace-name.js';
 
 const HOME = os.homedir();
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -114,9 +115,18 @@ export function createApp(config = {}) {
 
   // Request handler
   async function handleRequest(req, res) {
-    const wsName = req.headers?.['x-workspace'];
-    const db = wsName ? getDb(wsName) : getActiveDb();
-    return requestDbStore.run(db, () => route(req, res));
+    // Database resolution sits outside route()'s try/catch, so anything that
+    // throws here (unopenable file, bad permissions, disk full) would surface as
+    // an unhandled rejection and take the whole process down.
+    try {
+      const wsName = req.headers?.['x-workspace'];
+      if (wsName && !isValidWorkspaceName(wsName)) return sendError(res, 400, 'Invalid x-workspace header');
+      const db = wsName ? getDb(wsName) : getActiveDb();
+      return await requestDbStore.run(db, () => route(req, res));
+    } catch (e) {
+      console.error('Unhandled error resolving request:', e);
+      if (!res.headersSent) sendError(res, 500, 'Internal server error');
+    }
   }
 
   async function route(req, res) {
@@ -203,10 +213,17 @@ export function createApp(config = {}) {
         const prompts = Array.isArray(body) ? body : [];
         const db = globalDbCache.get();
         const upsert = db.prepare('INSERT OR REPLACE INTO prompts (id, title, content, category, variables, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
-        db.transaction(() => {
+        // node:sqlite's DatabaseSync has no better-sqlite3-style db.transaction();
+        // drive the transaction explicitly.
+        db.exec('BEGIN');
+        try {
           db.prepare('DELETE FROM prompts').run();
           for (const p of prompts) upsert.run(p.id, p.title, p.content, p.category || '', JSON.stringify(p.variables || []), p.createdAt || Date.now(), p.updatedAt || Date.now());
-        })();
+          db.exec('COMMIT');
+        } catch (e) {
+          db.exec('ROLLBACK');
+          throw e;
+        }
         return send(res, 200, { ok: true });
       }
 
@@ -411,8 +428,8 @@ if (isDirectRun) {
   const wss = new WebSocketServer({ noServer: true });
   app.setupBrowserWs(wss);
   server.on('upgrade', (req, socket, head) => { wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws, req)); });
-  server.listen(PORT, () => {
-    console.log(`ClawChats backend listening on port ${PORT}`);
+  server.listen(DEFAULT_PORT, () => {
+    console.log(`ClawChats backend listening on port ${DEFAULT_PORT}`);
     console.log(`Active workspace: ${app.getWorkspaces().active}`);
     console.log(`Data dir: ${app.dataDir}`);
     app.gatewayClient.connect();

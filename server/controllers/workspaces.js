@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody } from '../util/http.js';
 import { validateAgent } from '../config.js';
+import { isValidWorkspaceName } from '../util/workspace-name.js';
 import { cleanGatewaySession, cleanGatewaySessionsByPrefix } from '../gateway-cleanup.js';
 
 export class WorkspaceController {
@@ -28,7 +29,7 @@ export class WorkspaceController {
   async create(req, res) {
     const body = await parseBody(req);
     const { name, label } = body;
-    if (!name || !/^[a-z0-9-]{1,32}$/.test(name)) return sendError(res, 400, 'Name must be [a-z0-9-], 1-32 chars');
+    if (!isValidWorkspaceName(name)) return sendError(res, 400, 'Name must be [a-z0-9-], 1-32 chars');
     const ws = this.getWorkspaces();
     if (ws.workspaces[name]) return sendError(res, 409, 'Workspace already exists');
     let agent = 'main';
