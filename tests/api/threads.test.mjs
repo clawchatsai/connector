@@ -133,6 +133,48 @@ describe('GET /api/threads (list) - ordering', () => {
   });
 });
 
+describe('GET /api/threads (list) - sort_order dominates the updated_at bump', () => {
+  let srv;
+  before(async () => { srv = await startTestServer(); });
+  after(async () => { await srv.close(); });
+
+  test('posting a message to a lower-sort_order thread does not move it up', async () => {
+    const high = await createThread(srv.api);
+    const low = await createThread(srv.api);
+    await srv.api('PATCH', `/api/threads/${high}`, { body: { sort_order: 5 } });
+    await srv.api('PATCH', `/api/threads/${low}`, { body: { sort_order: 1 } });
+
+    const before = await srv.api('GET', '/api/threads');
+    assert.deepEqual(before.body.threads.map(t => t.id), [high, low], 'baseline order');
+
+    // updated_at is Date.now() at millisecond resolution, so without a gap the
+    // two threads can tie and the ordering claim below becomes ambiguous.
+    await new Promise(resolve => setTimeout(resolve, 2));
+
+    // messages.create() requires id, role, content and timestamp and answers 400
+    // otherwise. Asserting the status is what stops this test degrading into a
+    // vacuous one: a silently rejected post bumps nothing and the final
+    // assertion then holds for the wrong reason.
+    const posted = await srv.api('POST', `/api/threads/${low}/messages`, {
+      body: { id: 'msg-bump-1', role: 'user', content: 'bump me', timestamp: Date.now() },
+    });
+    assert.equal(posted.status, 201, `message post must succeed: ${JSON.stringify(posted.body)}`);
+
+    // Prove the bump actually landed, so `updated_at DESC` alone would rank the
+    // low-sort_order thread first — that is the pressure this test applies.
+    const [lowRow, highRow] = await Promise.all([
+      srv.api('GET', `/api/threads/${low}`),
+      srv.api('GET', `/api/threads/${high}`),
+    ]);
+    assert.ok(lowRow.body.thread.updated_at > highRow.body.thread.updated_at,
+      'the insert must bump threads.updated_at past the other thread');
+
+    const after = await srv.api('GET', '/api/threads');
+    assert.deepEqual(after.body.threads.map(t => t.id), [high, low],
+      'sort_order outranks the fresher updated_at');
+  });
+});
+
 describe('GET /api/threads (list) - pagination', () => {
   let srv;
   before(async () => { srv = await startTestServer(); });

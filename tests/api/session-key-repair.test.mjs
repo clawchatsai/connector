@@ -6,20 +6,18 @@
 // matters as much as what it fixes.
 //
 // The sessions directory is resolved from os.homedir() at module load
-// (server/config.js), so HOME is redirected at a sandbox BEFORE the server is
-// imported. Node runs each test file in its own process, so this is contained.
+// (server/config.js), so HOME is redirected at a sandbox before the server is
+// imported — harness.mjs owns that ordering now. See helpers/sandbox-home.mjs.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-const sandboxHome = fs.mkdtempSync(path.join(os.tmpdir(), 'connector-test-home-'));
-process.env.HOME = sandboxHome;
-const sessionsDir = path.join(sandboxHome, '.openclaw', 'agents', 'main', 'sessions');
-fs.mkdirSync(sessionsDir, { recursive: true });
+import { startTestServer } from '../helpers/harness.mjs';
+import { sandboxSessionsDir, removeSandboxHome } from '../helpers/sandbox-home.mjs';
 
-const { startTestServer } = await import('../helpers/harness.mjs');
+const sessionsDir = sandboxSessionsDir('main');
 
 /** Stop a server without deleting its data dir, so the next one can reopen it. */
 async function softClose(srv) {
@@ -46,7 +44,7 @@ describe('repairSessionKeyWorkspace', () => {
   after(async () => {
     for (const srv of servers) await softClose(srv);
     fs.rmSync(dataDir, { recursive: true, force: true });
-    fs.rmSync(sandboxHome, { recursive: true, force: true });
+    removeSandboxHome();
   });
 
   test('re-keys a row that names a workspace other than its own database', async () => {
