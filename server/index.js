@@ -127,6 +127,14 @@ export function createApp(config = {}) {
     try {
       const wsName = req.headers?.['x-workspace'];
       if (wsName && !isValidWorkspaceName(wsName)) return sendError(res, 400, 'Invalid x-workspace header');
+      // getDb() creates the file it cannot open, so a well-formed name nobody registered
+      // would mint a database — and, through the controllers, an intelligence directory —
+      // for a workspace GET /api/workspaces never lists and DELETE /api/workspaces/:name
+      // therefore refuses to remove. workspaces.json is the register of what exists;
+      // creation goes through POST /api/workspaces, which registers first and opens the
+      // database second. Object.hasOwn, not a plain read: isValidWorkspaceName() accepts
+      // "constructor".
+      if (wsName && !Object.hasOwn(getWorkspaces().workspaces, wsName)) return sendError(res, 404, 'Unknown workspace');
       const workspace = wsName || getWorkspaces().active;
       return await requestDbStore.run({ db: getDb(workspace), workspace }, () => route(req, res));
     } catch (e) {
