@@ -320,3 +320,48 @@ describe('session_key names the requesting workspace', () => {
     assert.equal(imported.session_key, 'agent:main:key-import:chat:imp-1');
   });
 });
+
+// CLA-1310. x-workspace names the tenancy boundary, and getDb() opens (creating it
+// if absent) whatever file the name resolves to. workspaces.json is the register of
+// what exists — a name that is not in it has no owner, and GET /api/workspaces never
+// lists it, so the storage it mints can never be deleted through the API either.
+describe('x-workspace must name a registered workspace', () => {
+  let srv;
+  before(async () => { srv = await startTestServer(); });
+  after(async () => { await srv.close(); });
+
+  test('a well-formed but unregistered name is rejected and mints nothing', async () => {
+    const res = await srv.api('GET', '/api/threads', { headers: { 'x-workspace': 'ghost' } });
+    assert.equal(res.status, 404);
+    assert.equal(fs.existsSync(path.join(srv.dataDir, 'ghost.db')), false,
+      'a rejected request must not leave a database behind');
+
+    const list = await srv.api('GET', '/api/workspaces');
+    assert.ok(!list.body.workspaces.some(w => w.name === 'ghost'));
+  });
+
+  test('a name that collides with an Object prototype key is not registered', async () => {
+    // isValidWorkspaceName() accepts "constructor", and a bare property read on the
+    // workspaces map would report it as present.
+    const res = await srv.api('GET', '/api/threads', { headers: { 'x-workspace': 'constructor' } });
+    assert.equal(res.status, 404);
+    assert.equal(fs.existsSync(path.join(srv.dataDir, 'constructor.db')), false);
+  });
+
+  test('a registered workspace is served as before', async () => {
+    await srv.api('POST', '/api/workspaces', { body: { name: 'real' } });
+    const res = await srv.api('GET', '/api/threads', { headers: { 'x-workspace': 'real' } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.threads, []);
+  });
+
+  test('a malformed name still fails validation before the register is consulted', async () => {
+    const res = await srv.api('GET', '/api/threads', { headers: { 'x-workspace': '../../etc' } });
+    assert.equal(res.status, 400);
+  });
+
+  test('no header still resolves to the active workspace', async () => {
+    const res = await srv.api('GET', '/api/threads');
+    assert.equal(res.status, 200);
+  });
+});

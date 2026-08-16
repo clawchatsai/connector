@@ -88,6 +88,9 @@ describe('regressions', () => {
   });
 
   test('x-workspace still routes valid names to their own database', async () => {
+    // Registered first: since CLA-1310 a name the register does not know is a 404
+    // rather than a freshly minted database.
+    await srv.api('POST', '/api/workspaces', { body: { name: 'alt-ws-1' } });
     const res = await srv.api('GET', '/api/health', { headers: { 'x-workspace': 'alt-ws-1' } });
     assert.equal(res.status, 200);
     assert.equal(fs.existsSync(path.join(srv.dataDir, 'alt-ws-1.db')), true);
@@ -98,13 +101,29 @@ describe('regressions', () => {
     // throw here escaped as an unhandled rejection, which Node turns into a
     // process exit — an unauthenticated request could kill the backend.
     // A directory where the .db file should be makes SQLite fail to open it.
-    fs.mkdirSync(path.join(srv.dataDir, 'blocked.db'), { recursive: true });
+    //
+    // Own sandbox: the workspace has to be registered (CLA-1310) yet never
+    // successfully opened, so the register is seeded on disk before boot and the
+    // directory put in the way while the db cache is still empty.
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'cla1310-unopenable-'));
+    const dataDir = path.join(sandbox, 'data');
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'workspaces.json'), JSON.stringify({
+      active: 'default',
+      workspaces: { default: { name: 'default' }, blocked: { name: 'blocked' } },
+    }));
+    fs.mkdirSync(path.join(dataDir, 'blocked.db'), { recursive: true });
+    const sandboxed = await startTestServer({ dataDir });
+    try {
+      const res = await sandboxed.api('GET', '/api/health', { headers: { 'x-workspace': 'blocked' } });
+      assert.equal(res.status, 500, 'should answer, not crash');
 
-    const res = await srv.api('GET', '/api/health', { headers: { 'x-workspace': 'blocked' } });
-    assert.equal(res.status, 500, 'should answer, not crash');
-
-    // The server must still be serving after the failure.
-    const after = await srv.api('GET', '/api/health');
-    assert.equal(after.status, 200, 'server should survive the failed request');
+      // The server must still be serving after the failure.
+      const after = await sandboxed.api('GET', '/api/health');
+      assert.equal(after.status, 200, 'server should survive the failed request');
+    } finally {
+      await sandboxed.close();
+      fs.rmSync(sandbox, { recursive: true, force: true });
+    }
   });
 });
