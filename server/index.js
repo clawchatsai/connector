@@ -102,7 +102,7 @@ export function createApp(config = {}) {
 
   // Instantiate controllers
   const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast });
-  const threads    = new ThreadController({ getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir: UPLOADS_DIR, broadcast });
+  const threads    = new ThreadController({ getDb, getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR, broadcast });
   const messages   = new MessageController({ getActiveDb, getWorkspaces, getRequestWorkspace, broadcast });
   const files      = new FileController({ getActiveDb, getRequestWorkspace, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
@@ -261,6 +261,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/threads/unread') return threads.getUnread(req, res);
       if (method === 'POST' && urlPath === '/api/threads') return await threads.create(req, res);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/mark-read'))) return await threads.markRead(req, res, p);
+      if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/move'))) return await threads.move(req, res, p);
       if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id/messages'))) return messages.getAll(req, res, p, query);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/messages'))) return await messages.create(req, res, p);
       if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id/messages/:messageId'))) return messages.delete(req, res, p);

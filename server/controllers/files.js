@@ -3,6 +3,13 @@ import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { parseMultipart } from '../util/multipart.js';
 
+// Where a thread's intelligence artefact lives. Exported because ThreadController
+// has to carry the file when a thread moves workspace — the path is workspace-scoped,
+// so leaving it behind empties the panel for the moved thread.
+export function intelligencePath(intelligenceDir, workspace, threadId) {
+  return path.join(intelligenceDir, workspace, `${threadId}.json`);
+}
+
 export class FileController {
   constructor({ getActiveDb, getRequestWorkspace, uploadsDir, intelligenceDir }) {
     this.getActiveDb = getActiveDb;
@@ -53,7 +60,7 @@ export class FileController {
   // belong to this one — a scan-and-adopt migration would be a guess, and the data
   // is auxiliary and regenerable.
   _intelligencePath(threadId) {
-    return path.join(this.intelligenceDir, this.getRequestWorkspace(), `${threadId}.json`);
+    return intelligencePath(this.intelligenceDir, this.getRequestWorkspace(), threadId);
   }
 
   getIntelligence(req, res, params) {

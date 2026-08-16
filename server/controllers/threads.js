@@ -3,14 +3,45 @@ import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { syncThreadUnreadCount } from '../util/helpers.js';
 import { getSessionsDirForAgent } from '../config.js';
-import { cleanGatewaySession } from '../gateway-cleanup.js';
+import { cleanGatewaySession, renameGatewaySession } from '../gateway-cleanup.js';
+import { intelligencePath } from './files.js';
+
+// node:sqlite's DatabaseSync has no better-sqlite3-style db.transaction(); drive it
+// explicitly, as POST /api/prompts does.
+function inTransaction(db, fn) {
+  db.exec('BEGIN');
+  try { const out = fn(); db.exec('COMMIT'); return out; }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+
+// Both workspace databases are built by the same migrate(), so a row's own keys are
+// the column list. Hardcoding one rots the moment a migration adds a column — the
+// threads table has already grown sort_order, unread_count and metadata that way.
+function copyRows(db, table, rows) {
+  for (const row of rows) {
+    const cols = Object.keys(row);
+    db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`).run(...cols.map(c => row[c]));
+  }
+}
+
+// Delete the messages and unread rows explicitly rather than leaning on the threads
+// foreign key: SQLite does not fire the messages_ad trigger for rows removed by an
+// ON DELETE CASCADE unless recursive_triggers is on, which would leave the moved
+// content indexed in the source workspace's FTS table.
+function deleteThreadRows(db, threadId) {
+  db.prepare('DELETE FROM unread_messages WHERE thread_id = ?').run(threadId);
+  db.prepare('DELETE FROM messages WHERE thread_id = ?').run(threadId);
+  db.prepare('DELETE FROM threads WHERE id = ?').run(threadId);
+}
 
 export class ThreadController {
-  constructor({ getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir, broadcast }) {
+  constructor({ getDb, getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir, intelligenceDir, broadcast }) {
+    this.getDb = getDb;
     this.getActiveDb = getActiveDb;
     this.getWorkspaces = getWorkspaces;
     this.getRequestWorkspace = getRequestWorkspace;
     this.uploadsDir = uploadsDir;
+    this.intelligenceDir = intelligenceDir;
     this.broadcast = broadcast;
   }
 
@@ -101,6 +132,76 @@ export class ThreadController {
       db.prepare(`UPDATE threads SET ${fields.join(', ')} WHERE id = ?`).run(...values);
     }
     send(res, 200, { thread: db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id) });
+  }
+
+  // Move a thread, its messages and its unread bookkeeping into another workspace's
+  // database. Body key is `workspace`, matching what the frontend already sends
+  // (clawchats PR #164, `moveChat()`).
+  async move(req, res, params) {
+    const body = await parseBody(req);
+    const target = body.workspace;
+    if (typeof target !== 'string' || !target) return sendError(res, 400, 'workspace is required');
+
+    // Object.hasOwn, not a plain read: "constructor" resolves on the prototype, and
+    // getDb() would then mint a database for a workspace nobody registered (CLA-1331).
+    const ws = this.getWorkspaces();
+    if (!Object.hasOwn(ws.workspaces, target)) return sendError(res, 404, 'Target workspace not found');
+
+    // The workspace this request targets (x-workspace), never the process-global
+    // active one: moving a thread out of A while B happens to be active has to read
+    // and delete from A. Same reasoning as CLA-1279.
+    const source = this.getRequestWorkspace();
+    if (source === target) return sendError(res, 400, 'Thread is already in this workspace');
+
+    const srcDb = this.getActiveDb();
+    const thread = srcDb.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
+    if (!thread) return sendError(res, 404, 'Thread not found');
+
+    const tgtDb = this.getDb(target);
+    // Thread ids are not unique across workspaces — POST /api/import preserves
+    // caller-supplied ids — so refuse rather than overwrite the target's thread.
+    if (tgtDb.prepare('SELECT id FROM threads WHERE id = ?').get(params.id)) {
+      return sendError(res, 409, 'A thread with this id already exists in the target workspace');
+    }
+
+    const messages = srcDb.prepare('SELECT * FROM messages WHERE thread_id = ?').all(params.id);
+    const unread = srcDb.prepare('SELECT * FROM unread_messages WHERE thread_id = ?').all(params.id);
+    // Re-key to the target, or parseSessionKey() would keep routing this thread's
+    // gateway events at the workspace it just left.
+    const newSessionKey = `agent:${ws.workspaces[target].agent || 'main'}:${target}:chat:${params.id}`;
+
+    // SQLite offers no cross-database atomicity: a transaction spanning two ATTACHed
+    // databases is documented as non-atomic once either is in WAL mode, and both of
+    // ours are. So the halves run in order, each in its own transaction, ordered so
+    // that any failure leaves the thread intact in exactly one workspace — the target
+    // write commits first, and only then is the source deleted.
+    inTransaction(tgtDb, () => {
+      copyRows(tgtDb, 'threads', [{ ...thread, session_key: newSessionKey }]);
+      copyRows(tgtDb, 'messages', messages);
+      copyRows(tgtDb, 'unread_messages', unread);
+    });
+    try {
+      inTransaction(srcDb, () => deleteThreadRows(srcDb, params.id));
+    } catch (e) {
+      // Undo the copy, so a failed second half cannot leave the thread live in both
+      // workspaces. The source is the copy that survives.
+      try { inTransaction(tgtDb, () => deleteThreadRows(tgtDb, params.id)); }
+      catch (undoErr) { console.error(`[move] thread ${params.id} was copied to "${target}" but both the source delete and its undo failed:`, undoErr.message); }
+      throw e;
+    }
+
+    // Sidecars that are keyed by workspace have to follow the thread. Uploads do not:
+    // they live under uploadsDir/<threadId>, which no workspace name enters.
+    renameGatewaySession(thread.session_key, newSessionKey);
+    const fromPath = intelligencePath(this.intelligenceDir, source, params.id);
+    if (fs.existsSync(fromPath)) {
+      const toPath = intelligencePath(this.intelligenceDir, target, params.id);
+      try { fs.mkdirSync(path.dirname(toPath), { recursive: true }); fs.renameSync(fromPath, toPath); }
+      catch (err) { console.warn(`[move] intelligence for thread ${params.id} left in "${source}":`, err.message); }
+    }
+
+    this.broadcast(JSON.stringify({ type: 'clawchats', event: 'thread-moved', threadId: params.id, fromWorkspace: source, toWorkspace: target, timestamp: Date.now() }));
+    send(res, 200, { ok: true, thread: tgtDb.prepare('SELECT * FROM threads WHERE id = ?').get(params.id) });
   }
 
   delete(req, res, params) {
