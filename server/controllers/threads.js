@@ -18,20 +18,10 @@ function inTransaction(db, fn) {
 // the column list. Hardcoding one rots the moment a migration adds a column — the
 // threads table has already grown sort_order, unread_count and metadata that way.
 function copyRows(db, table, rows) {
-  for (const row of rows) {
-    const cols = Object.keys(row);
-    db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`).run(...cols.map(c => row[c]));
-  }
-}
-
-// Delete the messages and unread rows explicitly rather than leaning on the threads
-// foreign key: SQLite does not fire the messages_ad trigger for rows removed by an
-// ON DELETE CASCADE unless recursive_triggers is on, which would leave the moved
-// content indexed in the source workspace's FTS table.
-function deleteThreadRows(db, threadId) {
-  db.prepare('DELETE FROM unread_messages WHERE thread_id = ?').run(threadId);
-  db.prepare('DELETE FROM messages WHERE thread_id = ?').run(threadId);
-  db.prepare('DELETE FROM threads WHERE id = ?').run(threadId);
+  if (!rows.length) return;
+  const cols = Object.keys(rows[0]);
+  const insert = db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`);
+  for (const row of rows) insert.run(...cols.map(c => row[c]));
 }
 
 export class ThreadController {
@@ -181,11 +171,14 @@ export class ThreadController {
       copyRows(tgtDb, 'unread_messages', unread);
     });
     try {
-      inTransaction(srcDb, () => deleteThreadRows(srcDb, params.id));
+      // Messages and unread rows go with it: both cascade off threads.id, and the
+      // cascade fires the messages_ad trigger, so the source FTS index is cleaned too.
+      // delete() relies on the same cascade.
+      srcDb.prepare('DELETE FROM threads WHERE id = ?').run(params.id);
     } catch (e) {
       // Undo the copy, so a failed second half cannot leave the thread live in both
       // workspaces. The source is the copy that survives.
-      try { inTransaction(tgtDb, () => deleteThreadRows(tgtDb, params.id)); }
+      try { tgtDb.prepare('DELETE FROM threads WHERE id = ?').run(params.id); }
       catch (undoErr) { console.error(`[move] thread ${params.id} was copied to "${target}" but both the source delete and its undo failed:`, undoErr.message); }
       throw e;
     }

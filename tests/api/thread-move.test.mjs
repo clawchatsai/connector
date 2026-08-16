@@ -112,6 +112,10 @@ describe('POST /api/threads/:id/move', () => {
 
       const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
       assert.equal(res.status, 409);
+      // Assert the explicit pre-check's wording. Dropping the guard still yields 409 —
+      // the INSERT trips threads.id and route() maps "UNIQUE constraint" to Conflict —
+      // so a status-only assertion cannot tell the two apart.
+      assert.match(res.body.error, /already exists in the target workspace/i);
 
       assert.ok(srcDb.prepare('SELECT id FROM threads WHERE id = ?').get(id), 'source thread survives');
       assert.equal(srcDb.prepare('SELECT COUNT(*) c FROM messages WHERE thread_id = ?').get(id).c, 1);
@@ -206,9 +210,12 @@ describe('POST /api/threads/:id/move', () => {
 
       await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
 
-      // The source delete has to fire the messages_ad trigger; SQLite does not fire it
-      // for rows removed by the threads ON DELETE CASCADE unless recursive_triggers is
-      // on, which would leave the moved text searchable in the workspace it left.
+      // Pins behaviour the move gets for free but silently depends on: deleting the
+      // thread cascades to messages, and that cascade fires the messages_ad trigger, so
+      // the source FTS index drops the text too. Verified against SQLite 3.51.2 with
+      // recursive_triggers both on and off. A migrate() change that swapped the cascade
+      // for a manual delete, or dropped the trigger, would leave the moved text
+      // searchable in the workspace it left — with no other test noticing.
       const after = await srv.api('GET', '/api/search?q=zanzibar');
       assert.equal(after.body.total, 0, 'no longer searchable in the source');
       const target = await srv.api('GET', '/api/search?q=zanzibar', { headers: SECOND });
