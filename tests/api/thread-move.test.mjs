@@ -73,6 +73,9 @@ describe('POST /api/threads/:id/move', () => {
       const id = await createThread(srv.api);
       const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'constructor' } });
       assert.equal(res.status, 404);
+      // Assert the reason, not just the code: an unrouted request 404s too, which
+      // would let this pass against a build that has no move endpoint at all.
+      assert.match(res.body.error, /target workspace not found/i);
     });
 
     test('moving into the workspace the thread is already in is a 400', async () => {
