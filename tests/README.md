@@ -10,9 +10,15 @@ response body. These import from `dist/`, so `npm test` runs `npm run build`
 first (`pretest`); anything needing a live DataChannel or WebRTC belongs in
 ClawChats' compose suite, not here.
 
+`tests/bench-delete-guard.mjs` — not a test and not in the suite (the runner
+globs `*.test.mjs`). It measures what the cross-workspace uploads guard costs a
+`DELETE /api/threads/:id` across a range of workspace counts, so the numbers
+quoted for CLA-1419 can be re-derived rather than trusted.
+
 ```bash
 npm test                                  # whole suite (builds first)
 node --test tests/api/threads.test.mjs    # one file
+node tests/bench-delete-guard.mjs         # delete-guard cost, not part of the suite
 ```
 
 ## Why these live here

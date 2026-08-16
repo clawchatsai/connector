@@ -251,6 +251,32 @@ export class ThreadController {
     send(res, 200, { ok: true, sessionMoved, thread: tgtDb.prepare('SELECT * FROM threads WHERE id = ?').get(params.id) });
   }
 
+  // Why `threadId`'s upload directory must survive this delete, or null if it can go.
+  //
+  // uploads/ is keyed by thread id alone — uploadsDir/<threadId>, with no workspace
+  // segment anywhere in the path — but thread ids are not unique across workspaces:
+  // POST /api/import preserves caller-supplied ids, and a move whose source delete
+  // fails leaves the same id live in both (see move()). Removing the directory would
+  // then destroy the attachments of the copy still live in the other workspace, which
+  // keeps its rows and goes on pointing at files that are gone.
+  //
+  // Called after the source row is deleted, so any row this finds is another
+  // workspace's copy. A workspace that cannot be read counts as a reason to keep the
+  // directory: it cannot rule the duplicate out, and an orphaned directory is
+  // recoverable where a live thread's attachments are not.
+  uploadsRetentionReason(threadId) {
+    for (const name of Object.keys(this.getWorkspaces().workspaces)) {
+      try {
+        if (this.getDb(name).prepare('SELECT id FROM threads WHERE id = ?').get(threadId)) {
+          return `it is still live in workspace "${name}"`;
+        }
+      } catch (e) {
+        return `workspace "${name}" could not be checked (${e.message})`;
+      }
+    }
+    return null;
+  }
+
   delete(req, res, params) {
     const db = this.getActiveDb();
     const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
@@ -264,7 +290,9 @@ export class ThreadController {
     }
     cleanGatewaySession(thread.session_key);
     if (sessionIdToDelete) { try { fs.unlinkSync(path.join(sessionsDir, `${sessionIdToDelete}.jsonl`)); } catch { /* ok */ } }
-    try { fs.rmSync(path.join(this.uploadsDir, params.id), { recursive: true }); } catch { /* ok */ }
+    const retain = this.uploadsRetentionReason(params.id);
+    if (retain) console.warn(`[delete] keeping the uploads for thread ${params.id}: ${retain}.`);
+    else try { fs.rmSync(path.join(this.uploadsDir, params.id), { recursive: true }); } catch { /* ok */ }
     send(res, 200, { ok: true });
   }
 }
