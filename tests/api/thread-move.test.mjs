@@ -16,6 +16,28 @@ import { sandboxSessionsDir } from '../helpers/sandbox-home.mjs';
 
 const SECOND = { 'x-workspace': 'second' };
 
+/**
+ * Make the next `times` statements on `db` whose SQL matches `pattern` throw when run,
+ * then let everything through again. This is the only way to reach the interleavings
+ * the move is *ordered* to survive: they need one write to fail against a database
+ * that is otherwise perfectly healthy.
+ *
+ * Only `.run()` is stubbed, so `pattern` must not match a statement the handler reads
+ * from — the readback SELECT has to keep working or its assertions mean nothing.
+ */
+function failStatements(db, pattern, times = Infinity) {
+  const real = db.prepare.bind(db);
+  let hits = 0;
+  db.prepare = sql => {
+    if (!pattern.test(sql) || hits >= times) return real(sql);
+    hits++;
+    // Deliberately not a "UNIQUE constraint" message: route() maps that to 409, which
+    // would mask the path under test behind a plausible-looking status.
+    return { run: () => { throw new Error('injected: disk I/O error'); } };
+  };
+  return { restore: () => { db.prepare = real; }, hits: () => hits };
+}
+
 /** Insert a message straight into `db`, as the FTS triggers see it. */
 function seedMessage(db, threadId, id, content, role = 'user') {
   const now = Date.now();
@@ -76,6 +98,28 @@ describe('POST /api/threads/:id/move', () => {
       // Assert the reason, not just the code: an unrouted request 404s too, which
       // would let this pass against a build that has no move endpoint at all.
       assert.match(res.body.error, /target workspace not found/i);
+    });
+
+    test('a registered name that escapes the data directory is still rejected', async () => {
+      const id = await createThread(srv.api);
+      // Registry membership is not enough on its own. POST /api/workspaces validates
+      // what it creates, but getWorkspaces() parses workspaces.json without checking
+      // its keys, so a hand-edited, restored or older-version registry puts an
+      // unvetted name straight in front of two path.join() calls: getDb()'s
+      // `<name>.db` and the intelligence directory. Mutating the cache is exactly what
+      // reading such a file produces.
+      const registry = srv.app.getWorkspaces();
+      const evil = '../../etc/foo';
+      registry.workspaces[evil] = { name: evil, label: 'evil', createdAt: Date.now() };
+      try {
+        const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: evil } });
+        assert.equal(res.status, 400);
+        assert.match(res.body.error, /invalid workspace name/i);
+      } finally { delete registry.workspaces[evil]; }
+
+      // The name must be refused before it reaches the filesystem, not after.
+      assert.equal(fs.existsSync(path.join(srv.dataDir, '..', '..', 'etc', 'foo.db')), false);
+      assert.ok(srv.app.getActiveDb().prepare('SELECT id FROM threads WHERE id = ?').get(id), 'thread stays put');
     });
 
     test('moving into the workspace the thread is already in is a 400', async () => {
@@ -224,6 +268,82 @@ describe('POST /api/threads/:id/move', () => {
     });
   });
 
+  // The target half commits before the source is deleted, so a failing source delete
+  // leaves a copy that has to be withdrawn. What happens when that withdrawal itself
+  // fails is the whole risk of the design, and it is reachable with no crash at all:
+  // both databases are WAL files on one disk, so a full disk or a read-only remount
+  // hits the delete and the undo together.
+  describe('when the source delete fails', () => {
+    const DELETE_THREAD = /^DELETE FROM threads/;
+
+    test('the copy is withdrawn and the source is left whole', async () => {
+      const id = await createThread(srv.api);
+      const srcDb = srv.app.getDb('default');
+      seedMessage(srcDb, id, 'kept', 'still here');
+      const fault = failStatements(srcDb, DELETE_THREAD, 1);
+      try {
+        const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
+        assert.equal(res.status, 500);
+      } finally { fault.restore(); }
+
+      assert.ok(srcDb.prepare('SELECT id FROM threads WHERE id = ?').get(id), 'source thread survives');
+      assert.equal(srcDb.prepare('SELECT COUNT(*) c FROM messages WHERE thread_id = ?').get(id).c, 1);
+      assert.equal(
+        srv.app.getDb('second').prepare('SELECT id FROM threads WHERE id = ?').get(id), undefined,
+        'the target copy is gone: the thread is in exactly one workspace',
+      );
+    });
+
+    test('a first undo failure is retried rather than abandoned', async () => {
+      const id = await createThread(srv.api);
+      const srcDb = srv.app.getDb('default');
+      const tgtDb = srv.app.getDb('second');
+      // The correlated case: the same fault takes out the source delete and the first
+      // attempt to undo. A single-shot undo strands the copy here.
+      const srcFault = failStatements(srcDb, DELETE_THREAD, 1);
+      const tgtFault = failStatements(tgtDb, DELETE_THREAD, 1);
+      try {
+        const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
+        assert.equal(res.status, 500);
+        assert.doesNotMatch(res.body.error, /duplicate/i, 'the retry succeeded, so nothing is duplicated');
+      } finally { srcFault.restore(); tgtFault.restore(); }
+
+      assert.equal(tgtFault.hits(), 1, 'the first undo attempt really did fail');
+      assert.ok(srcDb.prepare('SELECT id FROM threads WHERE id = ?').get(id), 'source thread survives');
+      assert.equal(tgtDb.prepare('SELECT id FROM threads WHERE id = ?').get(id), undefined, 'the retry withdrew the copy');
+    });
+
+    test('an undo that never succeeds is reported as a duplicate, not as a plain failure', async () => {
+      const id = await createThread(srv.api);
+      const srcDb = srv.app.getDb('default');
+      const tgtDb = srv.app.getDb('second');
+      const srcFault = failStatements(srcDb, DELETE_THREAD, 1);
+      const tgtFault = failStatements(tgtDb, DELETE_THREAD);   // every attempt fails
+      let res;
+      try {
+        res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
+      } finally { srcFault.restore(); tgtFault.restore(); }
+
+      // The thread genuinely is in both places now — that part is not recoverable from
+      // inside the handler. What is not acceptable is saying so in a way the caller
+      // cannot tell apart from "nothing happened": it would drop the thread back into
+      // the source list while the target quietly holds a live copy the user never saw.
+      // Both copies carry valid, distinct session keys, so repairSessionKeyWorkspace()
+      // considers neither stale and no restart reconciles them.
+      assert.equal(res.status, 500);
+      assert.match(res.body.error, /duplicate/i);
+      assert.match(res.body.error, /"default"/, 'names the workspace holding the authoritative copy');
+      assert.match(res.body.error, /"second"/, 'names the workspace holding the stray copy');
+
+      assert.ok(srcDb.prepare('SELECT id FROM threads WHERE id = ?').get(id), 'source copy is authoritative, as the message says');
+      assert.ok(tgtDb.prepare('SELECT id FROM threads WHERE id = ?').get(id), 'and the duplicate the message warns about is real');
+      // Not one bare attempt.
+      assert.ok(tgtFault.hits() > 1, `the undo was retried (attempts: ${tgtFault.hits()})`);
+
+      tgtDb.prepare('DELETE FROM threads WHERE id = ?').run(id);   // don't leak into later tests
+    });
+  });
+
   describe('workspace-scoped sidecars', () => {
     test('the gateway session entry is re-pointed at the new key', async () => {
       const id = await createThread(srv.api);
@@ -231,12 +351,13 @@ describe('POST /api/threads/:id/move', () => {
       const sessionsPath = path.join(sessionsDir, 'sessions.json');
       fs.writeFileSync(sessionsPath, JSON.stringify({ [`agent:main:default:chat:${id}`]: { sessionId: 'sess-1' } }));
 
-      await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
+      const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
 
       // Left behind, the moved thread would silently start a fresh gateway session and
       // lose the conversation the user can still see in the transcript.
       const store = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
       assert.deepEqual(store, { [`agent:main:second:chat:${id}`]: { sessionId: 'sess-1' } });
+      assert.equal(res.body.sessionMoved, true, 'reported as a move that kept its transcript');
     });
 
     test('an occupied target key is left alone rather than overwritten', async () => {
@@ -250,9 +371,15 @@ describe('POST /api/threads/:id/move', () => {
       const res = await srv.api('POST', `/api/threads/${id}/move`, { body: { workspace: 'second' } });
       assert.equal(res.status, 200, 'the move still succeeds; the session is auxiliary');
 
+      // The move is reported as partial, so the caller can say "moved, but the
+      // conversation stayed behind" rather than claiming an unqualified success.
+      assert.equal(res.body.sessionMoved, false);
+
       const store = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
       assert.equal(store[newKey].sessionId, 'someone-elses', 'the live transcript under the new key survives');
-      assert.equal(store[oldKey].sessionId, 'mine', 'and the old entry is left inert rather than deleted');
+      // Left behind rather than deleted — the lesser evil, not a harmless one: nothing
+      // points at this entry afterwards, so it and its .jsonl are collected by no path.
+      assert.equal(store[oldKey].sessionId, 'mine', 'and the old entry is not destroyed to tidy up');
     });
 
     test('the intelligence artefact follows the thread', async () => {
