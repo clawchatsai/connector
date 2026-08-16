@@ -1,10 +1,17 @@
 # API contract tests
 
-Per-endpoint coverage for the HTTP backend in `server/` — request/response
-shapes, validation, error paths, persistence and workspace isolation.
+`tests/api/` — per-endpoint coverage for the HTTP backend in `server/`:
+request/response shapes, validation, error paths, persistence and workspace
+isolation.
+
+`tests/plugin/` — pure decision functions from the TypeScript plugin in `src/`,
+where getting the answer wrong is a security defect rather than a wrong
+response body. These import from `dist/`, so `npm test` runs `npm run build`
+first (`pretest`); anything needing a live DataChannel or WebRTC belongs in
+ClawChats' compose suite, not here.
 
 ```bash
-npm test                                  # whole suite
+npm test                                  # whole suite (builds first)
 node --test tests/api/threads.test.mjs    # one file
 ```
 

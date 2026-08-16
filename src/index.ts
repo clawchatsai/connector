@@ -25,7 +25,7 @@ import type { DataChannelLike } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
 
-import { initAuth, handleAuthMessage, cleanupAuth, isAuthenticated, type AuthConfig } from './auth-handler.js';
+import { initAuth, handleAuthMessage, cleanupAuth, isAuthenticated, resolveAuthGate, type AuthConfig } from './auth-handler.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
 import { fileURLToPath } from 'node:url';
@@ -669,9 +669,9 @@ function setupDataChannelHandler(
   const config = loadConfig();
   const isDevMode = process.env.CLAWCHATS_DEV === 'true';
   const hasGoogle = !!config?.google;
-  const authEnabled = config?.schemaVersion === 2 && config?.totp && config?.sessionSecret;
+  const gate = resolveAuthGate(config);
 
-  if (authEnabled) {
+  if (gate.mode === 'enabled') {
     // In dev mode without Google identity, use placeholder
     const google = config!.google ?? {
       clientId: 'dev-placeholder',
@@ -754,28 +754,18 @@ function setupDataChannelHandler(
       processAuthenticatedMessage(dc, connectionId, msg, ctx);
     });
   } else {
-    // No auth configured (schemaVersion 1 or missing TOTP)
-    if (config && config.schemaVersion !== undefined && config.schemaVersion < 2) {
-      ctx.logger.warn('TOTP not configured — DataChannel access blocked. Run: openclaw clawchats reauth');
-      dc.send(JSON.stringify({
-        type: 'auth-required-setup',
-        message: 'Two-factor authentication is required. Run "openclaw clawchats reauth" on your gateway machine to set it up.',
-      }));
-      return; // Don't process any messages
-    }
-
-    // Legacy path: no config at all (shouldn't happen in normal flow)
-    connectedClients.set(connectionId, dc);
-    dc.onMessage(async (data: string) => {
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(data);
-      } catch {
-        dc.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
-        return;
-      }
-      processAuthenticatedMessage(dc, connectionId, msg, ctx);
-    });
+    // Auth config incomplete — refuse the channel instead of downgrading to
+    // unauthenticated access. No message handler is registered, so nothing
+    // reaches the gateway. The missing fields go to the gateway log only;
+    // the browser gets the generic setup prompt.
+    ctx.logger.warn(
+      `DataChannel access blocked — incomplete auth config (missing: ${gate.missing.join(', ')}). ` +
+      'Run: openclaw clawchats reauth',
+    );
+    dc.send(JSON.stringify({
+      type: 'auth-required-setup',
+      message: 'Two-factor authentication is required. Run "openclaw clawchats reauth" on your gateway machine to set it up.',
+    }));
   }
 
   dc.onClosed(() => {

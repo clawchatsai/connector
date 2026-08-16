@@ -15,6 +15,7 @@ import * as crypto from 'node:crypto';
 import { verifyTotp, verifyBackupCode } from './totp.js';
 import { verifyGoogleIdToken, clearJWKSCache } from './google-jwt.js';
 import { issueSessionToken, verifySessionToken } from './session-token.js';
+import type { PluginConfig } from './gateway-bridge.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,7 +30,13 @@ export interface AuthConfig {
     period: number;
     enabledAt: string;
   };
-  google: {
+  /**
+   * Absent on any gateway paired without Google — `PluginConfig.google` has
+   * always been optional, and `resolveAuthGate` does not require it. Declaring
+   * it required here was the mismatch that made every such config crash the
+   * moment auth actually engaged.
+   */
+  google?: {
     clientId: string;
     authorizedSub: string;
     authorizedEmail: string;
@@ -43,6 +50,15 @@ export interface AuthConfig {
 export interface DataChannelSend {
   send: (data: string) => void;
 }
+
+/**
+ * Whether a plugin config is complete enough to gate the DataChannel.
+ * `missing` names the absent config fields for the gateway log — it is never
+ * sent to the browser, which gets only the generic setup prompt.
+ */
+export type AuthGate =
+  | { mode: 'enabled' }
+  | { mode: 'blocked'; missing: string[] };
 
 type AuthState = 'awaiting-auth' | 'authenticated' | 'failed';
 
@@ -78,6 +94,32 @@ const BLOCK_DURATION_MS = 60_000;
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * Decide the DataChannel auth posture for a plugin config.
+ *
+ * Fails closed: only a complete schemaVersion >= 2 auth config enables the
+ * DataChannel. Everything else blocks — no config at all, a v1 config, and
+ * (the case this exists for) a v2 config carrying a partial auth block, which
+ * an interrupted migration, a hand edit or a setup path that writes TOTP
+ * before the session secret can all produce. Such a config looks fully
+ * 2FA-configured and used to fall through to unauthenticated access.
+ *
+ * Spec: datachannel-auth-totp.md §13 issue 5.
+ */
+export function resolveAuthGate(config: PluginConfig | null): AuthGate {
+  if (!config) {
+    return { mode: 'blocked', missing: ['config'] };
+  }
+
+  const missing: string[] = [];
+  const version = typeof config.schemaVersion === 'number' ? config.schemaVersion : 0;
+  if (version < 2) missing.push('schemaVersion >= 2');
+  if (!config.totp?.secret) missing.push('totp.secret');
+  if (!config.sessionSecret) missing.push('sessionSecret');
+
+  return missing.length === 0 ? { mode: 'enabled' } : { mode: 'blocked', missing };
+}
 
 /**
  * Initialize auth for a new DataChannel connection.
@@ -194,7 +236,7 @@ export async function handleAuthMessage(
         token,
         config.sessionSecret,
         config.userId,
-        config.google.authorizedSub,
+        config.google?.authorizedSub,
       );
       return authSuccess(dc, connectionId);
     } catch (e) {
@@ -220,29 +262,24 @@ export async function handleAuthMessage(
       return sendFailure(dc, connectionId, 'nonce_mismatch');
     }
 
-    // Verify Google ID token (skipped when not configured or in dev mode)
-    const skipGoogle = !config.google.clientId || config.google.clientId === 'dev-placeholder'
+    // Verify Google ID token (skipped when not configured or in dev mode).
+    // `google` is narrowed rather than asserted: a config with no Google block
+    // always takes the skip path, so the verify path only ever sees a real one.
+    const google = config.google;
+    const skipGoogle = !google?.clientId || google.clientId === 'dev-placeholder'
       || idToken === 'signaling-verified'
       || (config.devMode && idToken === 'dev-mode-no-google');
-    if (skipGoogle) {
+    if (skipGoogle || !google) {
       console.log('[Auth] Skipping Google ID token verification (not configured)');
     } else {
       try {
-        await verifyGoogleIdToken(idToken, {
-          clientId: config.google.clientId,
-          authorizedSub: config.google.authorizedSub,
-          authorizedEmail: config.google.authorizedEmail,
-        });
+        await verifyGoogleIdToken(idToken, google);
       } catch (e) {
         console.error(`[Auth] Google ID token verification failed: ${(e as Error).message}`);
         // Retry with fresh JWKS on first failure (key rotation)
         clearJWKSCache();
         try {
-          await verifyGoogleIdToken(idToken, {
-            clientId: config.google.clientId,
-            authorizedSub: config.google.authorizedSub,
-            authorizedEmail: config.google.authorizedEmail,
-          });
+          await verifyGoogleIdToken(idToken, google);
         } catch {
           return sendFailure(dc, connectionId, 'invalid_id_token');
         }
@@ -271,7 +308,7 @@ export async function handleAuthMessage(
     // Issue session token
     const sessionToken = issueSessionToken(
       config.userId,
-      config.google.authorizedSub,
+      config.google?.authorizedSub,
       sessionDays,
       config.sessionSecret,
     );
