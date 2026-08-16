@@ -8,7 +8,24 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// Must precede the server import: server/config.js resolves the gateway sessions
+// directory from os.homedir() at import time, and the cleanup paths unlink files
+// there. See sandbox-home.mjs.
+import { sandboxHome } from './sandbox-home.mjs';
 import { createApp } from '../../server/index.js';
+import { getSessionsDirForAgent } from '../../server/config.js';
+
+// Fail the whole file rather than let a suite run against the real store: a
+// redirect that did not take is invisible otherwise, and the tests would report
+// green while deleting live transcripts. A repo-root config.js carrying a
+// `sessionsDir` field also lands here, since that overrides HOME entirely.
+const resolvedSessionsDir = getSessionsDirForAgent('main');
+if (!resolvedSessionsDir.startsWith(sandboxHome)) {
+  throw new Error(
+    `Refusing to run: the sessions directory resolved to ${resolvedSessionsDir}, outside the ` +
+    `sandbox at ${sandboxHome}. Tests would mutate a real ~/.openclaw session store.`,
+  );
+}
 
 /**
  * Boot the API on an ephemeral port backed by throwaway directories.
