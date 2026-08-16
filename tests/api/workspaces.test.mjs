@@ -272,3 +272,51 @@ describe('workspace data isolation', () => {
     assert.equal(fs.existsSync(path.join(srv.dataDir, 'iso-b.db')), true);
   });
 });
+
+// CLA-1274. session_key is the cross-workspace routing seam: parseSessionKey()
+// resolves gateway events back to a workspace by reading slot 3. A row written to
+// <target>.db while naming <active> routes its events to a workspace where it does
+// not exist, so the key must name the workspace the request targets.
+describe('session_key names the requesting workspace', () => {
+  let srv;
+  before(async () => { srv = await startTestServer(); });
+  after(async () => { await srv.close(); });
+
+  test('POST /api/threads keys against x-workspace, not the active workspace', async () => {
+    await srv.api('POST', '/api/workspaces', { body: { name: 'key-target' } });
+    const active = await srv.api('GET', '/api/workspaces');
+    assert.equal(active.body.active, 'default', 'precondition: a different workspace is active');
+
+    const created = await srv.api('POST', '/api/threads', { headers: { 'x-workspace': 'key-target' } });
+    assert.equal(created.status, 201);
+    const { id, session_key } = created.body.thread;
+    assert.equal(session_key, `agent:main:key-target:chat:${id}`,
+      'the key must name the targeted workspace; naming the active one is CLA-1274');
+
+    // And the row really does live in the targeted workspace's db.
+    const fromTarget = await srv.api('GET', `/api/threads/${id}`, { headers: { 'x-workspace': 'key-target' } });
+    assert.equal(fromTarget.status, 200);
+    assert.equal(fromTarget.body.thread.session_key, session_key);
+  });
+
+  test('POST /api/threads with no header still keys against the active workspace', async () => {
+    const created = await srv.api('POST', '/api/threads');
+    assert.equal(created.status, 201);
+    const { id, session_key } = created.body.thread;
+    assert.equal(session_key, `agent:main:default:chat:${id}`);
+  });
+
+  test('POST /api/import mints keys against x-workspace when the thread carries none', async () => {
+    await srv.api('POST', '/api/workspaces', { body: { name: 'key-import' } });
+    const res = await srv.api('POST', '/api/import', {
+      headers: { 'x-workspace': 'key-import' },
+      body: { threads: [{ id: 'imp-1', title: 'No key' }] },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.threadsImported, 1);
+
+    const list = await srv.api('GET', '/api/threads', { headers: { 'x-workspace': 'key-import' } });
+    const imported = list.body.threads.find(t => t.id === 'imp-1');
+    assert.equal(imported.session_key, 'agent:main:key-import:chat:imp-1');
+  });
+});

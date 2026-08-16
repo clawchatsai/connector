@@ -2,9 +2,10 @@ import { send, sendError, parseBody } from '../util/http.js';
 import { buildContextPreamble } from '../util/context.js';
 
 export class MessageController {
-  constructor({ getActiveDb, getWorkspaces, broadcast }) {
+  constructor({ getActiveDb, getWorkspaces, getRequestWorkspace, broadcast }) {
     this.getActiveDb = getActiveDb;
     this.getWorkspaces = getWorkspaces;
+    this.getRequestWorkspace = getRequestWorkspace;
     this.broadcast = broadcast;
   }
 
@@ -100,6 +101,9 @@ export class MessageController {
     const body = await parseBody(req);
     const db = this.getActiveDb();
     const ws = this.getWorkspaces();
+    // Imported threads without a key are minted against the targeted workspace,
+    // matching ThreadController.create — see CLA-1274.
+    const workspace = this.getRequestWorkspace();
     if (!body.threads || !Array.isArray(body.threads)) return sendError(res, 400, 'Expected { threads: [...] }');
     let threadsImported = 0, messagesImported = 0;
     const insertThread = db.prepare('INSERT OR IGNORE INTO threads (id, session_key, title, pinned, pin_order, model, last_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
@@ -108,7 +112,7 @@ export class MessageController {
     try {
       for (const t of body.threads) {
         if (!t.id) continue;
-        const sessionKey = t.session_key || `agent:main:${ws.active}:chat:${t.id}`;
+        const sessionKey = t.session_key || `agent:${ws.workspaces[workspace]?.agent || 'main'}:${workspace}:chat:${t.id}`;
         if (insertThread.run(t.id, sessionKey, t.title || 'Imported chat', t.pinned || 0, t.pin_order || 0, t.model || null, t.last_session_id || null, t.created_at || Date.now(), t.updated_at || Date.now()).changes > 0) threadsImported++;
         for (const m of (t.messages || [])) {
           if (!m.id || !m.role) continue;
