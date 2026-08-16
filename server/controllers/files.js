@@ -4,9 +4,9 @@ import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { parseMultipart } from '../util/multipart.js';
 
 export class FileController {
-  constructor({ getActiveDb, getWorkspaces, uploadsDir, intelligenceDir }) {
+  constructor({ getActiveDb, getRequestWorkspace, uploadsDir, intelligenceDir }) {
     this.getActiveDb = getActiveDb;
-    this.getWorkspaces = getWorkspaces;
+    this.getRequestWorkspace = getRequestWorkspace;
     this.uploadsDir = uploadsDir;
     this.intelligenceDir = intelligenceDir;
   }
@@ -42,8 +42,18 @@ export class FileController {
     fs.createReadStream(resolved).pipe(res);
   }
 
+  // Store intelligence under the workspace the request targeted, not the
+  // process-global active one — otherwise a thread in workspace B has its
+  // intelligence filed under A and can never be read back — see CLA-1279.
+  //
+  // Files already written to the wrong directory are deliberately left where they
+  // are. A thread id is not unique across workspaces (POST /api/import preserves
+  // caller-supplied ids, so exporting A and importing into B puts the same id in
+  // both), so a `<threadId>.json` found under another workspace cannot be shown to
+  // belong to this one — a scan-and-adopt migration would be a guess, and the data
+  // is auxiliary and regenerable.
   _intelligencePath(threadId) {
-    return path.join(this.intelligenceDir, this.getWorkspaces().active, `${threadId}.json`);
+    return path.join(this.intelligenceDir, this.getRequestWorkspace(), `${threadId}.json`);
   }
 
   getIntelligence(req, res, params) {

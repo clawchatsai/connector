@@ -104,7 +104,7 @@ export function createApp(config = {}) {
   const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast });
   const threads    = new ThreadController({ getActiveDb, getWorkspaces, getRequestWorkspace, uploadsDir: UPLOADS_DIR, broadcast });
   const messages   = new MessageController({ getActiveDb, getWorkspaces, getRequestWorkspace, broadcast });
-  const files      = new FileController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
+  const files      = new FileController({ getActiveDb, getRequestWorkspace, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
 
   // Settings — file I/O lives in settings.js
@@ -261,7 +261,10 @@ export function createApp(config = {}) {
         const db = getActiveDb();
         const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(p.id);
         if (!thread) return sendError(res, 404, 'Thread not found');
-        gatewayClient.generateThreadTitle(db, p.id, getWorkspaces().active);
+        // Captured synchronously, while the request store is still on the stack:
+        // handleTitleResponse() resolves the database to write the generated title
+        // into from this value, long after the request has returned — CLA-1279.
+        gatewayClient.generateThreadTitle(db, p.id, getRequestWorkspace());
         return send(res, 200, { ok: true });
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/upload'))) return await files.upload(req, res, p);
