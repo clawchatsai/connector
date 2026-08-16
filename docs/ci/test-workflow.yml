@@ -1,0 +1,51 @@
+# API contract tests for the connector backend.
+#
+# ---------------------------------------------------------------------------
+# THIS FILE IS NOT ACTIVE. It must be copied to .github/workflows/test.yml by
+# someone whose GitHub token carries the `workflow` scope.
+#
+# The agent tokens used to author this repo have scopes `gist, read:org, repo`
+# only, so any push whose diff touches `.github/workflows/**` is rejected at the
+# remote. Parking the file here keeps it reviewable and diffable instead of
+# leaving it as prose in a pull request description.
+#
+#   cp docs/ci/test-workflow.yml .github/workflows/test.yml
+#   git add .github/workflows/test.yml && git commit && git push
+#
+# Until that happens, `npm test` is still enforced on the release path via the
+# `prepublishOnly` hook in package.json — a failing suite blocks `npm publish`.
+# That is a real gate, but it fires at release, not per change. This workflow is
+# what closes that gap.
+# ---------------------------------------------------------------------------
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # node:sqlite (used by server/bootstrap/native.js) needs >= 22.5.
+          # Pinned to match publish.yml so the two paths cannot drift.
+          node-version: '22.22.2'
+
+      - name: Install dependencies
+        # The suite only needs `ws`; node-datachannel's native download is dead
+        # weight here. `--ignore-scripts` would skip it and cut most of this
+        # step's runtime, but is left off until someone verifies it on a clean
+        # runner — a fast gate that fails for the wrong reason is worse.
+        run: npm ci
+
+      - name: Run API contract tests
+        run: npm test

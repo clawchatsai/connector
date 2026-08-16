@@ -20,7 +20,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "prepublishOnly": "npm run build"
+    "test": "node --test \"tests/**/*.test.mjs\"",
+    "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
     "jose": "^5.10.0",
