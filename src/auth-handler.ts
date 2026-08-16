@@ -30,7 +30,13 @@ export interface AuthConfig {
     period: number;
     enabledAt: string;
   };
-  google: {
+  /**
+   * Absent on any gateway paired without Google — `PluginConfig.google` has
+   * always been optional, and `resolveAuthGate` does not require it. Declaring
+   * it required here was the mismatch that made every such config crash the
+   * moment auth actually engaged.
+   */
+  google?: {
     clientId: string;
     authorizedSub: string;
     authorizedEmail: string;
@@ -230,7 +236,7 @@ export async function handleAuthMessage(
         token,
         config.sessionSecret,
         config.userId,
-        config.google.authorizedSub,
+        config.google?.authorizedSub,
       );
       return authSuccess(dc, connectionId);
     } catch (e) {
@@ -256,29 +262,24 @@ export async function handleAuthMessage(
       return sendFailure(dc, connectionId, 'nonce_mismatch');
     }
 
-    // Verify Google ID token (skipped when not configured or in dev mode)
-    const skipGoogle = !config.google.clientId || config.google.clientId === 'dev-placeholder'
+    // Verify Google ID token (skipped when not configured or in dev mode).
+    // `google` is narrowed rather than asserted: a config with no Google block
+    // always takes the skip path, so the verify path only ever sees a real one.
+    const google = config.google;
+    const skipGoogle = !google?.clientId || google.clientId === 'dev-placeholder'
       || idToken === 'signaling-verified'
       || (config.devMode && idToken === 'dev-mode-no-google');
-    if (skipGoogle) {
+    if (skipGoogle || !google) {
       console.log('[Auth] Skipping Google ID token verification (not configured)');
     } else {
       try {
-        await verifyGoogleIdToken(idToken, {
-          clientId: config.google.clientId,
-          authorizedSub: config.google.authorizedSub,
-          authorizedEmail: config.google.authorizedEmail,
-        });
+        await verifyGoogleIdToken(idToken, google);
       } catch (e) {
         console.error(`[Auth] Google ID token verification failed: ${(e as Error).message}`);
         // Retry with fresh JWKS on first failure (key rotation)
         clearJWKSCache();
         try {
-          await verifyGoogleIdToken(idToken, {
-            clientId: config.google.clientId,
-            authorizedSub: config.google.authorizedSub,
-            authorizedEmail: config.google.authorizedEmail,
-          });
+          await verifyGoogleIdToken(idToken, google);
         } catch {
           return sendFailure(dc, connectionId, 'invalid_id_token');
         }
@@ -307,7 +308,7 @@ export async function handleAuthMessage(
     // Issue session token
     const sessionToken = issueSessionToken(
       config.userId,
-      config.google.authorizedSub,
+      config.google?.authorizedSub,
       sessionDays,
       config.sessionSecret,
     );

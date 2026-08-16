@@ -24,11 +24,11 @@ function base64urlDecode(str: string): Buffer {
 }
 
 interface SessionPayload {
-  sub: string;        // userId
-  googleSub: string;  // Google account sub
-  iat: number;        // issued at (unix seconds)
-  exp: number;        // expiry (unix seconds)
-  jti: string;        // unique token ID
+  sub: string;         // userId
+  googleSub?: string;  // Google account sub — absent on a gateway paired without Google
+  iat: number;         // issued at (unix seconds)
+  exp: number;         // expiry (unix seconds)
+  jti: string;         // unique token ID
 }
 
 /**
@@ -42,7 +42,7 @@ interface SessionPayload {
  */
 export function issueSessionToken(
   userId: string,
-  googleSub: string,
+  googleSub: string | undefined,
   sessionDays: number,
   secret: string,
 ): string {
@@ -83,7 +83,7 @@ export function verifySessionToken(
   token: string,
   secret: string,
   userId: string,
-  googleSub: string,
+  googleSub: string | undefined,
 ): SessionPayload {
   const parts = token.split('.');
   if (parts.length !== 3) throw new Error('malformed_token');
