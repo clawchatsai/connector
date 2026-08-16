@@ -165,7 +165,7 @@ export class GatewayClient {
     // Title sessions are handled server-side — intercept and skip browser delivery
     if (sessionKey?.includes('__clawchats_title_')) {
       if (state === 'final') { const content = extractContent(message); if (content && this.handleTitleResponse(sessionKey, content)) return; }
-      else if (state === 'error' || state === 'aborted') { for (const key of this._pendingTitleGens.keys()) { if (sessionKey === key || sessionKey.includes(key)) { this._pendingTitleGens.delete(key); break; } } return; }
+      else if (state === 'error' || state === 'aborted') { const key = this._matchPendingTitleGen(sessionKey); if (key) this._pendingTitleGens.delete(key); return; }
       return;
     }
 
@@ -328,7 +328,12 @@ export class GatewayClient {
 
   generateThreadTitle(db, threadId, workspace, skipHeuristic = false) {
     if (!db.prepare('SELECT title FROM threads WHERE id = ?').get(threadId)) return;
-    const titleKey = `__clawchats_title_${threadId}`;
+    // Thread ids are caller-supplied (POST /api/threads, POST /api/import), so the same
+    // id genuinely lives in two workspaces. The key has to name the workspace too, or
+    // the second workspace returns early here and the entry the reply matches — whose
+    // .workspace selects the database written in handleTitleResponse() — is the wrong
+    // one. Workspace names are [a-z0-9-], so the "_" after them is an unambiguous split.
+    const titleKey = `__clawchats_title_${workspace}_${threadId}`;
     if (this._pendingTitleGens.has(titleKey)) return;
     const firstUserMsg = db.prepare("SELECT content FROM messages WHERE thread_id = ? AND role = 'user' ORDER BY created_at ASC LIMIT 1").get(threadId);
     if (!firstUserMsg?.content) return;
@@ -340,18 +345,28 @@ export class GatewayClient {
     const messages = db.prepare('SELECT role, content FROM messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT 6').all(threadId);
     if (messages.length < 2) return;
     const conversation = messages.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.length > 300 ? m.content.slice(0, 300) + '...' : m.content}`).join('\n\n');
-    const reqId = `title-${threadId}-${Date.now()}`;
+    const reqId = `title-${workspace}-${threadId}-${Date.now()}`;
     this._pendingTitleGens.set(titleKey, { threadId, workspace, reqId });
-    setTimeout(() => { if (this._pendingTitleGens.has(titleKey)) { this._pendingTitleGens.delete(titleKey); console.log(`Title gen timeout for ${threadId}`); } }, 30000);
+    setTimeout(() => { if (this._pendingTitleGens.has(titleKey)) { this._pendingTitleGens.delete(titleKey); console.log(`Title gen timeout for ${workspace}/${threadId}`); } }, 30000).unref(); // housekeeping only — must not hold the process open
     this.sendToGateway(JSON.stringify({ type: 'req', id: reqId, method: 'chat.send', params: { sessionKey: titleKey, message: `Based on this conversation, generate a concise 3-5 word title. Return ONLY the title text, no quotes, no explanation:\n\n${conversation}\n\nTitle:`, deliver: false, idempotencyKey: reqId } }));
   }
 
-  handleTitleResponse(sessionKey, content) {
-    let matchKey = null, pending = null;
-    for (const [key, val] of this._pendingTitleGens) {
-      if (sessionKey === key || sessionKey.includes(key)) { matchKey = key; pending = val; break; }
+  // The gateway echoes the title session key back with its own prefix, so the lookup has
+  // to tolerate a substring. Take the longest candidate rather than the first in insertion
+  // order: a caller-supplied thread id can be a strict prefix of another ("pre" and
+  // "pre-longer"), and the shorter key matches the longer key's reply just as well.
+  _matchPendingTitleGen(sessionKey) {
+    let match = null;
+    for (const key of this._pendingTitleGens.keys()) {
+      if ((sessionKey === key || sessionKey.includes(key)) && (!match || key.length > match.length)) match = key;
     }
-    if (!pending) return false;
+    return match;
+  }
+
+  handleTitleResponse(sessionKey, content) {
+    const matchKey = this._matchPendingTitleGen(sessionKey);
+    if (!matchKey) return false;
+    const pending = this._pendingTitleGens.get(matchKey);
     this._pendingTitleGens.delete(matchKey);
     let title = content.trim().replace(/^["']|["']$/g, '').replace(/^Title:\s*/i, '').replace(/\n.*/s, '').trim();
     if (title.length > 50) title = title.substring(0, 47) + '...';
