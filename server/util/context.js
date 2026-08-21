@@ -9,16 +9,24 @@ export function buildContextPreamble(db, threadId, lastSessionId, sessionKey) {
   if (lastSessionId) {
     const agentMatch = (sessionKey || '').match(/^agent:([^:]+):/);
     const sessionsDir = getSessionsDirForAgent(agentMatch?.[1]);
+    // sessionTranscriptPath() returns null for an id that cannot be a filename, and
+    // this was the one of its four call sites that did not check. It was harmless
+    // only by accident: fs.readFileSync(null) throws ERR_INVALID_ARG_TYPE, which the
+    // catch below swallowed along with the ENOENT it was written for. Narrowing that
+    // catch to ENOENT — an obvious tidy-up — would turn a rejected id into a
+    // TypeError on the message-send path. Skip instead, as the other three sites do.
     const transcript = sessionTranscriptPath(sessionsDir, lastSessionId);
-    try {
-      const lines = fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean);
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const entry = JSON.parse(lines[i]);
-          if (entry.type === 'compaction' && entry.summary) { summary = entry.summary; method = 'compaction'; break; }
-        } catch { /* skip malformed */ }
-      }
-    } catch { /* file not found */ }
+    if (transcript) {
+      try {
+        const lines = fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean);
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const entry = JSON.parse(lines[i]);
+            if (entry.type === 'compaction' && entry.summary) { summary = entry.summary; method = 'compaction'; break; }
+          } catch { /* skip malformed */ }
+        }
+      } catch { /* file not found */ }
+    }
   }
 
   let preamble = '';
