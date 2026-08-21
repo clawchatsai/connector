@@ -7,6 +7,12 @@ import { parseMultipart } from '../util/multipart.js';
 const HOME = os.homedir();
 const ALLOWED_FILE_DIRS = [HOME, '/tmp'];
 
+export function isPathWithin(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative === '' ||
+    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 export function handleServeFile(req, res, query, memoryConfig) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
@@ -40,7 +46,7 @@ export function handleWorkspaceList(req, res, query) {
   const depth = parseInt(query.depth || '2', 10);
   const showHidden = query.hidden === '1' || query.hidden === 'true';
   const resolved = path.resolve(reqPath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  if (!isPathWithin(HOME, resolved)) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved)) return sendError(res, 404, 'Path not found');
 
   const files = [{ path: resolved + '/', type: 'dir', name: path.basename(resolved), size: 0 }];
@@ -65,7 +71,7 @@ export function handleWorkspaceFileRead(req, res, query) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
   const resolved = path.resolve(filePath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  if (!isPathWithin(HOME, resolved)) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return sendError(res, 404, 'File not found');
 
   const stat = fs.statSync(resolved);
@@ -88,7 +94,7 @@ export async function handleWorkspaceFileWrite(req, res, query) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
   const resolved = path.resolve(filePath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Can only write to workspace directory');
+  if (!isPathWithin(HOME, resolved)) return sendError(res, 403, 'Can only write to workspace directory');
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const dir = path.dirname(resolved);
@@ -101,7 +107,7 @@ export function handleWorkspaceFileDelete(req, res, query) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
   const resolved = path.resolve(filePath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  if (!isPathWithin(HOME, resolved)) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved)) return sendError(res, 404, 'Path not found');
   try {
     const stat = fs.statSync(resolved);
@@ -114,7 +120,7 @@ export async function handleWorkspaceUpload(req, res, query) {
   const targetDir = query.path;
   if (!targetDir) return sendError(res, 400, 'Missing path parameter');
   const resolved = path.resolve(targetDir.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  if (!isPathWithin(HOME, resolved)) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return sendError(res, 404, 'Target directory not found');
   if (!(req.headers['content-type'] || '').includes('multipart/form-data')) return sendError(res, 400, 'Expected multipart/form-data');
 

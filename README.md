@@ -38,6 +38,32 @@ openclaw gateway restart
 
 Then open [app.clawchats.ai](https://app.clawchats.ai) and follow the setup flow.
 
+## Companion workflow: TweetClaw for X/Twitter
+
+ClawChats gives you a private browser UI for a local OpenClaw gateway. If the
+same gateway also needs public X/Twitter automation, install
+[TweetClaw](https://github.com/Xquik-dev/tweetclaw) alongside this connector:
+
+```bash
+openclaw plugins install clawhub:@xquik/tweetclaw
+openclaw config set tools.alsoAllow '["explore", "tweetclaw"]'
+```
+
+Use `openclaw plugins install npm:@xquik/tweetclaw` only when the npm fallback
+is required.
+
+Use ClawChats for the browser conversation, local files, memory, and P2P
+transport. Use TweetClaw for scrape tweets, search tweets, search tweet replies,
+follower export, user lookup, media upload, media download, direct messages,
+monitor tweets, webhooks, giveaway draws, and approval-gated post tweets or post
+tweet replies.
+
+Keep the Xquik API key in OpenClaw config or environment variables, not in chat
+messages or repository files. Review every visible X/Twitter action before
+approval.
+
+Xquik is an independent third-party service. Not affiliated with X Corp. "Twitter" and "X" are trademarks of X Corp.
+
 ## Architecture
 
 ```
