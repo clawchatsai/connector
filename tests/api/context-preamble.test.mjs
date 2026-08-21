@@ -57,10 +57,28 @@ describe('context preamble', () => {
     });
     assert.equal(patched.status, 200, `patch failed: ${JSON.stringify(patched.body)}`);
 
+    // Arm check. On the fixed arm the traversing request reads nothing at all, so
+    // `nullish` is [] whether the recorder is live or inert -- and the recorder is
+    // only live because context.js does `import fs from 'node:fs'` and calls
+    // fs.readFileSync as a property. A named import would bind the function at
+    // module-eval time and silently bypass the patch. So drive a request that MUST
+    // read, in the same recorder, and prove the seam is still observable.
+    const armed = await createThread(srv.api, { title: 'seam-arm' });
+    fs.writeFileSync(path.join(sessionsDir, 'seam-arm.jsonl'), JSON.stringify({ type: 'message' }));
+    await srv.api('PATCH', `/api/threads/${armed}`, { body: { last_session_id: 'seam-arm' } });
+
     const paths = await recordingReadFileSync(async () => {
       const res = await srv.api('POST', `/api/threads/${id}/context-fill`);
       assert.equal(res.status, 200);
+      const ctl = await srv.api('POST', `/api/threads/${armed}/context-fill`);
+      assert.equal(ctl.status, 200);
     });
+
+    assert.ok(
+      paths.includes(path.join(sessionsDir, 'seam-arm.jsonl')),
+      'recorder never saw buildContextPreamble read a transcript -- the fs seam moved ' +
+      'and the null assertion below can no longer fail. Re-point it at the new seam.',
+    );
 
     // sessionTranscriptPath() rejected the id and returned null. Unguarded, that
     // null is handed to fs.readFileSync and only a bare catch hides the TypeError.
