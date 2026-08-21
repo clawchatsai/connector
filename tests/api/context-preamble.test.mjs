@@ -17,6 +17,17 @@
 // observable only by watching the call. The two behavioural tests that follow are
 // the controls — they fail if the guard is over-applied and skips a legitimate
 // transcript, which a seam assertion on its own cannot detect.
+//
+// CLA-1503 changed how these are *armed*, not what they assert. Each used to PATCH
+// `last_session_id` onto a thread and drive the endpoint; that column no longer takes
+// a caller-supplied value, because it has no server-side writer and could name any
+// transcript in a store shared across workspaces. Re-arming it by hand — say, an
+// UPDATE straight into SQLite — would leave these testing a row state no entry point
+// can now produce. So the three below call buildContextPreamble() directly, which is
+// where the invariants actually live: `lastSessionId` is its parameter, and the guard
+// is its business whatever eventually supplies the argument. The endpoint keeps the
+// coverage it can still have in the fourth test. Everything else is real — a live
+// server, its real workspace database, and messages inserted through the API.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,6 +35,7 @@ import path from 'node:path';
 
 import { startTestServer, createThread } from '../helpers/harness.mjs';
 import { sandboxSessionsDir, removeSandboxHome } from '../helpers/sandbox-home.mjs';
+import { buildContextPreamble } from '../../server/util/context.js';
 
 const sessionsDir = sandboxSessionsDir('main');
 
@@ -49,29 +61,27 @@ describe('context preamble', () => {
   before(async () => { srv = await startTestServer(); });
   after(async () => { await srv.close(); removeSandboxHome(); });
 
+  /** The session key the server minted for `threadId`, as the endpoint would read it. */
+  function sessionKeyOf(threadId) {
+    return srv.app.getActiveDb().prepare('SELECT session_key FROM threads WHERE id = ?').get(threadId).session_key;
+  }
+
   test('a rejected last_session_id never reaches fs.readFileSync', async () => {
     const id = await createThread(srv.api, { title: 'seam' });
-    // PATCH is the second caller-supplied writer of this column, alongside import.
-    const patched = await srv.api('PATCH', `/api/threads/${id}`, {
-      body: { last_session_id: '../../../../etc/passwd' },
-    });
-    assert.equal(patched.status, 200, `patch failed: ${JSON.stringify(patched.body)}`);
+    const db = srv.app.getActiveDb();
 
-    // Arm check. On the fixed arm the traversing request reads nothing at all, so
+    // Arm check. On the fixed arm the traversing call reads nothing at all, so
     // `nullish` is [] whether the recorder is live or inert -- and the recorder is
     // only live because context.js does `import fs from 'node:fs'` and calls
     // fs.readFileSync as a property. A named import would bind the function at
-    // module-eval time and silently bypass the patch. So drive a request that MUST
+    // module-eval time and silently bypass the patch. So drive a call that MUST
     // read, in the same recorder, and prove the seam is still observable.
     const armed = await createThread(srv.api, { title: 'seam-arm' });
     fs.writeFileSync(path.join(sessionsDir, 'seam-arm.jsonl'), JSON.stringify({ type: 'message' }));
-    await srv.api('PATCH', `/api/threads/${armed}`, { body: { last_session_id: 'seam-arm' } });
 
     const paths = await recordingReadFileSync(async () => {
-      const res = await srv.api('POST', `/api/threads/${id}/context-fill`);
-      assert.equal(res.status, 200);
-      const ctl = await srv.api('POST', `/api/threads/${armed}/context-fill`);
-      assert.equal(ctl.status, 200);
+      buildContextPreamble(db, id, '../../../../etc/passwd', sessionKeyOf(id));
+      buildContextPreamble(db, armed, 'seam-arm', sessionKeyOf(armed));
     });
 
     assert.ok(
@@ -94,15 +104,11 @@ describe('context preamble', () => {
     fs.writeFileSync(canary, JSON.stringify({ type: 'compaction', summary: 'CANARY-LEAKED' }));
 
     const id = await createThread(srv.api, { title: 'traversal' });
-    await srv.api('PATCH', `/api/threads/${id}`, {
-      body: { last_session_id: '../CANARY-PREAMBLE' },
-    });
+    const res = buildContextPreamble(srv.app.getActiveDb(), id, '../CANARY-PREAMBLE', sessionKeyOf(id));
 
-    const res = await srv.api('POST', `/api/threads/${id}/context-fill`);
-    assert.equal(res.status, 200, `context-fill failed: ${JSON.stringify(res.body)}`);
-    assert.equal(res.body.method, 'raw', 'a traversing id was resolved to a transcript');
+    assert.equal(res.method, 'raw', 'a traversing id was resolved to a transcript');
     assert.ok(
-      !res.body.preamble.includes('CANARY-LEAKED'),
+      !res.preamble.includes('CANARY-LEAKED'),
       'the preamble leaked a transcript from outside the sessions directory',
     );
   });
@@ -119,14 +125,33 @@ describe('context preamble', () => {
     );
 
     const id = await createThread(srv.api, { title: 'happy path' });
-    await srv.api('PATCH', `/api/threads/${id}`, { body: { last_session_id: 'preamble-live' } });
+    const res = buildContextPreamble(srv.app.getActiveDb(), id, 'preamble-live', sessionKeyOf(id));
+
+    assert.equal(res.method, 'compaction', 'the ordinary compaction path stopped resolving');
+    assert.ok(
+      res.preamble.includes('RESTORED-SUMMARY'),
+      'the compaction summary is missing from the preamble',
+    );
+  });
+
+  test('POST /api/threads/:id/context-fill answers from the thread’s own messages', async () => {
+    // What the endpoint can still be driven to do end-to-end: with no session id on
+    // the row it takes the raw branch and replays this thread's messages. Keeping it
+    // here means a broken route is still caught by this file, which is otherwise now
+    // all direct calls. The compaction branch is deliberately not reachable from
+    // here — see the header.
+    const id = await createThread(srv.api, { title: 'endpoint' });
+    const posted = await srv.api('POST', `/api/threads/${id}/messages`, {
+      body: { id: 'ctx-endpoint-1', role: 'user', content: 'REPLAYED-MESSAGE', timestamp: Date.now() },
+    });
+    assert.ok([200, 201].includes(posted.status), `message setup failed: ${JSON.stringify(posted.body)}`);
 
     const res = await srv.api('POST', `/api/threads/${id}/context-fill`);
     assert.equal(res.status, 200, `context-fill failed: ${JSON.stringify(res.body)}`);
-    assert.equal(res.body.method, 'compaction', 'the ordinary compaction path stopped resolving');
+    assert.equal(res.body.method, 'raw');
     assert.ok(
-      res.body.preamble.includes('RESTORED-SUMMARY'),
-      'the compaction summary is missing from the preamble',
+      res.body.preamble.includes('REPLAYED-MESSAGE'),
+      'context-fill stopped replaying the thread’s own messages',
     );
   });
 });

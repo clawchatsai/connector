@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { syncThreadUnreadCount } from '../util/helpers.js';
-import { getSessionsDirForAgent, sessionTranscriptPath } from '../config.js';
 import { cleanGatewaySession, renameGatewaySession } from '../gateway-cleanup.js';
 import { intelligencePath } from './files.js';
 import { isValidWorkspaceName } from '../util/workspace-name.js';
@@ -116,7 +115,15 @@ export class ThreadController {
     const db = this.getActiveDb();
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(params.id)) return sendError(res, 404, 'Thread not found');
     const fields = [], values = [];
-    for (const [col, val] of [['title', body.title], ['model', body.model], ['last_session_id', body.last_session_id], ['unread_count', body.unread_count]]) {
+    // `last_session_id` is deliberately absent from this list, and from the import
+    // insert in MessageController. It names a file in the gateway session store, and
+    // nothing server-side has ever written it: the reconcile endpoint that was meant
+    // to maintain it (specs/backend-session-architecture.md, "Session Reset
+    // Detection") was never built, and the frontend neither sends the field nor calls
+    // the one endpoint that reads it. So every value it could hold was chosen by a
+    // caller, for a store that is shared across workspaces — CLA-1503. Restoring the
+    // feature means adding the server-side writer, not reopening this one.
+    for (const [col, val] of [['title', body.title], ['model', body.model], ['unread_count', body.unread_count]]) {
       if (val !== undefined) { fields.push(`${col} = ?`); values.push(val); }
     }
     if (body.pinned !== undefined) { fields.push('pinned = ?'); values.push(body.pinned ? 1 : 0); }
@@ -282,15 +289,17 @@ export class ThreadController {
     const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
     if (!thread) return sendError(res, 404, 'Thread not found');
     db.prepare('DELETE FROM threads WHERE id = ?').run(params.id);
-    const agentMatch = (thread.session_key || '').match(/^agent:([^:]+):/);
-    const sessionsDir = getSessionsDirForAgent(agentMatch?.[1]);
-    let sessionIdToDelete = thread.last_session_id;
-    if (!sessionIdToDelete) {
-      try { sessionIdToDelete = JSON.parse(fs.readFileSync(path.join(sessionsDir, 'sessions.json'), 'utf8'))[thread.session_key]?.sessionId; } catch { /* ok */ }
-    }
+    // cleanGatewaySession() unlinks the transcript the store associates with this
+    // thread's key, and the store is the only thing that records that association.
+    //
+    // This used to consult `thread.last_session_id` first and fall back to the store,
+    // which meant the extra unlink only did anything when the two disagreed. That is
+    // exactly the exploitable case: the column has no server-side writer at all — see
+    // update() — so a caller could name any transcript in a store that is resolved per
+    // *agent* and shared by every workspace, and deleting its own thread would unlink
+    // another workspace's live session (CLA-1503). CLA-1496 stopped the value escaping
+    // the store; it could still pick anything inside it.
     cleanGatewaySession(thread.session_key);
-    const transcript = sessionTranscriptPath(sessionsDir, sessionIdToDelete);
-    if (transcript) { try { fs.unlinkSync(transcript); } catch { /* ok */ } }
     const retain = this.uploadsRetentionReason(params.id);
     if (retain) console.warn(`[delete] keeping the uploads for thread ${params.id}: ${retain}.`);
     else try { fs.rmSync(path.join(this.uploadsDir, params.id), { recursive: true }); } catch { /* ok */ }

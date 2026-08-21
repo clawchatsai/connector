@@ -66,6 +66,11 @@ export class MessageController {
     const db = this.getActiveDb();
     const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
     if (!thread) return sendError(res, 404, 'Thread not found');
+    // `last_session_id` is NULL for every row since CLA-1503 took away its two
+    // caller-supplied writers, so buildContextPreamble() always takes its raw branch
+    // here today. The argument stays because the column is the right input to this
+    // call — what is missing is the server-side writer that was supposed to maintain
+    // it (see ThreadController.update()), not this reader.
     send(res, 200, buildContextPreamble(db, params.id, thread.last_session_id, thread.session_key));
   }
 
@@ -108,7 +113,10 @@ export class MessageController {
     const workspace = this.getRequestWorkspace();
     if (!body.threads || !Array.isArray(body.threads)) return sendError(res, 400, 'Expected { threads: [...] }');
     let threadsImported = 0, messagesImported = 0;
-    const insertThread = db.prepare('INSERT OR IGNORE INTO threads (id, session_key, title, pinned, pin_order, model, last_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    // `last_session_id` is not imported — see ThreadController.update() for why the
+    // column takes no caller-supplied value (CLA-1503). A dump carrying one is still
+    // accepted; the field is dropped, as any other unrecognised key would be.
+    const insertThread = db.prepare('INSERT OR IGNORE INTO threads (id, session_key, title, pinned, pin_order, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     const insertMsg = db.prepare('INSERT OR IGNORE INTO messages (id, thread_id, role, content, status, metadata, seq, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
     db.exec('BEGIN');
     try {
@@ -127,7 +135,7 @@ export class MessageController {
         const sessionKey = parsed && parsed.workspace === workspace && parsed.threadId === t.id
           ? t.session_key
           : `agent:${ws.workspaces[workspace]?.agent || 'main'}:${workspace}:chat:${t.id}`;
-        if (insertThread.run(t.id, sessionKey, t.title || 'Imported chat', t.pinned || 0, t.pin_order || 0, t.model || null, t.last_session_id || null, t.created_at || Date.now(), t.updated_at || Date.now()).changes > 0) threadsImported++;
+        if (insertThread.run(t.id, sessionKey, t.title || 'Imported chat', t.pinned || 0, t.pin_order || 0, t.model || null, t.created_at || Date.now(), t.updated_at || Date.now()).changes > 0) threadsImported++;
         for (const m of (t.messages || [])) {
           if (!m.id || !m.role) continue;
           const meta = m.metadata ? (typeof m.metadata === 'string' ? m.metadata : JSON.stringify(m.metadata)) : null;

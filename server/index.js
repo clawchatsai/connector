@@ -402,6 +402,14 @@ function migrate(db) {
   try { db.exec('ALTER TABLE threads ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch { /* exists */ }
   try { db.exec('ALTER TABLE threads ADD COLUMN unread_count INTEGER DEFAULT 0'); } catch { /* exists */ }
   try { db.prepare('ALTER TABLE threads ADD COLUMN metadata TEXT DEFAULT NULL').run(); } catch {}
+  // CLA-1503: `last_session_id` no longer takes a caller-supplied value, so from here
+  // on the column can only be NULL. Rows written before that can still hold a filename
+  // a caller chose, which POST /api/threads/:id/context-fill would go on reading out of
+  // a session store shared by every workspace — the delete path no longer consults it
+  // at all. This is what makes "no writer, therefore no value" true of existing
+  // databases and not just of new ones; nothing server-side produced these, so the
+  // clear loses nothing.
+  db.exec('UPDATE threads SET last_session_id = NULL WHERE last_session_id IS NOT NULL');
   db.exec(`CREATE TABLE IF NOT EXISTS unread_messages (thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (thread_id, message_id), FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_unread_thread ON unread_messages(thread_id)');
   ensureFts(db);
