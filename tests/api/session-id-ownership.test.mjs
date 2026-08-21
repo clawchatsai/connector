@@ -1,12 +1,11 @@
 // CLA-1503 — a thread must not be able to reach a transcript it does not own.
 //
-// `last_session_id` is the only thread column that names a file in the gateway
-// session store, and it is entirely client-maintained: `git grep last_session_id
-// server/` finds the schema, two caller-supplied writers (POST /api/import and
-// PATCH /api/threads/:id) and two readers (DELETE /api/threads/:id and
-// buildContextPreamble). Nothing server-side ever writes it — the reconcile
-// endpoint that was meant to, per specs/backend-session-architecture.md
-// ("Session Reset Detection"), was never built.
+// `last_session_id` was the only thread column that named a file in the gateway
+// session store, and it was entirely client-maintained: two caller-supplied writers
+// (POST /api/import and PATCH /api/threads/:id) and two readers (DELETE
+// /api/threads/:id and buildContextPreamble). Nothing server-side ever wrote it —
+// the reconcile endpoint that was meant to, per
+// specs/backend-session-architecture.md ("Session Reset Detection"), was never built.
 //
 // CLA-1496 stopped the value *escaping* the store. It stayed able to name any
 // transcript *inside* it, which is worse than a same-workspace collision sounds:
@@ -15,9 +14,15 @@
 // reaches another workspace's live transcript, crossing the boundary the rest of
 // the session-key handling exists to enforce.
 //
-// Both halves are covered because closing only the delete leaves the read open:
-// the same column also picks which transcript buildContextPreamble() parses, and
-// its compaction summary is returned to the caller in the response body.
+// Both halves are covered because closing only the delete would leave the read open:
+// the same column also picked which transcript buildContextPreamble() parsed, and
+// its compaction summary was returned to the caller in the response body.
+//
+// CLA-1509 then removed the column and that reader outright, so the two tests aimed
+// at them are re-aimed at the invariants that outlive them: the column does not exist
+// to be persisted into, and the endpoint that disclosed it does not exist to be
+// called. The writers are untouched — `last_session_id` is still accepted on the wire
+// by both, and must still be inert — so those tests stand as written.
 //
 // The canaries live inside the sandboxed HOME (helpers/sandbox-home.mjs), so a
 // regression destroys a fixture rather than a real transcript.
@@ -79,15 +84,15 @@ describe('caller-supplied last_session_id (CLA-1503)', () => {
     );
   });
 
-  test('context-fill does not read a transcript named by a caller-supplied last_session_id', async () => {
-    // The compaction summary is the payload: buildContextPreamble() returns it in
-    // the response body, so honouring the column here discloses another
-    // workspace's conversation, not just its filename.
-    plantVictimTranscript(
-      'victim-preamble',
-      JSON.stringify({ type: 'compaction', summary: 'SECRET-FROM-ANOTHER-WORKSPACE' }),
-    );
-
+  // Was: "context-fill does not read a transcript named by a caller-supplied
+  // last_session_id". The compaction summary was the payload — buildContextPreamble()
+  // returned it in the response body, so honouring the column disclosed another
+  // workspace's conversation, not just its filename. CLA-1509 removed the endpoint,
+  // which is a stronger form of the same guarantee, so that is what is asserted.
+  //
+  // The GET is what stops this passing vacuously: an unrouted path and a missing
+  // thread both answer 404, so the thread has to be shown to exist first.
+  test('the context-fill endpoint does not exist to disclose a transcript', async () => {
     const imported = await srv.api('POST', '/api/import', {
       body: {
         threads: [{
@@ -99,34 +104,41 @@ describe('caller-supplied last_session_id (CLA-1503)', () => {
       },
     });
     assert.equal(imported.status, 200, `import failed: ${JSON.stringify(imported.body)}`);
+    assert.equal((await srv.api('GET', '/api/threads/own-preamble')).status, 200);
 
     const filled = await srv.api('POST', '/api/threads/own-preamble/context-fill');
-    assert.equal(filled.status, 200);
-    assert.ok(
-      !filled.body.preamble.includes('SECRET-FROM-ANOTHER-WORKSPACE'),
-      'context-fill returned the compaction summary of a transcript the thread does not own',
+    assert.equal(
+      filled.status,
+      404,
+      'POST /api/threads/:id/context-fill is routed again — it reads a transcript chosen by thread state, and nothing server-side chooses that state',
     );
-    assert.equal(filled.body.method, 'raw');
   });
 
-  // The seam behind all three. The two behavioural tests above would also pass if
-  // only the readers were changed, leaving a client-chosen filename sitting in the
-  // column for the next reader that is added; this is the invariant that stops
-  // that — the value is never persisted in the first place.
+  // The seam behind the rest. The delete tests above would also pass if only the
+  // readers had changed, leaving a client-chosen filename sitting in the column for
+  // the next reader to be added. CLA-1503 made the writers refuse it; CLA-1509 took
+  // the column away, so the invariant is now the stronger one — there is no column to
+  // persist into, on a row either writer produced.
   test('neither writer persists a caller-supplied last_session_id', async () => {
     const imported = await srv.api('POST', '/api/import', {
       body: { threads: [{ id: 'seam-import', title: 'x', last_session_id: 'anything-at-all' }] },
     });
     assert.equal(imported.status, 200);
     const afterImport = await srv.api('GET', '/api/threads/seam-import');
-    assert.equal(afterImport.body.thread.last_session_id, null);
+    assert.ok(
+      !('last_session_id' in afterImport.body.thread),
+      `import produced a row carrying last_session_id: ${JSON.stringify(afterImport.body.thread.last_session_id)}`,
+    );
 
     const id = await createThread(srv.api);
     const patched = await srv.api('PATCH', `/api/threads/${id}`, {
       body: { last_session_id: 'anything-at-all' },
     });
     assert.equal(patched.status, 200);
-    assert.equal(patched.body.thread.last_session_id, null);
+    assert.ok(
+      !('last_session_id' in patched.body.thread),
+      `PATCH produced a row carrying last_session_id: ${JSON.stringify(patched.body.thread.last_session_id)}`,
+    );
   });
 
   // Controls. Refusing the column is only correct if the thread's *own* transcript

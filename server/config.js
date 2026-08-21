@@ -4,7 +4,6 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 export const HOME = os.homedir();
-export const MAX_PREAMBLE_CHARS = 50000;
 
 // Resolve __dirname for ESM (esbuild inlines this correctly)
 const __filename = fileURLToPath(import.meta.url);
@@ -55,11 +54,12 @@ const AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/;
 
 // The agent id here comes from the agent segment of a session_key, and
 // parseSessionKey() matches that segment as [^:]+ — which admits `/` and `..`.
-// Every caller (gateway-cleanup, thread delete, context preamble) then unlinks or
-// reads inside the directory this returns, so an unchecked segment is an arbitrary
-// filesystem path. Fall back to the default store rather than throwing: three of the
-// four call sites resolve the directory outside their try block, and none of them can
-// do anything useful with an exception on what is otherwise a cleanup path.
+// Every caller then unlinks inside the directory this returns, so an unchecked
+// segment is an arbitrary filesystem path. Fall back to the default store rather
+// than throwing: all three remaining call sites are the cleanup entry points in
+// gateway-cleanup.js, and none of them can do anything useful with an exception on
+// what is otherwise a best-effort cleanup path. (CLA-1509 removed the fourth, the
+// context preamble, which was the only reader.)
 export function getSessionsDirForAgent(agentId) {
   if (!agentId || agentId === 'main') return OPENCLAW_SESSIONS_DIR;
   if (!AGENT_ID_RE.test(agentId)) {
@@ -70,14 +70,16 @@ export function getSessionsDirForAgent(agentId) {
 }
 
 // Resolve a session transcript inside `sessionsDir`, or null when the id cannot be a
-// filename. Every id reaching here is interpolated into `${id}.jsonl` and then read or
+// filename. Every id reaching here is interpolated into `${id}.jsonl` and then
 // unlinked, and they arrive from the gateway session store — a file written by the
 // gateway, not by this server. basename() alone would silently rewrite a traversing id
 // into something that still resolves; returning null makes the caller skip instead.
 //
-// This also used to guard `last_session_id`, which POST /api/import stored verbatim.
-// CLA-1503 removed that column's callers rather than relying on the guard: refusing a
-// traversal never stopped an id naming another thread's transcript inside the store.
+// This also used to guard `threads.last_session_id`, which POST /api/import stored
+// verbatim. CLA-1503 removed that column's callers rather than relying on the guard —
+// refusing a traversal never stopped an id naming another thread's transcript inside
+// the store — and CLA-1509 removed the column. So the store is now the only source of
+// ids reaching here, which is what this guard was written for.
 export function sessionTranscriptPath(sessionsDir, sessionId) {
   if (typeof sessionId !== 'string' || !sessionId) return null;
   if (sessionId !== path.basename(sessionId)) {
