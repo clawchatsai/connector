@@ -265,7 +265,6 @@ export function createApp(config = {}) {
       if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id/messages'))) return messages.getAll(req, res, p, query);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/messages'))) return await messages.create(req, res, p);
       if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id/messages/:messageId'))) return messages.delete(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/context-fill'))) return messages.contextFill(req, res, p);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/generate-title'))) {
         const db = getActiveDb();
         const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(p.id);
@@ -389,7 +388,7 @@ function migrate(db) {
     CREATE TABLE IF NOT EXISTS threads (
       id TEXT PRIMARY KEY, session_key TEXT UNIQUE NOT NULL, title TEXT DEFAULT 'New chat',
       pinned INTEGER DEFAULT 0, pin_order INTEGER DEFAULT 0, model TEXT,
-      last_session_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
@@ -402,14 +401,15 @@ function migrate(db) {
   try { db.exec('ALTER TABLE threads ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch { /* exists */ }
   try { db.exec('ALTER TABLE threads ADD COLUMN unread_count INTEGER DEFAULT 0'); } catch { /* exists */ }
   try { db.prepare('ALTER TABLE threads ADD COLUMN metadata TEXT DEFAULT NULL').run(); } catch {}
-  // CLA-1503: `last_session_id` no longer takes a caller-supplied value, so from here
-  // on the column can only be NULL. Rows written before that can still hold a filename
-  // a caller chose, which POST /api/threads/:id/context-fill would go on reading out of
-  // a session store shared by every workspace — the delete path no longer consults it
-  // at all. This is what makes "no writer, therefore no value" true of existing
-  // databases and not just of new ones; nothing server-side produced these, so the
-  // clear loses nothing.
-  db.exec('UPDATE threads SET last_session_id = NULL WHERE last_session_id IS NOT NULL');
+  // CLA-1509: `last_session_id` is gone. CLA-1503 had already left it with no writer
+  // at all — the reconcile endpoint that was meant to maintain it was never built, and
+  // the two caller-supplied writers were removed because the value named a file in a
+  // session store shared by every workspace. Its only reader went with the context-fill
+  // endpoint in this change. Dropping it is what stops the next reader being added
+  // against a column nothing fills. Older databases still have it, hence the ALTER;
+  // it is best-effort like the ones above, and a database that keeps a NULL column is
+  // harmless now that no code names it.
+  try { db.exec('ALTER TABLE threads DROP COLUMN last_session_id'); } catch { /* already gone */ }
   db.exec(`CREATE TABLE IF NOT EXISTS unread_messages (thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (thread_id, message_id), FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_unread_thread ON unread_messages(thread_id)');
   ensureFts(db);

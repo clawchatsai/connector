@@ -1,5 +1,4 @@
 import { send, sendError, parseBody } from '../util/http.js';
-import { buildContextPreamble } from '../util/context.js';
 import { parseSessionKey } from '../util/helpers.js';
 
 export class MessageController {
@@ -62,18 +61,6 @@ export class MessageController {
     send(res, 200, { ok: true });
   }
 
-  contextFill(req, res, params) {
-    const db = this.getActiveDb();
-    const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
-    if (!thread) return sendError(res, 404, 'Thread not found');
-    // `last_session_id` is NULL for every row since CLA-1503 took away its two
-    // caller-supplied writers, so buildContextPreamble() always takes its raw branch
-    // here today. The argument stays because the column is the right input to this
-    // call — what is missing is the server-side writer that was supposed to maintain
-    // it (see ThreadController.update()), not this reader.
-    send(res, 200, buildContextPreamble(db, params.id, thread.last_session_id, thread.session_key));
-  }
-
   search(req, res, params, query) {
     const q = query.q || '';
     if (!q) return send(res, 200, { results: [], total: 0 });
@@ -113,8 +100,8 @@ export class MessageController {
     const workspace = this.getRequestWorkspace();
     if (!body.threads || !Array.isArray(body.threads)) return sendError(res, 400, 'Expected { threads: [...] }');
     let threadsImported = 0, messagesImported = 0;
-    // `last_session_id` is not imported — see ThreadController.update() for why the
-    // column takes no caller-supplied value (CLA-1503). A dump carrying one is still
+    // A dump written before CLA-1509 carries a `last_session_id` per thread. The
+    // column is gone (see ThreadController.update()) and such a dump is still
     // accepted; the field is dropped, as any other unrecognised key would be.
     const insertThread = db.prepare('INSERT OR IGNORE INTO threads (id, session_key, title, pinned, pin_order, model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     const insertMsg = db.prepare('INSERT OR IGNORE INTO messages (id, thread_id, role, content, status, metadata, seq, timestamp, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');

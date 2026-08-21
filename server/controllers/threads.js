@@ -115,14 +115,12 @@ export class ThreadController {
     const db = this.getActiveDb();
     if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(params.id)) return sendError(res, 404, 'Thread not found');
     const fields = [], values = [];
-    // `last_session_id` is deliberately absent from this list, and from the import
-    // insert in MessageController. It names a file in the gateway session store, and
-    // nothing server-side has ever written it: the reconcile endpoint that was meant
-    // to maintain it (specs/backend-session-architecture.md, "Session Reset
-    // Detection") was never built, and the frontend neither sends the field nor calls
-    // the one endpoint that reads it. So every value it could hold was chosen by a
-    // caller, for a store that is shared across workspaces — CLA-1503. Restoring the
-    // feature means adding the server-side writer, not reopening this one.
+    // `last_session_id` is not in this list because CLA-1509 dropped the column. It
+    // named a file in the gateway session store and nothing server-side ever wrote it,
+    // so every value it could hold was chosen by a caller, for a store shared across
+    // workspaces — CLA-1503. It is not coming back in this shape: a thread's current
+    // session id is already derivable server-side from sessions.json, exactly as
+    // gateway-cleanup.js reads it, so nothing here needs a client-writable column.
     for (const [col, val] of [['title', body.title], ['model', body.model], ['unread_count', body.unread_count]]) {
       if (val !== undefined) { fields.push(`${col} = ?`); values.push(val); }
     }
@@ -294,11 +292,11 @@ export class ThreadController {
     //
     // This used to consult `thread.last_session_id` first and fall back to the store,
     // which meant the extra unlink only did anything when the two disagreed. That is
-    // exactly the exploitable case: the column has no server-side writer at all — see
+    // exactly the exploitable case: that column never had a server-side writer — see
     // update() — so a caller could name any transcript in a store that is resolved per
     // *agent* and shared by every workspace, and deleting its own thread would unlink
     // another workspace's live session (CLA-1503). CLA-1496 stopped the value escaping
-    // the store; it could still pick anything inside it.
+    // the store; it could still pick anything inside it. CLA-1509 dropped the column.
     cleanGatewaySession(thread.session_key);
     const retain = this.uploadsRetentionReason(params.id);
     if (retain) console.warn(`[delete] keeping the uploads for thread ${params.id}: ${retain}.`);

@@ -14,10 +14,12 @@
 //
 // CLA-1503 has since taken the first bullet away: `last_session_id` accepts no
 // caller-supplied value at all, because refusing a traversal never stopped an id
-// naming another thread's transcript *inside* the store. The delete test below is
-// therefore armed through the session store instead — see the note on it. The guard
-// itself is unchanged and still needed: session ids reach it from a sessions.json the
-// gateway writes, which this server does not control either.
+// naming another thread's transcript *inside* the store. CLA-1509 then dropped the
+// column and buildContextPreamble() with it, leaving three directory call sites and
+// two filename ones, all in gateway-cleanup.js. The delete test below is therefore
+// armed through the session store instead — see the note on it. The guard itself is
+// unchanged and still needed: session ids reach it from a sessions.json the gateway
+// writes, which this server does not control either.
 //
 // The canaries live inside the sandboxed HOME (helpers/sandbox-home.mjs), so a
 // traversal that still works destroys a fixture rather than a real transcript.
