@@ -377,3 +377,97 @@ describe('GET /api/export and POST /api/import', () => {
     }
   });
 });
+
+// CLA-1296. session_key arrives from the client on import, and gateway replies are
+// routed by parsing it: saveAssistantMessage() resolves the database to write into
+// from the key's workspace segment, not from the database the thread lives in. So a
+// row whose key names another workspace persists its replies into that workspace —
+// the CLA-1274 defect, reached through a different door. Importing a dump into a
+// workspace other than the one it was exported from is the ordinary way a user gets
+// there, since export emits session_key and import used to preserve it verbatim.
+describe('POST /api/import does not trust the caller-supplied session_key', () => {
+  const raw = JSON.stringify({ type: 'event', event: 'chat' });
+
+  /** Register `second` and import one thread into it, returning the stored key. */
+  async function importInto(srv, thread) {
+    await srv.api('POST', '/api/workspaces', { body: { name: 'second' } });
+    const res = await srv.api('POST', '/api/import', {
+      headers: { 'x-workspace': 'second' },
+      body: { threads: [thread] },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.threadsImported, 1, 'import inserted no row');
+    const row = await srv.api('GET', `/api/threads/${thread.id}`, { headers: { 'x-workspace': 'second' } });
+    return row.body.thread.session_key;
+  }
+
+  test('re-keys a thread whose key names the workspace it was exported from', async () => {
+    const srv = await startTestServer();
+    try {
+      const key = await importInto(srv, { id: 'imp-ws', session_key: 'agent:main:default:chat:imp-ws', title: 'From default' });
+      assert.equal(key, 'agent:main:second:chat:imp-ws',
+        'the database the row lives in is ground truth for the workspace segment');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("a re-keyed thread's gateway reply is stored in the importing workspace", async () => {
+    const srv = await startTestServer();
+    try {
+      // The same id in both workspaces — reachable by importing one dump twice, and
+      // the case where the mis-key is a silent cross-workspace write rather than a
+      // dropped reply: default.db holds a live thread under the imported key.
+      await srv.api('POST', '/api/threads', { body: { id: 'shared-1' } });
+      const key = await importInto(srv, { id: 'shared-1', session_key: 'agent:main:default:chat:shared-1', title: 'From default' });
+
+      // The browser sends whatever key the row carries and the gateway echoes it
+      // back on the reply, so the stored key is what decides where this lands.
+      srv.app.gatewayClient.handleChatEvent(
+        { sessionKey: key, state: 'final', message: { content: 'reply for the imported thread' } }, raw);
+
+      const inSecond = await srv.api('GET', '/api/threads/shared-1/messages', { headers: { 'x-workspace': 'second' } });
+      const inDefault = await srv.api('GET', '/api/threads/shared-1/messages');
+      assert.deepEqual(inSecond.body.messages.map(m => m.content), ['reply for the imported thread']);
+      assert.deepEqual(inDefault.body.messages.map(m => m.content), [],
+        "the other workspace's same-id thread must not receive it");
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test('re-keys a thread whose key names a different thread in this workspace', async () => {
+    const srv = await startTestServer();
+    try {
+      // Every writer mints `...:chat:<row id>`; a key naming another thread would
+      // route this row's replies into that one, inside the same workspace.
+      const key = await importInto(srv, { id: 'imp-id', session_key: 'agent:main:second:chat:other-thread', title: 'Mismatched id' });
+      assert.equal(key, 'agent:main:second:chat:imp-id');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test('re-keys a thread whose key the parser rejects', async () => {
+    const srv = await startTestServer();
+    try {
+      const key = await importInto(srv, { id: 'imp-bad', session_key: 'garbage', title: 'Unparseable' });
+      assert.equal(key, 'agent:main:second:chat:imp-bad');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test('preserves a key that already describes the row, including its agent segment', async () => {
+    const srv = await startTestServer();
+    try {
+      // Re-importing a dump into the workspace it came from is the round-trip this
+      // must not break: the key still describes the row, so the link to the gateway
+      // transcript is kept. The agent segment is PATCH /api/workspaces/:name's.
+      const key = await importInto(srv, { id: 'imp-ok', session_key: 'agent:legacy:second:chat:imp-ok', title: 'Same workspace' });
+      assert.equal(key, 'agent:legacy:second:chat:imp-ok');
+    } finally {
+      await srv.close();
+    }
+  });
+});

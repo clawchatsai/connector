@@ -1,5 +1,6 @@
 import { send, sendError, parseBody } from '../util/http.js';
 import { buildContextPreamble } from '../util/context.js';
+import { parseSessionKey } from '../util/helpers.js';
 
 export class MessageController {
   constructor({ getActiveDb, getWorkspaces, getRequestWorkspace, broadcast }) {
@@ -102,8 +103,8 @@ export class MessageController {
     const body = await parseBody(req);
     const db = this.getActiveDb();
     const ws = this.getWorkspaces();
-    // Imported threads without a key are minted against the targeted workspace,
-    // matching ThreadController.create — see CLA-1274.
+    // Imported threads without a usable key are minted against the targeted
+    // workspace, matching ThreadController.create — see CLA-1274.
     const workspace = this.getRequestWorkspace();
     if (!body.threads || !Array.isArray(body.threads)) return sendError(res, 400, 'Expected { threads: [...] }');
     let threadsImported = 0, messagesImported = 0;
@@ -113,7 +114,19 @@ export class MessageController {
     try {
       for (const t of body.threads) {
         if (!t.id) continue;
-        const sessionKey = t.session_key || `agent:${ws.workspaces[workspace]?.agent || 'main'}:${workspace}:chat:${t.id}`;
+        // CLA-1296: session_key arrives from the client, so it is honoured only when
+        // it parses and already describes this row — same workspace, same thread id.
+        // The database file a row lives in is ground truth for which workspace owns
+        // it (CLA-1274), and gateway replies are routed by parsing this key: a key
+        // naming another workspace persists this thread's replies into that
+        // workspace's database. Importing a dump into a workspace other than the one
+        // it was exported from does exactly that. Anything unusable is re-minted,
+        // which is the state repairSessionKeyWorkspace() converges to on the next
+        // open anyway — done here so there is no window before that restart.
+        const parsed = parseSessionKey(t.session_key);
+        const sessionKey = parsed && parsed.workspace === workspace && parsed.threadId === t.id
+          ? t.session_key
+          : `agent:${ws.workspaces[workspace]?.agent || 'main'}:${workspace}:chat:${t.id}`;
         if (insertThread.run(t.id, sessionKey, t.title || 'Imported chat', t.pinned || 0, t.pin_order || 0, t.model || null, t.last_session_id || null, t.created_at || Date.now(), t.updated_at || Date.now()).changes > 0) threadsImported++;
         for (const m of (t.messages || [])) {
           if (!m.id || !m.role) continue;

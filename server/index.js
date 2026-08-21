@@ -424,9 +424,15 @@ function migrate(db) {
 // inert: the re-keyed thread simply opens a new gateway session under its new key.
 function repairSessionKeyWorkspace(db, workspace, agent) {
   if (!workspace) return;
+  // Judged with parseSessionKey() rather than a second, hand-rolled parse of the
+  // same format: the two must not drift, and the looser one rewrote keys the parser
+  // rejects. A `>= 5` segment test accepted `agent:main:default:chat:a:b`, which the
+  // parser's anchored 5-segment regex does not match, and re-keying it discarded the
+  // trailing segments. A key the parser rejects routes nowhere whatever its workspace
+  // segment says, so it is not this repair's to rewrite — CLA-1296.
   const stale = db.prepare('SELECT id, session_key FROM threads').all().filter(row => {
-    const parts = (row.session_key || '').split(':');
-    return parts.length >= 5 && parts[0] === 'agent' && parts[3] === 'chat' && parts[2] !== workspace;
+    const parsed = parseSessionKey(row.session_key);
+    return parsed && parsed.workspace !== workspace;
   });
   if (!stale.length) return;
   const update = db.prepare('UPDATE threads SET session_key = ? WHERE id = ?');
