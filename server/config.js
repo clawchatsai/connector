@@ -49,14 +49,44 @@ export const OPENCLAW_SESSIONS_DIR =
   parseConfigField('sessionsDir') ||
   path.join(HOME, '.openclaw', 'agents', 'main', 'sessions');
 
+// The shape an agent id must have to be safe as a single path segment. Shared with
+// validateAgent() below so the two cannot drift apart.
+const AGENT_ID_RE = /^[a-zA-Z0-9_-]+$/;
+
+// The agent id here comes from the agent segment of a session_key, and
+// parseSessionKey() matches that segment as [^:]+ — which admits `/` and `..`.
+// Every caller (gateway-cleanup, thread delete, context preamble) then unlinks or
+// reads inside the directory this returns, so an unchecked segment is an arbitrary
+// filesystem path. Fall back to the default store rather than throwing: three of the
+// four call sites resolve the directory outside their try block, and none of them can
+// do anything useful with an exception on what is otherwise a cleanup path.
 export function getSessionsDirForAgent(agentId) {
   if (!agentId || agentId === 'main') return OPENCLAW_SESSIONS_DIR;
+  if (!AGENT_ID_RE.test(agentId)) {
+    console.warn(`getSessionsDirForAgent: refusing unsafe agent id ${JSON.stringify(agentId)}; using the default sessions directory`);
+    return OPENCLAW_SESSIONS_DIR;
+  }
   return path.join(HOME, '.openclaw', 'agents', agentId, 'sessions');
+}
+
+// Resolve a session transcript inside `sessionsDir`, or null when the id cannot be a
+// filename. `last_session_id` is stored verbatim by POST /api/import and by the
+// gateway session store, and both the delete path and the context preamble
+// interpolate it into `${id}.jsonl` — so without this an import payload picks the
+// file. basename() alone would silently rewrite a traversing id into something that
+// still resolves; returning null makes the caller skip instead.
+export function sessionTranscriptPath(sessionsDir, sessionId) {
+  if (typeof sessionId !== 'string' || !sessionId) return null;
+  if (sessionId !== path.basename(sessionId)) {
+    console.warn(`sessionTranscriptPath: refusing unsafe session id ${JSON.stringify(sessionId)}`);
+    return null;
+  }
+  return path.join(sessionsDir, `${sessionId}.jsonl`);
 }
 
 export function validateAgent(agentId) {
   if (!agentId) return 'main';
-  if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) throw new Error('Invalid agent ID');
+  if (!AGENT_ID_RE.test(agentId)) throw new Error('Invalid agent ID');
   const agentDir = path.join(HOME, '.openclaw', 'agents', agentId);
   if (!fs.existsSync(agentDir)) throw new Error(`Agent not found: ${agentId}`);
   return agentId;

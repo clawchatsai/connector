@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { MAX_PREAMBLE_CHARS, getSessionsDirForAgent } from '../config.js';
+import { MAX_PREAMBLE_CHARS, getSessionsDirForAgent, sessionTranscriptPath } from '../config.js';
 
 export function buildContextPreamble(db, threadId, lastSessionId, sessionKey) {
   let summary = null;
@@ -9,8 +9,9 @@ export function buildContextPreamble(db, threadId, lastSessionId, sessionKey) {
   if (lastSessionId) {
     const agentMatch = (sessionKey || '').match(/^agent:([^:]+):/);
     const sessionsDir = getSessionsDirForAgent(agentMatch?.[1]);
+    const transcript = sessionTranscriptPath(sessionsDir, lastSessionId);
     try {
-      const lines = fs.readFileSync(path.join(sessionsDir, `${lastSessionId}.jsonl`), 'utf8').split('\n').filter(Boolean);
+      const lines = fs.readFileSync(transcript, 'utf8').split('\n').filter(Boolean);
       for (let i = lines.length - 1; i >= 0; i--) {
         try {
           const entry = JSON.parse(lines[i]);

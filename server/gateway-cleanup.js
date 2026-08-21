@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getSessionsDirForAgent } from './config.js';
+import { getSessionsDirForAgent, sessionTranscriptPath } from './config.js';
 
 export function cleanGatewaySession(sessionKey) {
   try {
@@ -10,8 +10,9 @@ export function cleanGatewaySession(sessionKey) {
     const store = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
     const entry = store[sessionKey];
     if (!entry) return null;
-    if (entry.sessionId) {
-      try { fs.unlinkSync(path.join(sessionsDir, `${entry.sessionId}.jsonl`)); } catch { /* ok */ }
+    const transcript = sessionTranscriptPath(sessionsDir, entry.sessionId);
+    if (transcript) {
+      try { fs.unlinkSync(transcript); } catch { /* ok */ }
     }
     const sessionId = entry.sessionId || null;
     delete store[sessionKey];
@@ -73,8 +74,9 @@ export function cleanGatewaySessionsByPrefix(prefix) {
     let cleaned = 0;
     for (const key of Object.keys(store)) {
       if (!key.startsWith(prefix)) continue;
-      if (store[key]?.sessionId) {
-        try { fs.unlinkSync(path.join(sessionsDir, `${store[key].sessionId}.jsonl`)); } catch { /* ok */ }
+      const transcript = sessionTranscriptPath(sessionsDir, store[key]?.sessionId);
+      if (transcript) {
+        try { fs.unlinkSync(transcript); } catch { /* ok */ }
       }
       delete store[key];
       cleaned++;
