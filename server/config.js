@@ -70,11 +70,14 @@ export function getSessionsDirForAgent(agentId) {
 }
 
 // Resolve a session transcript inside `sessionsDir`, or null when the id cannot be a
-// filename. `last_session_id` is stored verbatim by POST /api/import and by the
-// gateway session store, and both the delete path and the context preamble
-// interpolate it into `${id}.jsonl` — so without this an import payload picks the
-// file. basename() alone would silently rewrite a traversing id into something that
-// still resolves; returning null makes the caller skip instead.
+// filename. Every id reaching here is interpolated into `${id}.jsonl` and then read or
+// unlinked, and they arrive from the gateway session store — a file written by the
+// gateway, not by this server. basename() alone would silently rewrite a traversing id
+// into something that still resolves; returning null makes the caller skip instead.
+//
+// This also used to guard `last_session_id`, which POST /api/import stored verbatim.
+// CLA-1503 removed that column's callers rather than relying on the guard: refusing a
+// traversal never stopped an id naming another thread's transcript inside the store.
 export function sessionTranscriptPath(sessionsDir, sessionId) {
   if (typeof sessionId !== 'string' || !sessionId) return null;
   if (sessionId !== path.basename(sessionId)) {

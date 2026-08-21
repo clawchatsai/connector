@@ -12,6 +12,13 @@
 // because four call sites resolve a directory from the agent segment and three
 // build a `.jsonl` filename.
 //
+// CLA-1503 has since taken the first bullet away: `last_session_id` accepts no
+// caller-supplied value at all, because refusing a traversal never stopped an id
+// naming another thread's transcript *inside* the store. The delete test below is
+// therefore armed through the session store instead — see the note on it. The guard
+// itself is unchanged and still needed: session ids reach it from a sessions.json the
+// gateway writes, which this server does not control either.
+//
 // The canaries live inside the sandboxed HOME (helpers/sandbox-home.mjs), so a
 // traversal that still works destroys a fixture rather than a real transcript.
 import { test, describe, before, after } from 'node:test';
@@ -30,6 +37,11 @@ describe('session store path traversal', () => {
   before(async () => { srv = await startTestServer(); });
   after(async () => { await srv.close(); removeSandboxHome(); });
 
+  // Armed through the session store rather than through `last_session_id`. Importing
+  // a traversing id no longer stores one (CLA-1503), so the original arming would
+  // leave this passing without ever reaching sessionTranscriptPath() — green, and
+  // testing nothing. The store is where the delete path now gets its session id, so
+  // it is also the input that still needs the guard.
   test('DELETE /api/threads/:id cannot unlink outside the sessions directory', async () => {
     const canary = path.join(sandboxHome, 'CANARY-DELETE.jsonl');
     fs.writeFileSync(canary, 'do not delete me');
@@ -38,9 +50,14 @@ describe('session store path traversal', () => {
     // into <sandbox> once the `.jsonl` suffix is appended.
     const escape = path.relative(sessionsDir, path.join(sandboxHome, 'CANARY-DELETE'));
     const imported = await srv.api('POST', '/api/import', {
-      body: { threads: [{ id: 'trav-delete', title: 'x', last_session_id: escape }] },
+      body: { threads: [{ id: 'trav-delete', title: 'x' }] },
     });
     assert.equal(imported.status, 200, `import failed: ${JSON.stringify(imported.body)}`);
+    const { session_key: sessionKey } = (await srv.api('GET', '/api/threads/trav-delete')).body.thread;
+    fs.writeFileSync(
+      path.join(sessionsDir, 'sessions.json'),
+      JSON.stringify({ [sessionKey]: { sessionId: escape } }),
+    );
 
     const deleted = await srv.api('DELETE', '/api/threads/trav-delete');
     assert.equal(deleted.status, 200);
@@ -96,14 +113,25 @@ describe('session store path traversal', () => {
     assert.equal(getSessionsDirForAgent(undefined), sessionsDir);
   });
 
-  test('a legitimate last_session_id is still unlinked on delete', async () => {
+  // The control for the delete test above, armed the same way: without it, a delete
+  // path that unlinked nothing at all would satisfy every canary assertion in this
+  // file. (session-id-ownership.test.mjs asserts the same behaviour, as the control
+  // for a different change — that one guards the removal of the column, this one
+  // guards the traversal refusal.)
+  test('a session id the store owns is still unlinked on delete', async () => {
     const live = path.join(sessionsDir, 'live-session-1.jsonl');
     fs.writeFileSync(live, '{}');
 
     const imported = await srv.api('POST', '/api/import', {
-      body: { threads: [{ id: 'trav-control', title: 'x', last_session_id: 'live-session-1' }] },
+      body: { threads: [{ id: 'trav-control', title: 'x' }] },
     });
     assert.equal(imported.status, 200, `import failed: ${JSON.stringify(imported.body)}`);
+    const { session_key: sessionKey } = (await srv.api('GET', '/api/threads/trav-control')).body.thread;
+    fs.writeFileSync(
+      path.join(sessionsDir, 'sessions.json'),
+      JSON.stringify({ [sessionKey]: { sessionId: 'live-session-1' } }),
+    );
+
     await srv.api('DELETE', '/api/threads/trav-control');
 
     assert.ok(!fs.existsSync(live), 'the ordinary delete path stopped removing its own transcript');
