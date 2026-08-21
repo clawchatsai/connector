@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { syncThreadUnreadCount } from '../util/helpers.js';
-import { getSessionsDirForAgent } from '../config.js';
+import { getSessionsDirForAgent, sessionTranscriptPath } from '../config.js';
 import { cleanGatewaySession, renameGatewaySession } from '../gateway-cleanup.js';
 import { intelligencePath } from './files.js';
 import { isValidWorkspaceName } from '../util/workspace-name.js';
@@ -289,7 +289,8 @@ export class ThreadController {
       try { sessionIdToDelete = JSON.parse(fs.readFileSync(path.join(sessionsDir, 'sessions.json'), 'utf8'))[thread.session_key]?.sessionId; } catch { /* ok */ }
     }
     cleanGatewaySession(thread.session_key);
-    if (sessionIdToDelete) { try { fs.unlinkSync(path.join(sessionsDir, `${sessionIdToDelete}.jsonl`)); } catch { /* ok */ } }
+    const transcript = sessionTranscriptPath(sessionsDir, sessionIdToDelete);
+    if (transcript) { try { fs.unlinkSync(transcript); } catch { /* ok */ } }
     const retain = this.uploadsRetentionReason(params.id);
     if (retain) console.warn(`[delete] keeping the uploads for thread ${params.id}: ${retain}.`);
     else try { fs.rmSync(path.join(this.uploadsDir, params.id), { recursive: true }); } catch { /* ok */ }
