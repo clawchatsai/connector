@@ -101,7 +101,6 @@ let _stopRequested = false;
 let _imageRestrictedModels: string[] = [];
 /** True if session.reset config risks wiping ClawChats history (daily reset or short idle). */
 let _sessionResetWarning = false;
-let _uploadsDir: string | null = null;
 
 // ---------------------------------------------------------------------------
 // Types for OpenClaw plugin API (minimal — these come from the plugin SDK)
@@ -398,7 +397,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   // 4. Import server.js and create app instance with plugin paths
   const dataDir = path.join(ctx.stateDir, 'clawchats', 'data');
   const uploadsDir = path.join(ctx.stateDir, 'clawchats', 'uploads');
-  _uploadsDir = uploadsDir;
   // Dynamic import of server.js (plain JS, no type declarations)
   // @ts-expect-error — server/index.js is plain JS with no .d.ts
   const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server/index.js');
@@ -594,69 +592,6 @@ async function stopClawChats(ctx: PluginServiceContext): Promise<void> {
 // Track which ClawChats thread sessions have received the capability note (once per session).
 
 
-function normalizeGatewayPayload(raw: string): string {
-  try {
-    const parsed = JSON.parse(raw);
-    if (parsed.method === 'chat.send' && typeof parsed.params?.message === 'string') {
-      // Warn user in-chat if they're sending image attachments to an image-restricted model.
-      // The warning is appended to the message so the AI echoes it back — impossible to miss.
-      if (
-        Array.isArray(parsed.params?.attachments) &&
-        parsed.params.attachments.length > 0 &&
-        _imageRestrictedModels.length > 0
-      ) {
-        parsed.params.message = (parsed.params.message || '').trimEnd() +
-          '\n\n[⚠️ ClawChats: image attachment not delivered — your model config is missing "image" input support. ' +
-          'Fix: add "image" to the input array for your model in ~/.openclaw/openclaw.json, then restart the gateway.]';
-        return JSON.stringify(parsed);
-      }
-
-      // Fix image-only messages: inject placeholder so gateway doesn't reject empty body.
-      if (
-        Array.isArray(parsed.params?.attachments) &&
-        parsed.params.attachments.length > 0 &&
-        !parsed.params.message?.trim()
-      ) {
-        parsed.params.message = '[Image]';
-        return JSON.stringify(parsed);
-      }
-
-      // Save inline base64 attachments to disk so the agent can reference them as file paths.
-      // Runs before capability note so a gateway restart doesn't prevent path injection.
-      if (Array.isArray(parsed.params?.attachments) && parsed.params.attachments.length > 0 && _uploadsDir) {
-        const skMatch = (parsed.params.sessionKey as string || '').match(/^agent:[^:]+:[^:]+:chat:([^:]+)$/);
-        const threadId = skMatch?.[1] || 'misc';
-        const uploadDir = path.join(_uploadsDir, threadId);
-        const extMap: Record<string, string> = { jpeg: 'jpg', jpg: 'jpg', png: 'png', gif: 'gif', webp: 'webp', pdf: 'pdf', 'svg+xml': 'svg', mp3: 'mp3', mp4: 'mp4', wav: 'wav', webm: 'webm' };
-        const savedPaths: string[] = [];
-        for (const att of parsed.params.attachments) {
-          if (!att.content || !att.mimeType) continue;
-          try {
-            const rawExt = (att.mimeType as string).split('/')[1]?.split(';')[0] || 'bin';
-            const ext = extMap[rawExt] || rawExt;
-            const fileId = `${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-            const filePath = path.join(uploadDir, `${fileId}.${ext}`);
-            fs.mkdirSync(uploadDir, { recursive: true });
-            fs.writeFileSync(filePath, Buffer.from(att.content as string, 'base64'));
-            savedPaths.push(filePath);
-          } catch { /* skip attachment on error */ }
-        }
-        if (savedPaths.length > 0) {
-          const label = savedPaths.length === 1 ? 'Attached file saved on disk' : 'Attached files saved on disk';
-          parsed.params.message = (parsed.params.message as string).trimEnd() +
-            `\n\n[${label}:\n${savedPaths.map((p: string) => `- ${p}`).join('\n')}]`;
-          return JSON.stringify(parsed);
-        }
-      }
-
-
-    }
-  } catch {
-    // Not JSON or unexpected shape — pass through unchanged
-  }
-  return raw;
-}
-
 // DataChannel message handler (spec section 6.4)
 // ---------------------------------------------------------------------------
 
@@ -849,7 +784,7 @@ function processAuthenticatedMessage(
               .run(_gwMsg.params.model, Date.now(), _gwMsg.params.key);
           }
         } catch { /* ignore parse/db errors */ }
-        app.gatewayClient.sendToGateway(normalizeGatewayPayload(_gwPayload));
+        app.gatewayClient.sendToGateway(_gwPayload);
       }
       break;
 
@@ -882,7 +817,7 @@ function processAuthenticatedMessage(
         gatewayMsgChunkBuffers.delete(chunkId);
         const fullPayload = buf.chunks.join('');
         if (app?.gatewayClient) {
-          app.gatewayClient.sendToGateway(normalizeGatewayPayload(fullPayload));
+          app.gatewayClient.sendToGateway(fullPayload);
         }
       }
       break;

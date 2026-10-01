@@ -2,7 +2,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { syncThreadUnreadCount } from '../util/helpers.js';
-import { getSessionsDirForAgent } from '../config.js';
 import { cleanGatewaySession } from '../gateway-cleanup.js';
 
 export class ThreadController {
@@ -100,15 +99,9 @@ export class ThreadController {
     const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
     if (!thread) return sendError(res, 404, 'Thread not found');
     db.prepare('DELETE FROM threads WHERE id = ?').run(params.id);
-    const agentMatch = (thread.session_key || '').match(/^agent:([^:]+):/);
-    const sessionsDir = getSessionsDirForAgent(agentMatch?.[1]);
-    let sessionIdToDelete = thread.last_session_id;
-    if (!sessionIdToDelete) {
-      try { sessionIdToDelete = JSON.parse(fs.readFileSync(path.join(sessionsDir, 'sessions.json'), 'utf8'))[thread.session_key]?.sessionId; } catch { /* ok */ }
-    }
-    cleanGatewaySession(thread.session_key);
-    if (sessionIdToDelete) { try { fs.unlinkSync(path.join(sessionsDir, `${sessionIdToDelete}.jsonl`)); } catch { /* ok */ } }
+    cleanGatewaySession(thread.session_key); // async, best effort
     try { fs.rmSync(path.join(this.uploadsDir, params.id), { recursive: true }); } catch { /* ok */ }
     send(res, 200, { ok: true });
   }
+
 }

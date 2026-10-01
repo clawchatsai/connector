@@ -3,6 +3,19 @@ import { WebSocket as WS } from 'ws';
 import { loadOrCreateDeviceIdentity, buildDeviceAuth } from './bootstrap/identity.js';
 import { parseSessionKey, extractContent, isSilentReplyExact, isSilentReplyPrefix, sanitizeAssistantContent, syncThreadUnreadCount, generateActivitySummary, writeActivityToDb } from './util/helpers.js';
 
+/**
+ * Cumulative assistant text for a `chat` delta event.
+ * Protocol-v4 gateways (2026.9+) send appends in `deltaText`; only the first frame of a
+ * run (and any new baseline) carries the full `message` snapshot, which already includes
+ * the delta. `replace: true` makes `deltaText` the entire text. Older gateways send the
+ * full cumulative `message` on every delta, which the snapshot branch covers.
+ */
+export function nextChatText(prev, params) {
+  if (params?.message) return extractContent(params.message);
+  if (typeof params?.deltaText !== 'string') return prev || '';
+  return params.replace ? params.deltaText : (prev || '') + params.deltaText;
+}
+
 export class GatewayClient {
   constructor({ getDb, getWorkspaces, dataDir, debugLogger, gatewayWsUrl, authToken }) {
     this.getDb = getDb;
@@ -26,6 +39,9 @@ export class GatewayClient {
     this.browserClients = new Map();
     this._externalBroadcastTargets = [];
     this.streamState = new Map();
+    this._utilityText = new Map(); // sessionKey → accumulated delta text for utility sessions
+    this._rpc = new Map(); // request id → { resolve, reject, timer } for connector-originated RPCs
+    this._rpcSeq = 0;
     this.activityLogs = new Map();
     this._pendingTitleGens = new Map();
     // Runs we've already synthesized a streaming-end{reason:'error'} for
@@ -84,6 +100,16 @@ export class GatewayClient {
     let msg;
     try { msg = JSON.parse(data); } catch { console.error('Invalid JSON from gateway:', data); return; }
 
+    // Responses to the connector's own RPCs (request()) are not browser traffic.
+    if (msg.type === 'res' && this._rpc.has(msg.id)) {
+      const pending = this._rpc.get(msg.id);
+      this._rpc.delete(msg.id);
+      clearTimeout(pending.timer);
+      if (msg.ok) pending.resolve(msg.payload);
+      else pending.reject(new Error(msg.error?.message || `${pending.method} failed`));
+      return;
+    }
+
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
       const identity = loadOrCreateDeviceIdentity(path.join(this.dataDir, 'device-identity.json'));
       const device = buildDeviceAuth(identity, { clientId: 'gateway-client', clientMode: 'backend', role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], token: this.authToken, nonce: msg.payload?.nonce || '' });
@@ -109,7 +135,8 @@ export class GatewayClient {
     const UTILITY_SESSIONS = { '__clawchats_summarizer': 'summarizer', '__clawchats_semantic': 'semantic', '__clawchats_intelligence': 'intelligence' };
     const utilityName = UTILITY_SESSIONS[bareSessionKey];
     if (utilityName) {
-      const content = extractContent(message);
+      const content = state === 'delta' ? this._accumulateChatText(sessionKey, params) : extractContent(message);
+      if (state !== 'delta') this._utilityText.delete(sessionKey);
       if (state === 'delta' && content) {
         this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'utility-response', session: utilityName, state: 'delta', content }));
       } else if (state === 'final' || state === 'aborted') {
@@ -127,7 +154,8 @@ export class GatewayClient {
       if (parsed) {
         const existing = this.streamState.get(sessionKey) || { buffer: '', threadId: parsed.threadId, state: 'streaming', held: [] };
         const prevLen = existing.buffer.length; // capture before update — used to advance thoughtStartOffset on first post-tool delta
-        existing.buffer = extractContent(message); // gateway sends full cumulative content per delta, not chunks
+        const prevBuffer = existing.buffer;
+        existing.buffer = nextChatText(existing.buffer, params);
         if (isSilentReplyPrefix(existing.buffer, 'NO_REPLY') || isSilentReplyPrefix(existing.buffer, 'HEARTBEAT_OK')) {
           existing.held = existing.held || [];
           existing.held.push(rawData);
@@ -144,7 +172,9 @@ export class GatewayClient {
         // frontend to clear the bubble. Both happen here — right before the new-segment delta —
         // so the clear and fill are atomic from the browser's perspective.
         if (existing.pendingReset) {
-          existing.thoughtStartOffset = prevLen;
+          // A v4 gateway may open the post-tool segment with a fresh snapshot instead of
+          // extending the run text; only skip the old text if it's still a prefix.
+          existing.thoughtStartOffset = existing.buffer.startsWith(prevBuffer) ? prevLen : 0;
           existing.pendingReset = false;
           this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-reset', threadId: parsed.threadId, workspace: parsed.workspace }));
         }
@@ -218,6 +248,24 @@ export class GatewayClient {
     }
   }
 
+  // Gateway RPC from the connector itself; resolves with the response payload.
+  request(method, params = {}, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      if (!this.connected || !this.ws || this.ws.readyState !== 1) return reject(new Error('gateway not connected'));
+      const id = `cc-rpc-${++this._rpcSeq}`;
+      const timer = setTimeout(() => { this._rpc.delete(id); reject(new Error(`${method} timed out`)); }, timeoutMs);
+      this._rpc.set(id, { resolve, reject, timer, method });
+      this.ws.send(JSON.stringify({ type: 'req', id, method, params }));
+    });
+  }
+
+  // Utility sessions keep no streamState entry; accumulate their delta text separately.
+  _accumulateChatText(sessionKey, params) {
+    const text = nextChatText(this._utilityText.get(sessionKey) || '', params);
+    this._utilityText.set(sessionKey, text);
+    return text;
+  }
+
   // Removes metadata.pending flag from any pending assistant message for a thread.
   // Called on abort and by _cleanupSilentPending — keeps the SQL in one place.
   _clearPendingFlag(db, threadId) {
@@ -253,7 +301,10 @@ export class GatewayClient {
     // Trim to final-answer portion: only text after the last tool call offset.
     // thoughtStartOffset is passed in from handleChatEvent (captured before streamState.delete).
     // Intermediate narration lives in activityLog steps; message.content is the clean final answer.
-    let content = sanitizeAssistantContent(extractContent(message).substring(thoughtStartOffset));
+    const fullContent = extractContent(message);
+    // Never let a stale segment offset blank the reply (v4 snapshots can be shorter).
+    if (thoughtStartOffset > fullContent.length) thoughtStartOffset = 0;
+    let content = sanitizeAssistantContent(fullContent.substring(thoughtStartOffset));
 
     // Attach media (MEDIA: paths extracted from exec tool args by handleAgentEvent).
     // Buffer is read before the empty-content guard — media-only responses (no text) must not be dropped.
