@@ -30,7 +30,10 @@
   "openclaw": {
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "install": {
+      "minHostVersion": ">=2026.9.7"
+    }
   },
   "devDependencies": {
     "@types/ws": "^8.0.0",
