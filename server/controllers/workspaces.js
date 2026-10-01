@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody } from '../util/http.js';
 import { validateAgent } from '../config.js';
-import { cleanGatewaySession, cleanGatewaySessionsByPrefix } from '../gateway-cleanup.js';
+import { cleanGatewaySession, cleanGatewaySessions } from '../gateway-cleanup.js';
 
 export class WorkspaceController {
   constructor({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir, broadcast }) {
@@ -70,12 +70,13 @@ export class WorkspaceController {
     const ws = this.getWorkspaces();
     if (!ws.workspaces[params.name]) return sendError(res, 404, 'Workspace not found');
     if (Object.keys(ws.workspaces).length <= 1) return sendError(res, 400, 'Cannot delete the only workspace');
+    // Collect the workspace's gateway session keys before its DB is removed.
+    let sessionKeys = [];
+    try { sessionKeys = this.getDb(params.name).prepare('SELECT session_key FROM threads WHERE session_key IS NOT NULL').all().map(r => r.session_key); } catch { /* ok */ }
     this.closeDb(params.name);
     const dbPath = path.join(this.dataDir, `${params.name}.db`);
     for (const suffix of ['', '-wal', '-shm']) { try { fs.unlinkSync(dbPath + suffix); } catch { /* ok */ } }
-    const wsAgent = ws.workspaces[params.name]?.agent || 'main';
-    const cleaned = cleanGatewaySessionsByPrefix(`agent:${wsAgent}:${params.name}:chat:`);
-    if (cleaned > 0) console.log(`Cleaned ${cleaned} gateway sessions for workspace: ${params.name}`);
+    cleanGatewaySessions(sessionKeys).then(n => { if (n > 0) console.log(`Cleaned ${n} gateway sessions for workspace: ${params.name}`); });
     delete ws.workspaces[params.name];
     if (ws.active === params.name) ws.active = Object.keys(ws.workspaces)[0] || null;
     this.setWorkspaces(ws);

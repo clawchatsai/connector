@@ -1,47 +1,31 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { getSessionsDirForAgent } from './config.js';
+// Gateway session cleanup for deleted threads/workspaces.
+// 2026.9+ gateways keep sessions in SQLite and own their lifecycle, so cleanup goes
+// through the `sessions.delete` RPC (same as the Control UI) instead of touching files.
 
-export function cleanGatewaySession(sessionKey) {
+let _gatewayClient = null;
+
+export function setGatewayClient(client) {
+  _gatewayClient = client;
+}
+
+/** Delete one gateway session (row + transcript). Best effort; never throws. */
+export async function cleanGatewaySession(sessionKey) {
+  if (!sessionKey || !_gatewayClient) return false;
   try {
-    const agentMatch = (sessionKey || '').match(/^agent:([^:]+):/);
-    const sessionsDir = getSessionsDirForAgent(agentMatch?.[1]);
-    const sessionsPath = path.join(sessionsDir, 'sessions.json');
-    const store = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
-    const entry = store[sessionKey];
-    if (!entry) return null;
-    if (entry.sessionId) {
-      try { fs.unlinkSync(path.join(sessionsDir, `${entry.sessionId}.jsonl`)); } catch { /* ok */ }
-    }
-    const sessionId = entry.sessionId || null;
-    delete store[sessionKey];
-    fs.writeFileSync(sessionsPath, JSON.stringify(store, null, 2));
-    return sessionId;
+    await _gatewayClient.request('sessions.delete', { key: sessionKey, deleteTranscript: true });
+    return true;
   } catch (err) {
-    console.warn(`cleanGatewaySession(${sessionKey}):`, err.message);
-    return null;
+    // A thread that never sent a message has no gateway session; that's fine.
+    if (!/not found|no session|unknown session/i.test(err.message)) {
+      console.warn(`cleanGatewaySession(${sessionKey}): ${err.message}`);
+    }
+    return false;
   }
 }
 
-export function cleanGatewaySessionsByPrefix(prefix) {
-  try {
-    const agentMatch = (prefix || '').match(/^agent:([^:]+):/);
-    const sessionsDir = getSessionsDirForAgent(agentMatch?.[1]);
-    const sessionsPath = path.join(sessionsDir, 'sessions.json');
-    const store = JSON.parse(fs.readFileSync(sessionsPath, 'utf8'));
-    let cleaned = 0;
-    for (const key of Object.keys(store)) {
-      if (!key.startsWith(prefix)) continue;
-      if (store[key]?.sessionId) {
-        try { fs.unlinkSync(path.join(sessionsDir, `${store[key].sessionId}.jsonl`)); } catch { /* ok */ }
-      }
-      delete store[key];
-      cleaned++;
-    }
-    if (cleaned > 0) fs.writeFileSync(sessionsPath, JSON.stringify(store, null, 2));
-    return cleaned;
-  } catch (err) {
-    console.warn(`cleanGatewaySessionsByPrefix(${prefix}):`, err.message);
-    return 0;
-  }
+/** Delete several gateway sessions by exact key. Returns how many were deleted. */
+export async function cleanGatewaySessions(sessionKeys) {
+  let cleaned = 0;
+  for (const key of sessionKeys) if (await cleanGatewaySession(key)) cleaned++;
+  return cleaned;
 }

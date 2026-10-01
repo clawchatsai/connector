@@ -22,7 +22,7 @@ import { handleStatic } from './controllers/static.js';
 import { handleAgents } from './controllers/agents.js';
 import { createSettingsHandlers } from './controllers/settings.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
-import { cleanGatewaySession } from './gateway-cleanup.js';
+import { cleanGatewaySession, setGatewayClient } from './gateway-cleanup.js';
 import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
@@ -92,6 +92,7 @@ export function createApp(config = {}) {
   // Instantiate the gateway client with all dependencies injected
   const gatewayClient = new GatewayClient({ getDb, getWorkspaces, dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken });
   const broadcast = msg => gatewayClient.broadcastToBrowsers(msg);
+  setGatewayClient(gatewayClient);
 
   // Instantiate controllers
   const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast });

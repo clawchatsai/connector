@@ -40,6 +40,8 @@ export class GatewayClient {
     this._externalBroadcastTargets = [];
     this.streamState = new Map();
     this._utilityText = new Map(); // sessionKey → accumulated delta text for utility sessions
+    this._rpc = new Map(); // request id → { resolve, reject, timer } for connector-originated RPCs
+    this._rpcSeq = 0;
     this.activityLogs = new Map();
     this._pendingTitleGens = new Map();
     // Runs we've already synthesized a streaming-end{reason:'error'} for
@@ -97,6 +99,16 @@ export class GatewayClient {
     this.debugLogger.logFrame('GW→SRV', data);
     let msg;
     try { msg = JSON.parse(data); } catch { console.error('Invalid JSON from gateway:', data); return; }
+
+    // Responses to the connector's own RPCs (request()) are not browser traffic.
+    if (msg.type === 'res' && this._rpc.has(msg.id)) {
+      const pending = this._rpc.get(msg.id);
+      this._rpc.delete(msg.id);
+      clearTimeout(pending.timer);
+      if (msg.ok) pending.resolve(msg.payload);
+      else pending.reject(new Error(msg.error?.message || `${pending.method} failed`));
+      return;
+    }
 
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
       const identity = loadOrCreateDeviceIdentity(path.join(this.dataDir, 'device-identity.json'));
@@ -234,6 +246,17 @@ export class GatewayClient {
         this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'error', errorMessage: gwErrorMessage || message?.error || message?.content || 'Unknown error', ...(activity || {}) }));
       }
     }
+  }
+
+  // Gateway RPC from the connector itself; resolves with the response payload.
+  request(method, params = {}, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+      if (!this.connected || !this.ws || this.ws.readyState !== 1) return reject(new Error('gateway not connected'));
+      const id = `cc-rpc-${++this._rpcSeq}`;
+      const timer = setTimeout(() => { this._rpc.delete(id); reject(new Error(`${method} timed out`)); }, timeoutMs);
+      this._rpc.set(id, { resolve, reject, timer, method });
+      this.ws.send(JSON.stringify({ type: 'req', id, method, params }));
+    });
   }
 
   // Utility sessions keep no streamState entry; accumulate their delta text separately.
