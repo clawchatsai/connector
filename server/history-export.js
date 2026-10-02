@@ -13,7 +13,16 @@ import { DatabaseSync } from 'node:sqlite';
 import { WebSocket } from 'ws';
 import { loadOrCreateDeviceIdentity, buildDeviceAuth } from './bootstrap/identity.js';
 import { parseSessionKey } from './util/helpers.js';
-import { isPushableTitle, withSuffix } from './gateway-sync.js';
+
+const PLACEHOLDER_TITLES = new Set(['New chat', '']);
+
+function withSuffix(base, n) {
+  return n <= 1 ? base : `${base} (${n})`;
+}
+
+function isPushableTitle(title) {
+  return typeof title === 'string' && !PLACEHOLDER_TITLES.has(title.trim());
+}
 
 const SKIP_CONTENT = new Set(['[Response interrupted]']);
 

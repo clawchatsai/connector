@@ -36,22 +36,6 @@ const EVENT_ENVELOPE = new Set(['sessionKey', 'agentId', 'reason', 'phase', 'ts'
 
 const LIST_DEFAULTS = { excludeSubagents: true, excludeCron: true, excludeSystem: true };
 
-/**
- * Gateway transcript entry metadata ({ id, runId, seq, ... }) lives under a
- * double-underscore field whose name is the platform brand. It is found by shape instead
- * of by name so brand renames never break it; ClawChats gets it as `_entry: { id, runId }`.
- */
-export function entryMeta(m) {
-  if (!m || typeof m !== 'object') return null;
-  for (const k of Object.keys(m)) {
-    const v = m[k];
-    if (k.startsWith('__') && v && typeof v === 'object' && !Array.isArray(v) && (typeof v.id === 'string' || typeof v.runId === 'string')) {
-      return { ...(v.id ? { id: v.id } : {}), ...(v.runId ? { runId: v.runId } : {}) };
-    }
-  }
-  return null;
-}
-
 export function isUtilityKey(key) {
   return typeof key === 'string' && key.includes(UTILITY_MARK);
 }
@@ -108,10 +92,6 @@ export function rowVerdict(row) {
   // Main-linked roots are top level only when operator-created (older rows stay nested).
   if (parent && row.createdVia !== 'operator' && !row.forkSource) return true;
   return false;
-}
-
-export function rowIsHidden(row) {
-  return rowVerdict(row) === true;
 }
 
 export function trimRow(row) {

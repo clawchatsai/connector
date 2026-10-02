@@ -1,20 +1,15 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { WebSocket as WS, WebSocketServer } from 'ws';
+import { WebSocketServer } from 'ws';
 
 import { Database, requestDbStore } from './bootstrap/native.js';
-import { GATEWAY_WS_URL, AUTH_TOKEN, getSessionsDirForAgent } from './config.js';
+import { GATEWAY_WS_URL, AUTH_TOKEN } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
-// LEGACY(gateway-native): import { GatewaySync } from './gateway-sync.js';
 import { discoverMemoryConfig } from './providers/memory-config.js';
 import { createMemoryProvider } from './providers/memory.js';
-// LEGACY(gateway-native): import { WorkspaceController } from './controllers/workspaces.js';
-// LEGACY(gateway-native): import { ThreadController } from './controllers/threads.js';
-// LEGACY(gateway-native): import { MessageController } from './controllers/messages.js';
 import { FileController } from './controllers/files.js';
 import { MemoryController } from './controllers/memory.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload } from './controllers/filesystem.js';
@@ -26,11 +21,9 @@ import { createSettingsHandlers } from './controllers/settings.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
 import { SessionLens } from './session-lens.js';
-import { cleanGatewaySession, setGatewayClient } from './gateway-cleanup.js';
 import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
-const HOME = os.homedir();
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
 const DEFAULT_PORT = 3001;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -66,8 +59,7 @@ export function createApp(config = {}) {
     return db;
   }
   function getActiveDb() { return requestDbStore.getStore() || getDb(getWorkspaces().active); }
-  function closeDb(name) { const db = dbCache.get(name); if (db) { db.close(); dbCache.delete(name); } }
-  function closeAll() { gatewayClient?.sync?.stop(); for (const db of dbCache.values()) db.close(); dbCache.clear(); globalDbCache.close?.(); }
+  function closeAll() { for (const db of dbCache.values()) db.close(); dbCache.clear(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -94,25 +86,15 @@ export function createApp(config = {}) {
   const MEMORY_FILES_DIR = path.join(memoryConfig.workspaceDir, 'memory');
 
   // Instantiate the gateway client with all dependencies injected
-  const gatewayClient = new GatewayClient({ getDb, getWorkspaces, dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken });
+  const gatewayClient = new GatewayClient({ dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken });
   const broadcast = msg => gatewayClient.broadcastToBrowsers(msg);
-  setGatewayClient(gatewayClient);
   // ClawChats-only data + the gateway↔browser session filter (gateway-native architecture).
   const extras = createExtrasStore(() => globalDbCache.get());
   try { const n = extras.seedFromWorkspaces(getWorkspaces()); if (n) console.log(`[extras] seeded ${n} project style(s) from workspaces.json`); }
   catch (e) { console.error('[extras] style seed failed:', e.message); }
   gatewayClient.lens = new SessionLens({ broadcast, request: (m, p, t) => gatewayClient.request(m, p, t), extras });
-  // ── LEGACY(gateway-native) BEGIN: two-way project/thread sync with per-project DBs
-  // const gatewaySync = new GatewaySync({ gateway: gatewayClient, getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, uploadsDir: UPLOADS_DIR, broadcast });
-  // gatewayClient.sync = gatewaySync;
-  // ── LEGACY(gateway-native) END
 
   // Instantiate controllers
-  // ── LEGACY(gateway-native) BEGIN: project/thread/message REST controllers
-  // const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast, sync: gatewaySync, extras });
-  // const threads    = new ThreadController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, broadcast, sync: gatewaySync });
-  // const messages   = new MessageController({ getActiveDb, getWorkspaces, broadcast });
-  // ── LEGACY(gateway-native) END
   const files      = new FileController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
 
@@ -255,61 +237,9 @@ export function createApp(config = {}) {
         return send(res, 200, { ok: true });
       }
 
-      // ── LEGACY(gateway-native) BEGIN: project REST (gateway sessions.groups.*)
-      // // Workspaces
-      // if (method === 'GET' && urlPath === '/api/workspaces') return workspaces.getAll(req, res);
-      // if (method === 'POST' && urlPath === '/api/workspaces') return await workspaces.create(req, res);
-      // if ((p = matchRoute(method, urlPath, 'PATCH /api/workspaces/:name'))) return await workspaces.update(req, res, p);
-      // if ((p = matchRoute(method, urlPath, 'DELETE /api/workspaces/:name'))) return await workspaces.delete(req, res, p);
-      // if (method === 'POST' && urlPath === '/api/workspaces/reorder') return await workspaces.reorder(req, res);
-      // if ((p = matchRoute(method, urlPath, 'POST /api/workspaces/:name/activate'))) return workspaces.activate(req, res, p);
-      // ── LEGACY(gateway-native) END
-
-      // ── LEGACY(gateway-native) BEGIN: thread/message REST (gateway sessions.* / chat.history)
-      // // Threads
-      // if (method === 'GET' && urlPath === '/api/threads') return threads.getAll(req, res, {}, query);
-      // if (method === 'GET' && urlPath === '/api/threads/unread') return threads.getUnread(req, res);
-      // if (method === 'POST' && urlPath === '/api/threads') return await threads.create(req, res);
-      // if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/mark-read'))) return await threads.markRead(req, res, p);
-      // if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id/messages'))) return messages.getAll(req, res, p, query);
-      // if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/messages'))) return await messages.create(req, res, p);
-      // if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id/messages/:messageId'))) return messages.delete(req, res, p);
-      // if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/generate-title'))) {
-        // const db = getActiveDb();
-        // const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(p.id);
-        // if (!thread) return sendError(res, 404, 'Thread not found');
-        // gatewayClient.generateThreadTitle(db, p.id, getWorkspaces().active);
-        // return send(res, 200, { ok: true });
-      // }
-      // ── LEGACY(gateway-native) END
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/upload'))) return await files.upload(req, res, p);
       if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id/intelligence'))) return files.getIntelligence(req, res, p);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/intelligence'))) return await files.saveIntelligence(req, res, p);
-      // ── LEGACY(gateway-native) BEGIN: thread REST
-      // if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id'))) return threads.get(req, res, p);
-      // if ((p = matchRoute(method, urlPath, 'PATCH /api/threads/:id'))) return await threads.update(req, res, p);
-      // if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id'))) return await threads.delete(req, res, p);
-      // ── LEGACY(gateway-native) END
-
-      // ── LEGACY(gateway-native) BEGIN: search/export/import, active-thread unread, incognito cleanup
-      // // Search / export / import
-      // if (method === 'GET' && urlPath === '/api/search') return messages.search(req, res, {}, query);
-      // if (method === 'GET' && urlPath === '/api/export') return messages.export(req, res);
-      // if (method === 'POST' && urlPath === '/api/import') return await messages.import(req, res);
-
-      // if (method === 'POST' && urlPath === '/api/active-thread') {
-        // const body = await parseBody(req);
-        // if (body.threadId && body.workspace) gatewayClient.setActiveThread(null, body.workspace, body.threadId);
-        // return send(res, 200, { ok: true });
-      // }
-
-      // if (method === 'POST' && urlPath === '/api/incognito/cleanup') {
-        // const { sessionKey, threadId } = await parseBody(req);
-        // if (sessionKey) cleanGatewaySession(sessionKey);
-        // if (threadId) { try { fs.rmSync(path.join(UPLOADS_DIR, threadId), { recursive: true }); } catch { /* ok */ } }
-        // return send(res, 200, { ok: true });
-      // }
-      // ── LEGACY(gateway-native) END
 
       sendError(res, 404, `Not found: ${method} ${urlPath}`);
     } catch (err) {
@@ -344,7 +274,7 @@ export function createApp(config = {}) {
             return;
           }
           if (msg.type === 'clawchats' || msg.type === 'shellchat') {
-            if (msg.action === 'active-thread') { gatewayClient.setActiveThread(ws, msg.workspace, msg.threadId); return; }
+            if (msg.action === 'active-thread') return; // sent by pre-gateway-native frontends; nothing to track now
             if (msg.action === 'debug-start') { const r = debugLogger.start(msg.ts, ws); ws.send(JSON.stringify(r.error === 'already-active' ? { type: 'clawchats', event: 'debug-error', error: 'Recording already active in another tab', sessionId: r.sessionId } : { type: 'clawchats', event: 'debug-started', sessionId: r.sessionId })); return; }
             if (msg.action === 'debug-dump') { const r = debugLogger.saveDump(msg); ws.send(JSON.stringify({ type: 'clawchats', event: 'debug-saved', sessionId: r.sessionId, files: r.files })); return; }
           }
@@ -388,7 +318,6 @@ export function createApp(config = {}) {
     shutdown: closeAll,
     closeAllDbs: closeAll,
     gatewayClient,
-    // LEGACY(gateway-native): gatewaySync,
     extras,
     setupBrowserWs,
     debugLogger,

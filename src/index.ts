@@ -25,7 +25,7 @@ import type { DataChannelLike } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
 
-import { initAuth, handleAuthMessage, cleanupAuth, isAuthenticated, type AuthConfig } from './auth-handler.js';
+import { initAuth, handleAuthMessage, cleanupAuth, type AuthConfig } from './auth-handler.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
 import { fileURLToPath } from 'node:url';
@@ -297,45 +297,8 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   }
 }
 
-// ── LEGACY(gateway-native) BEGIN: CLAWCHATS.md content
-// const CLAWCHATS_MD_CONTENT = `# ClawChats — Inline File Delivery
-
-// To deliver a file inline in this chat, run an exec that outputs a MEDIA: line:
-
-    // MEDIA:/absolute/path/to/file
-
-// **After creating any file** (via Write tool or exec), deliver it by running:
-
-    // exec echo "MEDIA:/absolute/path/to/file"
-
-// For files created during an exec command, you can inline it at the end of the same command:
-
-    // exec python3 generate.py --output /tmp/result.png && echo "MEDIA:/tmp/result.png"
-
-// Notes:
-// - Works for images (png, jpg, gif, webp, svg, etc.), documents, markdown, code files, and more
-// - Output each path once — duplicates are ignored automatically
-// `;
-// ── LEGACY(gateway-native) END
-
 async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<void> {
   _stopRequested = false;
-
-  // ── LEGACY(gateway-native) BEGIN: CLAWCHATS.md exec-echo MEDIA protocol (gateway parses MEDIA: in replies)
-  // // Bootstrap CLAWCHATS.md in the agent workspace so the agent always knows the MEDIA: protocol.
-  // // Written once on plugin start; never overwrites an existing file (user may have customised it).
-  // try {
-    // const workspaceDir = path.join(ctx.stateDir, 'workspace');
-    // const clawchatsDoc = path.join(workspaceDir, 'CLAWCHATS.md');
-    // if (!fs.existsSync(clawchatsDoc)) {
-      // fs.mkdirSync(workspaceDir, { recursive: true });
-      // fs.writeFileSync(clawchatsDoc, CLAWCHATS_MD_CONTENT, { encoding: 'utf8' });
-      // ctx.logger.info('[clawchats] wrote CLAWCHATS.md to workspace');
-    // }
-  // } catch (e) {
-    // ctx.logger.warn(`[clawchats] could not write CLAWCHATS.md: ${(e as Error).message}`);
-  // }
-  // ── LEGACY(gateway-native) END
 
   let config = loadConfig();
 
@@ -780,17 +743,6 @@ function processAuthenticatedMessage(
     case 'gateway-msg':
       if (app?.gatewayClient && typeof msg['payload'] === 'string') {
         const _gwPayload = msg['payload'] as string;
-        // ── LEGACY(gateway-native) BEGIN: model column in ClawChats DB
-        // // Persist model when sessions.patch is called
-        // try {
-          // const _gwMsg = JSON.parse(_gwPayload);
-          // if (_gwMsg.method === 'sessions.patch' && _gwMsg.params?.model && _gwMsg.params?.key) {
-            // const _db = app.getActiveDb() as any;
-            // _db.prepare('UPDATE threads SET model = ?, updated_at = ? WHERE session_key = ?')
-              // .run(_gwMsg.params.model, Date.now(), _gwMsg.params.key);
-          // }
-        // } catch { /* ignore parse/db errors */ }
-        // ── LEGACY(gateway-native) END
         app.gatewayClient.forwardFromBrowser(_gwPayload);
       }
       break;
@@ -1559,20 +1511,6 @@ const plugin: OpenClawPluginDefinition = {
   description: 'Connects your gateway to ClawChats via WebRTC P2P',
 
   register(api: PluginApi) {
-    // ── LEGACY(gateway-native) BEGIN: exec-echo MEDIA hint in every system prompt (conflicts with gateway MEDIA:)
-    // // Inject MEDIA: capability note into the system prompt via before_prompt_build.
-    // // Appended to system context (trusted, not user-turn) so it's always present and
-    // // never flagged as prompt injection. Survives compaction automatically.
-    // //
-    // // Path parsing lives in server/gateway.js handleAgentEvent (stable singleton) —
-    // // do NOT hold state in this closure; OpenClaw may call register() multiple times
-    // // during the plugin lifecycle and each call creates a fresh closure.
-    // api.on('before_prompt_build', (_event, _ctx) => {
-      // return {
-        // appendSystemContext: 'ClawChats inline preview: after writing a file with the Write tool, run `echo "MEDIA:/absolute/path/to/file"` via the exec tool to display it inline in the chat UI.',
-      // };
-    // }, { name: 'clawchats-media-hint', description: 'Appends MEDIA: file preview capability note to system prompt' });
-    // ── LEGACY(gateway-native) END
 
     // Background service: signaling + gateway bridge + future WebRTC
     api.registerService({
