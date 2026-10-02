@@ -4,13 +4,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
-import { Database, requestDbStore } from './bootstrap/native.js';
+import { Database } from './bootstrap/native.js';
 import { GATEWAY_WS_URL, AUTH_TOKEN } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
 import { discoverMemoryConfig } from './providers/memory-config.js';
 import { createMemoryProvider } from './providers/memory.js';
-import { FileController } from './controllers/files.js';
 import { MemoryController } from './controllers/memory.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
@@ -21,7 +20,6 @@ import { createSettingsHandlers } from './controllers/settings.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
 import { SessionLens } from './session-lens.js';
-import { parseSessionKey } from './util/helpers.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -34,10 +32,8 @@ const PLUGIN_DIR = path.resolve(__dirname, '..');
 export function createApp(config = {}) {
   const PORT             = config.port           || DEFAULT_PORT;
   const DATA_DIR         = config.dataDir        || path.join(PLUGIN_DIR, 'data');
-  const UPLOADS_DIR      = config.uploadsDir     || path.join(PLUGIN_DIR, 'uploads');
   const WORKSPACES_FILE  = path.join(DATA_DIR, 'workspaces.json');
   const SETTINGS_FILE    = path.join(DATA_DIR, 'settings.json');
-  const INTELLIGENCE_DIR = path.join(DATA_DIR, 'intelligence');
 
   const authToken      = config.authToken    !== undefined ? config.authToken    : AUTH_TOKEN;
   const gatewayToken   = config.gatewayToken !== undefined ? config.gatewayToken : authToken;
@@ -45,21 +41,8 @@ export function createApp(config = {}) {
   const openaiApiKey   = config.openaiApiKey || null;
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-  // Per-workspace SQLite databases
-  const dbCache = new Map();
-  function getDb(workspaceName) {
-    if (dbCache.has(workspaceName)) return dbCache.get(workspaceName);
-    const db = new Database(path.join(DATA_DIR, `${workspaceName}.db`));
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec('PRAGMA foreign_keys = ON');
-    migrate(db);
-    dbCache.set(workspaceName, db);
-    return db;
-  }
-  function getActiveDb() { return requestDbStore.getStore() || getDb(getWorkspaces().active); }
-  function closeAll() { for (const db of dbCache.values()) db.close(); dbCache.clear(); globalDbCache.close?.(); }
+  function closeAll() { gatewayClient?.close(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -95,7 +78,6 @@ export function createApp(config = {}) {
   gatewayClient.lens = new SessionLens({ broadcast, request: (m, p, t) => gatewayClient.request(m, p, t), extras });
 
   // Instantiate controllers
-  const files      = new FileController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
 
   const handleGatewayMedia = createGatewayMediaHandler({ gatewayWsUrl: gatewayUrl, gatewayToken });
@@ -114,11 +96,7 @@ export function createApp(config = {}) {
 
   // Request handler
   async function handleRequest(req, res) {
-    const wsName = req.headers?.['x-workspace'];
-    // Only known projects: gateway-native browsers may send a group name, which must never
-    // become a DB file name.
-    const db = wsName && getWorkspaces().workspaces[wsName] ? getDb(wsName) : getActiveDb();
-    return requestDbStore.run(db, () => route(req, res));
+    return route(req, res);
   }
 
   async function route(req, res) {
@@ -136,7 +114,6 @@ export function createApp(config = {}) {
     }
 
     // Unauthenticated routes
-    if ((p = matchRoute(method, urlPath, 'GET /api/uploads/:threadId/:fileId'))) return files.serveUpload(req, res, p);
 
     if (method === 'GET' && urlPath === '/api/emoji') {
       try { const rows = globalDbCache.get().prepare('SELECT name, pack, url, mime_type FROM custom_emojis ORDER BY created_at DESC').all(); res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' }); return res.end(JSON.stringify(rows)); }
@@ -237,9 +214,6 @@ export function createApp(config = {}) {
         return send(res, 200, { ok: true });
       }
 
-      if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/upload'))) return await files.upload(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id/intelligence'))) return files.getIntelligence(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/intelligence'))) return await files.saveIntelligence(req, res, p);
 
       sendError(res, 404, `Not found: ${method} ${urlPath}`);
     } catch (err) {
@@ -260,7 +234,6 @@ export function createApp(config = {}) {
       ws.on('message', async data => {
         const msgStr = data.toString();
         debugLogger.logFrame('BR→SRV', msgStr);
-        let msgToForward = msgStr;
         try {
           const msg = JSON.parse(msgStr);
           if (msg.type === 'req' && msg.method === 'connect') {
@@ -278,30 +251,8 @@ export function createApp(config = {}) {
             if (msg.action === 'debug-start') { const r = debugLogger.start(msg.ts, ws); ws.send(JSON.stringify(r.error === 'already-active' ? { type: 'clawchats', event: 'debug-error', error: 'Recording already active in another tab', sessionId: r.sessionId } : { type: 'clawchats', event: 'debug-started', sessionId: r.sessionId })); return; }
             if (msg.action === 'debug-dump') { const r = debugLogger.saveDump(msg); ws.send(JSON.stringify({ type: 'clawchats', event: 'debug-saved', sessionId: r.sessionId, files: r.files })); return; }
           }
-          // Save inline attachments to disk before forwarding to gateway
-          if (msg.type === 'req' && msg.method === 'chat.send' && msg.params?.attachments?.length > 0) {
-            const parsed = parseSessionKey(msg.params.sessionKey || '');
-            const threadId = parsed?.threadId || 'misc';
-            const uploadDir = path.join(UPLOADS_DIR, threadId);
-            fs.mkdirSync(uploadDir, { recursive: true });
-            const extMap = { jpeg: 'jpg', jpg: 'jpg', png: 'png', gif: 'gif', webp: 'webp', pdf: 'pdf', 'svg+xml': 'svg', mp3: 'mp3', mp4: 'mp4', wav: 'wav', webm: 'webm' };
-            const savedPaths = [];
-            for (const att of msg.params.attachments) {
-              if (!att.content || !att.mimeType) continue;
-              try {
-                const rawExt = att.mimeType.split('/')[1]?.split(';')[0] || 'bin';
-                const filePath = path.join(uploadDir, `${Date.now()}_${Math.random().toString(36).slice(2, 6)}.${extMap[rawExt] || rawExt}`);
-                fs.writeFileSync(filePath, Buffer.from(att.content, 'base64'));
-                savedPaths.push(filePath);
-              } catch (err) { console.error('[upload] Failed to save attachment:', err.message); }
-            }
-            if (savedPaths.length > 0) {
-              const note = `\n\n[${savedPaths.length === 1 ? 'Attached file saved on disk' : 'Attached files saved on disk'}:\n${savedPaths.map(p => `- ${p}`).join('\n')}]`;
-              msgToForward = JSON.stringify({ ...msg, params: { ...msg.params, message: (msg.params.message || '') + note } });
-            }
-          }
         } catch { /* not JSON or not a ClawChats message, forward as-is */ }
-        gatewayClient.forwardFromBrowser(msgToForward);
+        gatewayClient.forwardFromBrowser(msgStr);
       });
 
       ws.on('close', () => { console.log('Browser client disconnected'); debugLogger.handleClientDisconnect(ws); gatewayClient.removeBrowserClient(ws); });
@@ -311,12 +262,9 @@ export function createApp(config = {}) {
 
   return {
     handleRequest,
-    getDb,
-    getActiveDb,
     getWorkspaces,
     setWorkspaces,
     shutdown: closeAll,
-    closeAllDbs: closeAll,
     gatewayClient,
     extras,
     setupBrowserWs,
@@ -325,67 +273,10 @@ export function createApp(config = {}) {
   };
 }
 
-// Migration — kept here as it references Database-level constructs shared across modules
-function migrate(db) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS threads (
-      id TEXT PRIMARY KEY, session_key TEXT UNIQUE NOT NULL, title TEXT DEFAULT 'New chat',
-      pinned INTEGER DEFAULT 0, pin_order INTEGER DEFAULT 0, model TEXT,
-      last_session_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS messages (
-      id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
-      status TEXT DEFAULT 'sent', metadata TEXT, seq INTEGER, timestamp INTEGER NOT NULL, created_at INTEGER NOT NULL,
-      FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_messages_dedup ON messages(thread_id, role, timestamp);
-  `);
-  try { db.exec('ALTER TABLE threads ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch { /* exists */ }
-  try { db.exec('ALTER TABLE threads ADD COLUMN unread_count INTEGER DEFAULT 0'); } catch { /* exists */ }
-  try { db.prepare('ALTER TABLE threads ADD COLUMN metadata TEXT DEFAULT NULL').run(); } catch {}
-  // When the connector first saw this thread's gateway session (gateway sync). NULL = never
-  // synced: the thread's state is pushed to the gateway, never pulled or deleted from it.
-  try { db.exec('ALTER TABLE threads ADD COLUMN gateway_seen_at INTEGER DEFAULT NULL'); } catch { /* exists */ }
-  db.exec(`CREATE TABLE IF NOT EXISTS unread_messages (thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (thread_id, message_id), FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE)`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_unread_thread ON unread_messages(thread_id)');
-  ensureFts(db);
-}
-
-function createFts(db) {
-  db.exec(`CREATE VIRTUAL TABLE messages_fts USING fts5(content, content=messages, content_rowid=rowid, tokenize='porter unicode61 tokenchars x27')`);
-  db.exec(`CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content); END`);
-  db.exec(`CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content); END`);
-  db.exec(`CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.rowid, old.content); INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content); END`);
-}
-
-function dropFts(db) {
-  db.exec('DROP TABLE IF EXISTS messages_fts; DROP TRIGGER IF EXISTS messages_ai; DROP TRIGGER IF EXISTS messages_ad; DROP TRIGGER IF EXISTS messages_au;');
-}
-
-function ensureFts(db) {
-  const hasFts = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'").get();
-  if (!hasFts) {
-    try { createFts(db); db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')").run(); }
-    catch (e) { console.error('[DB] messages_fts creation failed:', e.message); }
-    return;
-  }
-  const schema = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'").get();
-  if (schema && !schema.sql.includes('tokenchars')) {
-    console.log('[DB] Upgrading messages_fts tokenizer...');
-    try { dropFts(db); createFts(db); db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')").run(); console.log('[DB] Upgrade complete'); }
-    catch (e) { console.error('[DB] Upgrade failed:', e.message); dropFts(db); }
-  } else {
-    try { db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')").run(); }
-    catch { try { db.prepare("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')").run(); } catch (e) { console.error('[DB] FTS rebuild failed:', e.message); dropFts(db); } }
-  }
-}
-
 // Standalone mode (node server/index.js or via isDirectRun check in bundle)
 const isDirectRun = import.meta.url === `file://${process.argv[1]}`;
 if (isDirectRun) {
   const app = createApp();
-  app.getActiveDb();
 
   const server = http.createServer(app.handleRequest);
   const wss = new WebSocketServer({ noServer: true });

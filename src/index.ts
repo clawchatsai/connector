@@ -47,12 +47,9 @@ export const PLUGIN_VERSION: string = _pkgJson.version;
 /** Minimal type for the object returned by server.js createApp() */
 interface AppInstance {
   handleRequest: (req: unknown, res: unknown) => void | Promise<void>;
-  getDb: (workspace: string) => unknown;
-  getActiveDb: () => unknown;
   getWorkspaces: () => { active: string; workspaces: Record<string, unknown> };
   setWorkspaces: (data: unknown) => void;
   shutdown: () => void;
-  closeAllDbs: () => void;
   gatewayClient: {
     connect: () => void;
     connected: boolean;
@@ -364,7 +361,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
 
   // 4. Import server.js and create app instance with plugin paths
   const dataDir = path.join(ctx.stateDir, 'clawchats', 'data');
-  const uploadsDir = path.join(ctx.stateDir, 'clawchats', 'uploads');
   // Dynamic import of server.js (plain JS, no type declarations)
   // @ts-expect-error — server/index.js is plain JS with no .d.ts
   const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server/index.js');
@@ -384,7 +380,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
 
   app = serverModule.createApp({
     dataDir,
-    uploadsDir,
     port:          parseInt(process.env.PORT || '3001', 10),
     gatewayUrl:    process.env.GATEWAY_WS_URL || 'ws://localhost:18789',
     authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
@@ -1039,9 +1034,7 @@ async function handleSetup(token: string, options: { skipTotp?: boolean } = {}):
 
         // Create data directories
         const dataDir = path.join(CONFIG_DIR, 'data');
-        const uploadsDir = path.join(CONFIG_DIR, 'uploads');
         fs.mkdirSync(dataDir, { recursive: true });
-        fs.mkdirSync(uploadsDir, { recursive: true });
 
         ws.close();
 
