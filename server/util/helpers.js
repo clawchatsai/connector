@@ -82,7 +82,7 @@ export function generateActivitySummary(steps) {
 export function writeActivityToDb(getDbFn, broadcastFn, runId, log) {
   if (!log._parsed) log._parsed = parseSessionKey(log.sessionKey);
   const parsed = log._parsed;
-  if (!parsed) return;
+  if (!parsed?.workspace) return; // gateway-native chat: no ClawChats DB row
   const db = getDbFn(parsed.workspace);
   if (!db) return;
   const cleanSteps = log.steps.map(s => { const c = { ...s }; delete c._sealed; return c; });
