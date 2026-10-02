@@ -20,7 +20,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "node --test server/",
+    "test": "node --test 'server/**/*.test.js'",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {

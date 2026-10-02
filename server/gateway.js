@@ -22,12 +22,13 @@ export class GatewayClient {
   }
 
   connect() {
+    if (this._closed) return;
     if (this.ws && (this.ws.readyState === WS.CONNECTING || this.ws.readyState === WS.OPEN)) return;
     console.log(`Connecting to gateway at ${this.gatewayWsUrl}...`);
     this.ws = new WS(this.gatewayWsUrl);
     this.ws.on('open', () => { console.log('Gateway WebSocket connected'); this.reconnectAttempts = 0; });
     this.ws.on('message', data => this.handleGatewayMessage(data.toString()));
-    this.ws.on('close', () => { console.log('Gateway WebSocket closed'); this.connected = false; this._failPendingRpcs('gateway disconnected'); this.lens?.reset(); this.broadcastGatewayStatus(false); this.scheduleReconnect(); });
+    this.ws.on('close', () => { console.log('Gateway WebSocket closed'); this.connected = false; this._failPendingRpcs('gateway disconnected'); this.lens?.reset(); this.broadcastGatewayStatus(false); if (!this._closed) this.scheduleReconnect(); });
     this.ws.on('error', err => console.error('Gateway WebSocket error:', err.message));
   }
 
@@ -117,7 +118,31 @@ export class GatewayClient {
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), this.maxReconnectDelay);
     this.reconnectAttempts++;
     console.log(`Reconnecting to gateway in ${delay}ms (attempt ${this.reconnectAttempts})...`);
-    setTimeout(() => this.connect(), delay);
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = setTimeout(() => { this._reconnectTimer = null; this.connect(); }, delay);
+  }
+
+  /**
+   * Permanent shutdown (plugin stop/reload): no reconnects, pending RPCs fail, socket closed.
+   * Without this the gateway's plugin drain waits forever on the open WebSocket.
+   */
+  close() {
+    this._closed = true;
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    this._failPendingRpcs('connector stopping');
+    this.connected = false;
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      ws.removeAllListeners('message');
+      ws.on('error', () => {});
+      try { ws.readyState === WS.CONNECTING ? ws.terminate() : ws.close(1001, 'connector stopping'); } catch { /* already closed */ }
+      // Don't let a half-closed socket hold the drain open.
+      setTimeout(() => { try { ws.terminate(); } catch { /* gone */ } }, 2000).unref?.();
+    }
+    this.browserClients.clear();
+    this._externalBroadcastTargets = [];
   }
 
   addBrowserClient(ws) {

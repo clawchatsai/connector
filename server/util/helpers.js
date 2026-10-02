@@ -1,5 +1,5 @@
 // Legacy ClawChats session keys: agent:<agent>:<workspace>:chat:<threadId>.
-// Used for upload paths and by the history exporter.
+// Used by the history exporter.
 export function parseSessionKey(sessionKey) {
   if (!sessionKey) return null;
   const match = sessionKey.match(/^agent:([^:]+):([^:]+):chat:([^:]+)$/);
