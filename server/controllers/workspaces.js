@@ -5,7 +5,7 @@ import { validateAgent } from '../config.js';
 import { cleanGatewaySession } from '../gateway-cleanup.js';
 
 export class WorkspaceController {
-  constructor({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir, broadcast, sync }) {
+  constructor({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir, broadcast, sync, extras }) {
     this.getDb = getDb;
     this.closeDb = closeDb;
     this.getWorkspaces = getWorkspaces;
@@ -13,6 +13,12 @@ export class WorkspaceController {
     this.dataDir = dataDir;
     this.broadcast = broadcast;
     this.sync = sync;
+    this.extras = extras;
+  }
+
+  // Mirror project styles into the extras store while workspaces.json still drives the UI.
+  _style(fn) {
+    try { if (this.extras) fn(this.extras); } catch (e) { console.warn(`[extras] project style: ${e.message}`); }
   }
 
   getAll(req, res) {
@@ -38,6 +44,7 @@ export class WorkspaceController {
     const finalLabel = await this.sync.push(() => this.sync.projectCreated(label || name));
     const order = Math.max(-1, ...Object.values(ws.workspaces).map(w => w.order ?? -1)) + 1;
     ws.workspaces[name] = { name, label: finalLabel, color: body.color || null, icon: body.icon || null, agent, createdAt: Date.now(), order };
+    this._style(x => x.setProjectStyle(finalLabel, { color: body.color || null, icon: body.icon || null }));
     this.setWorkspaces(ws);
     this.getDb(name);
     send(res, 201, { workspace: ws.workspaces[name] });
@@ -50,9 +57,11 @@ export class WorkspaceController {
     if (body.label !== undefined && body.label !== ws.workspaces[params.name].label) {
       const current = ws.workspaces[params.name].label;
       ws.workspaces[params.name].label = await this.sync.push(() => this.sync.projectRenamed(params.name, current, body.label));
+      this._style(x => x.renameProjectStyle(current, ws.workspaces[params.name].label));
     }
     if (body.color !== undefined) ws.workspaces[params.name].color = body.color;
     if (body.icon !== undefined) ws.workspaces[params.name].icon = body.icon;
+    if (body.color !== undefined || body.icon !== undefined) this._style(x => x.setProjectStyle(ws.workspaces[params.name].label, { color: body.color, icon: body.icon }));
     if (body.lastThread !== undefined) ws.workspaces[params.name].lastThread = body.lastThread;
     let migratedThreads = 0;
     if (body.agent !== undefined) {
@@ -89,6 +98,7 @@ export class WorkspaceController {
     const dbPath = path.join(this.dataDir, `${params.name}.db`);
     for (const suffix of ['', '-wal', '-shm']) { try { fs.unlinkSync(dbPath + suffix); } catch { /* ok */ } }
     delete ws.workspaces[params.name];
+    this._style(x => x.deleteProjectStyle(label));
     if (ws.active === params.name) ws.active = Object.keys(ws.workspaces)[0] || null;
     this.setWorkspaces(ws);
     send(res, 200, { ok: true });
