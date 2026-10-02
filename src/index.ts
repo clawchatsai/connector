@@ -67,8 +67,14 @@ interface AppInstance {
   dataDir: string;
 }
 
-/** Max DataChannel message size (~256KB, leave room for envelope) */
-const MAX_DC_MESSAGE_SIZE = 256 * 1024;
+/**
+ * Largest string sent as one DataChannel message. The SCTP limit (~256 KiB) is in bytes;
+ * string length is in UTF-16 units, so non-ASCII text and JSON escaping can push a
+ * "256K" string over it (libdatachannel then drops it: "Message size exceeds limit").
+ * 64K units stays under the limit even at 3 bytes per unit; matches the browser side.
+ */
+const MAX_DC_MESSAGE_SIZE = 64 * 1024;
+const DC_CHUNK_SIZE = MAX_DC_MESSAGE_SIZE - 512; // room for the chunk envelope
 
 /** Active DataChannel connections: connectionId → send function */
 const connectedClients = new Map<string, { send: (data: string) => void }>();
@@ -94,11 +100,6 @@ let signaling: SignalingClient | null = null;
 let webrtcPeer: WebRTCPeerManagerType | null = null;
 let healthServer: http.Server | null = null;
 let _stopRequested = false;
-
-/** Model IDs that have 'input' explicitly set without 'image' support. */
-let _imageRestrictedModels: string[] = [];
-/** True if session.reset config risks wiping ClawChats history (daily reset or short idle). */
-let _sessionResetWarning = false;
 
 // ---------------------------------------------------------------------------
 // Types for OpenClaw plugin API (minimal — these come from the plugin SDK)
@@ -320,42 +321,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     return;
   }
 
-  // Check session.reset config — warn if daily reset or short idle could wipe ClawChats history.
-  _sessionResetWarning = false;
-  try {
-    const sessionReset = (gwCfg?.['session'] as Record<string, unknown> | undefined)?.['reset'] as Record<string, unknown> | undefined;
-    if (sessionReset) {
-      const mode = sessionReset['mode'] as string | undefined;
-      const idleMinutes = sessionReset['idleMinutes'] as number | undefined;
-      if (mode === 'daily' || (mode === 'idle' && typeof idleMinutes === 'number' && idleMinutes < 43200)) {
-        _sessionResetWarning = true;
-        ctx.logger.warn(`[clawchats] session.reset may wipe chat history (mode=${mode}, idleMinutes=${idleMinutes ?? 'unset'}) — set mode=idle + idleMinutes=999999`);
-      }
-    }
-  } catch {
-    // Non-fatal
-  }
-
-  // Check for model definitions with 'input' set but missing 'image' — they silently drop attachments.
-  _imageRestrictedModels = [];
-  try {
-    const providers = (gwCfg?.['models'] as Record<string, unknown> | undefined)?.['providers'] as Record<string, { models?: Array<{ id?: string; input?: string[] }> }> | undefined ?? {};
-    for (const provider of Object.values(providers)) {
-      if (Array.isArray(provider.models)) {
-        for (const m of provider.models) {
-          if (Array.isArray(m.input) && !m.input.includes('image')) {
-            _imageRestrictedModels.push(m.id ?? '(unknown)');
-          }
-        }
-      }
-    }
-    if (_imageRestrictedModels.length > 0) {
-      ctx.logger.warn(`[clawchats] image-restricted models detected (missing "image" input): ${_imageRestrictedModels.join(', ')}`);
-    }
-  } catch {
-    // Non-fatal: config parse issue, just skip the check
-  }
-
   // 3. Ensure native modules are built (OpenClaw installs with --ignore-scripts)
   await ensureNativeModules(ctx);
 
@@ -399,11 +364,14 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   // 4. Connect createApp's gateway client (handles persistence + event relay)
   app.gatewayClient.connect();
 
-  // Wire DataChannel clients as broadcast targets so they receive gateway events
+  // Wire DataChannel clients as broadcast targets so they receive gateway events.
+  // Frames over the DataChannel limit (e.g. a complete chat.history snapshot) go as chunks.
   app.gatewayClient.addBroadcastTarget((data: string) => {
+    const frame = JSON.stringify({ type: 'gateway-event', payload: data });
     for (const [id, client] of connectedClients) {
       try {
-        client.send(JSON.stringify({ type: 'gateway-event', payload: data }));
+        if (frame.length <= MAX_DC_MESSAGE_SIZE) client.send(frame);
+        else sendGatewayEventChunked(client, data);
       } catch {
         connectedClients.delete(id);
       }
@@ -607,22 +575,6 @@ function setupDataChannelHandler(
           // Auth succeeded — add to broadcast clients and inform gateway
           connectedClients.set(connectionId, dc);
           ctx.logger.info(`Browser authenticated: ${connectionId}`);
-
-          // Warn if any models have image support disabled in openclaw.json
-          if (_imageRestrictedModels.length > 0) {
-            dc.send(JSON.stringify({
-              type: 'gateway-event',
-              payload: JSON.stringify({ type: 'clawchats', event: 'image-capability-warning', models: _imageRestrictedModels }),
-            }));
-          }
-
-          // Warn if session.reset config risks wiping ClawChats history
-          if (_sessionResetWarning) {
-            dc.send(JSON.stringify({
-              type: 'gateway-event',
-              payload: JSON.stringify({ type: 'clawchats', event: 'session-reset-warning' }),
-            }));
-          }
 
           // Persist backup code changes if any were consumed
           if (authConfig.backupCodeHashes && config!.backupCodeHashes) {
@@ -895,8 +847,7 @@ async function handleRpcMessage(
 
 function sendChunked(dc: DataChannelLike, id: string, status: number, body: string): void {
   const data = typeof body === 'string' ? body : JSON.stringify(body);
-  const chunkSize = 128 * 1024; // 128KB — safe margin for JSON envelope + escaping overhead
-  const totalChunks = Math.ceil(data.length / chunkSize);
+  const totalChunks = Math.ceil(data.length / DC_CHUNK_SIZE);
 
   for (let i = 0; i < totalChunks; i++) {
     dc.send(JSON.stringify({
@@ -905,7 +856,23 @@ function sendChunked(dc: DataChannelLike, id: string, status: number, body: stri
       status,
       index: i,
       total: totalChunks,
-      data: data.slice(i * chunkSize, (i + 1) * chunkSize),
+      data: data.slice(i * DC_CHUNK_SIZE, (i + 1) * DC_CHUNK_SIZE),
+    }));
+  }
+}
+
+/** A gateway frame too large for one DataChannel message; the browser transport reassembles it. */
+let gatewayChunkSeq = 0;
+function sendGatewayEventChunked(client: { send: (data: string) => void }, payload: string): void {
+  const id = `ge-${Date.now().toString(36)}-${(gatewayChunkSeq++).toString(36)}`;
+  const total = Math.ceil(payload.length / DC_CHUNK_SIZE);
+  for (let i = 0; i < total; i++) {
+    client.send(JSON.stringify({
+      type: 'gateway-event-chunk',
+      id,
+      index: i,
+      total,
+      data: payload.slice(i * DC_CHUNK_SIZE, (i + 1) * DC_CHUNK_SIZE),
     }));
   }
 }
