@@ -7,11 +7,11 @@ import { parseMultipart } from '../util/multipart.js';
 const HOME = os.homedir();
 const ALLOWED_FILE_DIRS = [HOME, '/tmp'];
 
-export function handleServeFile(req, res, query, memoryConfig) {
+export function handleServeFile(req, res, query, workspaceDir) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
   const resolved = (filePath.startsWith('./') || filePath.startsWith('../'))
-    ? path.resolve(memoryConfig.workspaceDir, filePath)
+    ? path.resolve(workspaceDir, filePath)
     : path.resolve(filePath);
   if (!ALLOWED_FILE_DIRS.some(dir => resolved.startsWith(dir + '/') || resolved === dir)) return sendError(res, 403, 'Access denied: path not in allowed directories');
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return sendError(res, 404, 'File not found');

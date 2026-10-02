@@ -329,20 +329,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   // Dynamic import of server.js (plain JS, no type declarations)
   // @ts-expect-error — server/index.js is plain JS with no .d.ts
   const serverModule: { createApp: (config: Record<string, unknown>) => AppInstance } = await import('../server/index.js');
-  // Read env vars here (plugin host) so server/ bundle stays process.env-free.
-  const memoryEnv = {
-    provider:   process.env.MEMORY_PROVIDER,
-    host:       process.env.MEMORY_HOST   || process.env.QDRANT_HOST,
-    port:       process.env.MEMORY_PORT   || process.env.QDRANT_PORT,
-    collection: process.env.MEMORY_COLLECTION || process.env.QDRANT_COLLECTION,
-    pgUrl:      process.env.MEMORY_PG_URL,
-    qdrantUrl:  process.env.QDRANT_URL,
-  };
-  // Filter out undefined values so discoverMemoryConfig only overrides what's set.
-  const memoryEnvFiltered = Object.fromEntries(
-    Object.entries(memoryEnv).filter(([, v]) => v !== undefined && v !== ''),
-  );
-
   app = serverModule.createApp({
     dataDir,
     port:          parseInt(process.env.PORT || '3001', 10),
@@ -358,7 +344,6 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
       } catch { /* ok */ }
       return process.env.OPENAI_API_KEY || null;
     })(),
-    memoryEnv:     memoryEnvFiltered,
   });
 
   // 4. Connect createApp's gateway client (handles persistence + event relay)

@@ -50,8 +50,7 @@ server/                   # Local backend server (Node.js, plain ESM)
   bootstrap/
     native.js             # node:sqlite initialisation (built into Node ≥22.5, no compilation)
     identity.js           # ed25519 device signing for OpenClaw ≥2.15
-  controllers/            # HTTP route handlers (threads, messages, workspaces, files, memory)
-  providers/              # Memory backends (Qdrant, Postgres)
+  controllers/            # HTTP route handlers (files, workspace, gateway media, transcribe, settings)
   util/                   # HTTP helpers, multipart parser, context builder, misc
 src/                      # OpenClaw plugin wrapper (TypeScript)
   index.ts                # Plugin entry point — registers with OpenClaw, manages lifecycle

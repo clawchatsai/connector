@@ -41,3 +41,14 @@ export function discoverGatewayWsUrl() {
   return 'ws://localhost:18789';
 }
 export const GATEWAY_WS_URL = discoverGatewayWsUrl();
+
+// Agent workspace dir (relative /api/file paths resolve against it): openclaw config → default.
+export function discoverWorkspaceDir() {
+  for (const cfgPath of [path.join(HOME, '.openclaw', 'openclaw.json'), '/etc/openclaw/openclaw.json']) {
+    try {
+      const ws = JSON.parse(fs.readFileSync(cfgPath, 'utf8')).agents?.defaults?.workspace;
+      if (ws) return ws;
+    } catch { /* try next */ }
+  }
+  return path.join(HOME, '.openclaw', 'workspace');
+}

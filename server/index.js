@@ -5,12 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 
 import { Database } from './bootstrap/native.js';
-import { GATEWAY_WS_URL, AUTH_TOKEN } from './config.js';
+import { GATEWAY_WS_URL, AUTH_TOKEN, discoverWorkspaceDir } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
-import { discoverMemoryConfig } from './providers/memory-config.js';
-import { createMemoryProvider } from './providers/memory.js';
-import { MemoryController } from './controllers/memory.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
@@ -63,10 +60,7 @@ export function createApp(config = {}) {
 
   const debugLogger = new DebugLogger(DATA_DIR);
 
-  const memoryConfig = discoverMemoryConfig(config.memoryEnv || {});
-  const memoryProvider = createMemoryProvider(memoryConfig);
-  memoryProvider.init().catch(err => console.error('[createApp] Memory provider init error:', err.message));
-  const MEMORY_FILES_DIR = path.join(memoryConfig.workspaceDir, 'memory');
+  const workspaceDir = discoverWorkspaceDir();
 
   // Instantiate the gateway client with all dependencies injected
   const gatewayClient = new GatewayClient({ dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken });
@@ -78,8 +72,6 @@ export function createApp(config = {}) {
   gatewayClient.lens = new SessionLens({ broadcast, request: (m, p, t) => gatewayClient.request(m, p, t), extras });
 
   // Instantiate controllers
-  const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
-
   const handleGatewayMedia = createGatewayMediaHandler({ gatewayWsUrl: gatewayUrl, gatewayToken });
 
   // Settings — file I/O lives in settings.js
@@ -157,21 +149,13 @@ export function createApp(config = {}) {
       }
 
       // File serving & workspace browser
-      if (method === 'GET' && urlPath === '/api/file') return handleServeFile(req, res, query, memoryConfig);
+      if (method === 'GET' && urlPath === '/api/file') return handleServeFile(req, res, query, workspaceDir);
       if (method === 'GET' && urlPath === '/api/gw-media') return handleGatewayMedia(req, res, query);
       if (method === 'GET' && urlPath === '/api/workspace') return handleWorkspaceList(req, res, query);
       if (method === 'GET' && urlPath === '/api/workspace/file') return handleWorkspaceFileRead(req, res, query);
       if (method === 'PUT' && urlPath === '/api/workspace/file') return await handleWorkspaceFileWrite(req, res, query);
       if (method === 'DELETE' && urlPath === '/api/workspace/file') return handleWorkspaceFileDelete(req, res, query);
       if (method === 'POST' && urlPath === '/api/workspace/upload') return await handleWorkspaceUpload(req, res, query);
-
-      // Memory
-      if (method === 'GET' && urlPath === '/api/memory/status') return await memory.status(req, res);
-      if (method === 'GET' && urlPath === '/api/memory/list') return await memory.list(req, res, query);
-      if (method === 'GET' && urlPath === '/api/memory/search') return await memory.search(req, res, query);
-      if (method === 'GET' && urlPath === '/api/memory/files') return memory.files(req, res, query);
-      if ((p = matchRoute(method, urlPath, 'PUT /api/memory/:id'))) return await memory.update(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'DELETE /api/memory/:id'))) return await memory.delete(req, res, p);
 
       // Prompt library
       if (method === 'GET' && urlPath === '/api/prompts') {
