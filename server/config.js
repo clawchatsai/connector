@@ -41,22 +41,3 @@ export function discoverGatewayWsUrl() {
   return 'ws://localhost:18789';
 }
 export const GATEWAY_WS_URL = discoverGatewayWsUrl();
-
-// Sessions directory — where OpenClaw stores session .jsonl files
-// Note: OPENCLAW_SESSIONS_DIR env var is read by the plugin host (src/index.ts) and passed via createApp().
-export const OPENCLAW_SESSIONS_DIR =
-  parseConfigField('sessionsDir') ||
-  path.join(HOME, '.openclaw', 'agents', 'main', 'sessions');
-
-export function getSessionsDirForAgent(agentId) {
-  if (!agentId || agentId === 'main') return OPENCLAW_SESSIONS_DIR;
-  return path.join(HOME, '.openclaw', 'agents', agentId, 'sessions');
-}
-
-export function validateAgent(agentId) {
-  if (!agentId) return 'main';
-  if (!/^[a-zA-Z0-9_-]+$/.test(agentId)) throw new Error('Invalid agent ID');
-  const agentDir = path.join(HOME, '.openclaw', 'agents', agentId);
-  if (!fs.existsSync(agentDir)) throw new Error(`Agent not found: ${agentId}`);
-  return agentId;
-}
