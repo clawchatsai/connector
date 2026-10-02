@@ -2,14 +2,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody, uuid } from '../util/http.js';
 import { syncThreadUnreadCount } from '../util/helpers.js';
-import { cleanGatewaySession } from '../gateway-cleanup.js';
 
 export class ThreadController {
-  constructor({ getActiveDb, getWorkspaces, uploadsDir, broadcast }) {
+  constructor({ getActiveDb, getWorkspaces, uploadsDir, broadcast, sync }) {
     this.getActiveDb = getActiveDb;
     this.getWorkspaces = getWorkspaces;
     this.uploadsDir = uploadsDir;
     this.broadcast = broadcast;
+    this.sync = sync;
   }
 
   getAll(req, res, params, query) {
@@ -77,7 +77,19 @@ export class ThreadController {
   async update(req, res, params) {
     const body = await parseBody(req);
     const db = this.getActiveDb();
-    if (!db.prepare('SELECT id FROM threads WHERE id = ?').get(params.id)) return sendError(res, 404, 'Thread not found');
+    const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
+    if (!thread) return sendError(res, 404, 'Thread not found');
+    // Gateway first for synced fields; a suffix may be added to make the title unique.
+    if (body.title !== undefined && body.title !== thread.title) {
+      const requested = body.title;
+      body.title = await this.sync.push(() => this.sync.pushTitle(thread.session_key, requested));
+      if (body.title !== requested) {
+        this.broadcast(JSON.stringify({ type: 'clawchats', event: 'thread-title-updated', threadId: params.id, workspace: this.getWorkspaces().active, title: body.title }));
+      }
+    }
+    if (body.pinned !== undefined && !!body.pinned !== !!thread.pinned) {
+      await this.sync.push(() => this.sync.pushPinned(thread.session_key, body.pinned));
+    }
     const fields = [], values = [];
     for (const [col, val] of [['title', body.title], ['model', body.model], ['last_session_id', body.last_session_id], ['unread_count', body.unread_count]]) {
       if (val !== undefined) { fields.push(`${col} = ?`); values.push(val); }
@@ -94,12 +106,12 @@ export class ThreadController {
     send(res, 200, { thread: db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id) });
   }
 
-  delete(req, res, params) {
+  async delete(req, res, params) {
     const db = this.getActiveDb();
     const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
     if (!thread) return sendError(res, 404, 'Thread not found');
+    await this.sync.push(() => this.sync.deleteSession(thread.session_key));
     db.prepare('DELETE FROM threads WHERE id = ?').run(params.id);
-    cleanGatewaySession(thread.session_key); // async, best effort
     try { fs.rmSync(path.join(this.uploadsDir, params.id), { recursive: true }); } catch { /* ok */ }
     send(res, 200, { ok: true });
   }

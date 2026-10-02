@@ -4,7 +4,6 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 export const HOME = os.homedir();
-export const MAX_PREAMBLE_CHARS = 50000;
 
 // Resolve __dirname for ESM (esbuild inlines this correctly)
 const __filename = fileURLToPath(import.meta.url);

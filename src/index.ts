@@ -16,7 +16,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
-import type { PluginConfig } from './gateway-bridge.js';
+import type { PluginConfig } from './plugin-config.js';
 import { SignalingClient } from './signaling-client.js';
 // Lazy-imported after ensureNativeModules() builds the native binary.
 // Top-level import would crash because node-datachannel .node file doesn't exist yet
@@ -1384,6 +1384,37 @@ async function handleReauth(): Promise<void> {
   }
 }
 
+async function handleExportHistory(api: PluginApi, mode?: string): Promise<void> {
+  if (mode !== undefined && mode !== 'check') {
+    console.error(`Unknown option "${mode}". Use: ocplatform clawchats export-history [check]`);
+    process.exitCode = 1;
+    return;
+  }
+  const gwCfg = (api as unknown as { config?: Record<string, unknown> }).config;
+  const gw = gwCfg?.['gateway'] as Record<string, unknown> | undefined;
+  const token = ((gw?.['auth'] as Record<string, unknown> | undefined)?.['token'] as string | undefined) || loadConfig()?.gatewayToken || '';
+  if (!token) {
+    console.error('No gateway token found. Is ClawChats set up? (ocplatform clawchats setup <token>)');
+    process.exitCode = 1;
+    return;
+  }
+  const port = (gw?.['port'] as number | undefined) || 18789;
+  // @ts-expect-error — server/ is plain JS with no .d.ts
+  const serverModule: { exportHistory: (o: Record<string, unknown>) => Promise<{ exported: number }> } = await import('../server/history-export.js');
+  try {
+    await serverModule.exportHistory({
+      dataDir: path.join(CONFIG_DIR, 'data'),
+      stateDir: path.dirname(CONFIG_DIR),
+      gatewayUrl: process.env.GATEWAY_WS_URL || `ws://127.0.0.1:${port}`,
+      token,
+      check: mode === 'check',
+    });
+  } catch (err) {
+    console.error(`export-history failed: ${(err as Error).message}`);
+    process.exitCode = 1;
+  }
+}
+
 async function handleStatus(): Promise<void> {
   // CLI runs in a separate process — module-level vars are null here.
   // Query the live service via the health endpoint instead.
@@ -1576,6 +1607,10 @@ const plugin: OpenClawPluginDefinition = {
       cmd.command('reset')
         .description('Disconnect and remove all ClawChats data')
         .action(() => handleReset());
+
+      cmd.command('export-history [check]')
+        .description('Export ClawChats chats the gateway has no history for, for the gateway importer ("check" = report only)')
+        .action((mode: unknown) => handleExportHistory(api, mode === undefined ? undefined : String(mode)));
 
       cmd.command('import <path>')
         .description('Import databases and config from a folder (e.g. migrate from old data directory)')
