@@ -85,13 +85,18 @@ export class GatewayClient {
     }, 5 * 60 * 1000);
   }
 
+  /** parseSessionKey, but following threads that sync moved to another project. */
+  _locate(sessionKey) {
+    return this.sync ? this.sync.locate(sessionKey) : parseSessionKey(sessionKey);
+  }
+
   connect() {
     if (this.ws && (this.ws.readyState === WS.CONNECTING || this.ws.readyState === WS.OPEN)) return;
     console.log(`Connecting to gateway at ${this.gatewayWsUrl}...`);
     this.ws = new WS(this.gatewayWsUrl);
     this.ws.on('open', () => { console.log('Gateway WebSocket connected'); this.reconnectAttempts = 0; });
     this.ws.on('message', data => this.handleGatewayMessage(data.toString()));
-    this.ws.on('close', () => { console.log('Gateway WebSocket closed'); this.connected = false; this.broadcastGatewayStatus(false); this.scheduleReconnect(); });
+    this.ws.on('close', () => { console.log('Gateway WebSocket closed'); this.connected = false; this._failPendingRpcs('gateway disconnected'); this.broadcastGatewayStatus(false); this.scheduleReconnect(); });
     this.ws.on('error', err => console.error('Gateway WebSocket error:', err.message));
   }
 
@@ -116,7 +121,13 @@ export class GatewayClient {
       this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: { minProtocol: 3, maxProtocol: 4, client: { id: 'gateway-client', version: '0.1.0', platform: 'node', mode: 'backend' }, role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin'], device, auth: { token: this.authToken }, caps: ['tool-events'] } }));
       return;
     }
-    if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); }
+    if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); this.sync?.onConnected(); }
+    // Session-list events exist for the connector's own subscription (gateway sync);
+    // the ClawChats frontend never subscribes, so don't spend tunnel bandwidth on them.
+    if (msg.type === 'event' && (msg.event === 'sessions.changed' || msg.event === 'session.message')) {
+      if (msg.event === 'sessions.changed') this.sync?.onSessionsChanged(msg.payload);
+      return;
+    }
     if (msg.type === 'event' && msg.event === 'chat' && msg.payload) {
       this.handleChatEvent(msg.payload, data);
     } else {
@@ -150,7 +161,7 @@ export class GatewayClient {
 
     // --- Delta path ---
     if (state === 'delta') {
-      const parsed = parseSessionKey(sessionKey);
+      const parsed = this._locate(sessionKey);
       if (parsed) {
         const existing = this.streamState.get(sessionKey) || { buffer: '', threadId: parsed.threadId, state: 'streaming', held: [] };
         const prevLen = existing.buffer.length; // capture before update — used to advance thoughtStartOffset on first post-tool delta
@@ -194,14 +205,19 @@ export class GatewayClient {
 
     // Title sessions are handled server-side — intercept and skip browser delivery
     if (sessionKey?.includes('__clawchats_title_')) {
-      if (state === 'final') { const content = extractContent(message); if (content && this.handleTitleResponse(sessionKey, content)) return; }
+      if (state === 'final') {
+        const content = extractContent(message);
+        const handled = content && this.handleTitleResponse(sessionKey, content);
+        if (this.sync) this.sync.run(() => this.sync.deleteSession(sessionKey)).catch(e => console.warn(`[clawchats] title session cleanup: ${e.message}`));
+        if (handled) return;
+      }
       else if (state === 'error' || state === 'aborted') { for (const key of this._pendingTitleGens.keys()) { if (sessionKey === key || sessionKey.includes(key)) { this._pendingTitleGens.delete(key); break; } } return; }
       return;
     }
 
     if (state === 'final') {
       const rawContent = extractContent(message);
-      const parsed = parseSessionKey(sessionKey);
+      const parsed = this._locate(sessionKey);
       if (isSilentReplyExact(rawContent, 'NO_REPLY') || isSilentReplyExact(rawContent, 'HEARTBEAT_OK')) {
         this._cleanupSilentPending(sessionKey);
         if (parsed) this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'streaming-end', threadId: parsed.threadId, workspace: parsed.workspace, reason: 'silent' }));
@@ -218,7 +234,7 @@ export class GatewayClient {
       return;
     }
     if (state === 'aborted') {
-      const parsed = parseSessionKey(sessionKey);
+      const parsed = this._locate(sessionKey);
       // Clear pending flag from DB so a stale pending:true doesn't survive page reloads
       // and trigger phantom "thinking..." state on next visit to this thread.
       if (parsed) {
@@ -238,7 +254,7 @@ export class GatewayClient {
         console.log(`[clawchats] ignoring late error for run ${runId} — reply already delivered`);
         return;
       }
-      const parsed = parseSessionKey(sessionKey);
+      const parsed = this._locate(sessionKey);
       this.saveErrorMarker(sessionKey, message);
       this.broadcastToBrowsers(rawData); // dual-emit
       if (parsed) {
@@ -259,6 +275,10 @@ export class GatewayClient {
     });
   }
 
+  _failPendingRpcs(reason) {
+    for (const [id, p] of this._rpc) { clearTimeout(p.timer); p.reject(new Error(reason)); this._rpc.delete(id); }
+  }
+
   // Utility sessions keep no streamState entry; accumulate their delta text separately.
   _accumulateChatText(sessionKey, params) {
     const text = nextChatText(this._utilityText.get(sessionKey) || '', params);
@@ -276,7 +296,7 @@ export class GatewayClient {
   }
 
   _cleanupSilentPending(sessionKey) {
-    const parsed = parseSessionKey(sessionKey);
+    const parsed = this._locate(sessionKey);
     if (!parsed) return;
     const ws = this.getWorkspaces();
     if (!ws.workspaces[parsed.workspace]) return;
@@ -291,7 +311,7 @@ export class GatewayClient {
   // early-out. handleChatEvent uses the result to decide whether the run counts as
   // having delivered a visible reply.
   saveAssistantMessage(sessionKey, message, seq, thoughtStartOffset = 0) {
-    const parsed = parseSessionKey(sessionKey);
+    const parsed = this._locate(sessionKey);
     if (!parsed) return false;
     const ws = this.getWorkspaces();
     if (!ws.workspaces[parsed.workspace]) { console.log(`Ignoring response for deleted workspace: ${parsed.workspace}`); return false; }
@@ -363,7 +383,7 @@ export class GatewayClient {
   }
 
   saveErrorMarker(sessionKey, message) {
-    const parsed = parseSessionKey(sessionKey);
+    const parsed = this._locate(sessionKey);
     if (!parsed) return;
     const ws = this.getWorkspaces();
     if (!ws.workspaces[parsed.workspace]) return;
@@ -387,6 +407,7 @@ export class GatewayClient {
       const heuristic = firstUserMsg.content.replace(/\n.*/s, '').slice(0, 40).trim() + (firstUserMsg.content.length > 40 ? '...' : '');
       db.prepare('UPDATE threads SET title = ? WHERE id = ?').run(heuristic, threadId);
       this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'thread-title-updated', threadId, workspace, title: heuristic }));
+      this._syncTitle(db, workspace, threadId, heuristic);
     }
     const messages = db.prepare('SELECT role, content FROM messages WHERE thread_id = ? ORDER BY created_at ASC LIMIT 6').all(threadId);
     if (messages.length < 2) return;
@@ -411,7 +432,16 @@ export class GatewayClient {
     db.prepare('UPDATE threads SET title = ? WHERE id = ?').run(title, pending.threadId);
     this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'thread-title-updated', threadId: pending.threadId, workspace: pending.workspace, title }));
     console.log(`AI title generated for ${pending.threadId}: "${title}"`);
+    this._syncTitle(db, pending.workspace, pending.threadId, title);
     return true;
+  }
+
+  // Copy a generated title to the gateway session's custom name; the throwaway
+  // title-generation session is deleted once its answer is in.
+  _syncTitle(db, workspace, threadId, title) {
+    if (!this.sync) return;
+    const row = db.prepare('SELECT session_key FROM threads WHERE id = ?').get(threadId);
+    if (row?.session_key) this.sync.titleGenerated(workspace, threadId, row.session_key, title);
   }
 
   handleAgentEvent(payload) {
@@ -419,6 +449,7 @@ export class GatewayClient {
     if (!runId) return;
     if (!this.activityLogs.has(runId)) this.activityLogs.set(runId, { sessionKey, steps: [], startTime: Date.now() });
     const log = this.activityLogs.get(runId);
+    if (!log._parsed && sessionKey) log._parsed = this._locate(sessionKey);
 
     if (stream === 'thinking') {
       let step = log.steps.find(s => s.type === 'thinking');
@@ -533,7 +564,7 @@ export class GatewayClient {
       // "never produced a reply" from "already delivered one".
       if (data?.phase === 'error' && !this.streamState.has(sessionKey) && !this._syntheticErrorRuns.has(runId) && !this._runsWithDeliveredReply.has(runId)) {
         this._syntheticErrorRuns.add(runId);
-        const parsed = parseSessionKey(sessionKey);
+        const parsed = this._locate(sessionKey);
         if (parsed) {
           // Mirror the state:'error' path — writeActivityToDb just set metadata.pending=true,
           // and without this the flag survives: loadHistory re-derives has_pending on reconnect,
@@ -604,7 +635,7 @@ export class GatewayClient {
       const streams = [];
       for (const [sessionKey, state] of this.streamState.entries()) {
         if (state.state === 'streaming' && !(state.held?.length > 0)) {
-          const parsed = parseSessionKey(sessionKey);
+          const parsed = this._locate(sessionKey);
           // Include both old shape (sessionKey/buffer) and new shape (workspace/content) for dual-emit compat
           streams.push({ sessionKey, threadId: state.threadId, buffer: state.buffer, ...(parsed ? { workspace: parsed.workspace, content: state.buffer.substring(state.thoughtStartOffset || 0) } : {}) });
         }

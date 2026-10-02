@@ -9,6 +9,7 @@ import { Database, requestDbStore } from './bootstrap/native.js';
 import { GATEWAY_WS_URL, AUTH_TOKEN, getSessionsDirForAgent } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
+import { GatewaySync } from './gateway-sync.js';
 import { discoverMemoryConfig } from './providers/memory-config.js';
 import { createMemoryProvider } from './providers/memory.js';
 import { WorkspaceController } from './controllers/workspaces.js';
@@ -63,7 +64,7 @@ export function createApp(config = {}) {
   }
   function getActiveDb() { return requestDbStore.getStore() || getDb(getWorkspaces().active); }
   function closeDb(name) { const db = dbCache.get(name); if (db) { db.close(); dbCache.delete(name); } }
-  function closeAll() { for (const db of dbCache.values()) db.close(); dbCache.clear(); globalDbCache.close?.(); }
+  function closeAll() { gatewayClient?.sync?.stop(); for (const db of dbCache.values()) db.close(); dbCache.clear(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -93,10 +94,12 @@ export function createApp(config = {}) {
   const gatewayClient = new GatewayClient({ getDb, getWorkspaces, dataDir: DATA_DIR, debugLogger, gatewayWsUrl: gatewayUrl, authToken: gatewayToken });
   const broadcast = msg => gatewayClient.broadcastToBrowsers(msg);
   setGatewayClient(gatewayClient);
+  const gatewaySync = new GatewaySync({ gateway: gatewayClient, getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, uploadsDir: UPLOADS_DIR, broadcast });
+  gatewayClient.sync = gatewaySync;
 
   // Instantiate controllers
-  const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast });
-  const threads    = new ThreadController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, broadcast });
+  const workspaces = new WorkspaceController({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir: DATA_DIR, broadcast, sync: gatewaySync });
+  const threads    = new ThreadController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, broadcast, sync: gatewaySync });
   const messages   = new MessageController({ getActiveDb, getWorkspaces, broadcast });
   const files      = new FileController({ getActiveDb, getWorkspaces, uploadsDir: UPLOADS_DIR, intelligenceDir: INTELLIGENCE_DIR });
   const memory     = new MemoryController({ memoryProvider, memoryFilesDir: MEMORY_FILES_DIR, memoryConfig });
@@ -222,7 +225,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/workspaces') return workspaces.getAll(req, res);
       if (method === 'POST' && urlPath === '/api/workspaces') return await workspaces.create(req, res);
       if ((p = matchRoute(method, urlPath, 'PATCH /api/workspaces/:name'))) return await workspaces.update(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'DELETE /api/workspaces/:name'))) return workspaces.delete(req, res, p);
+      if ((p = matchRoute(method, urlPath, 'DELETE /api/workspaces/:name'))) return await workspaces.delete(req, res, p);
       if (method === 'POST' && urlPath === '/api/workspaces/reorder') return await workspaces.reorder(req, res);
       if ((p = matchRoute(method, urlPath, 'POST /api/workspaces/:name/activate'))) return workspaces.activate(req, res, p);
 
@@ -234,7 +237,6 @@ export function createApp(config = {}) {
       if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id/messages'))) return messages.getAll(req, res, p, query);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/messages'))) return await messages.create(req, res, p);
       if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id/messages/:messageId'))) return messages.delete(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/context-fill'))) return messages.contextFill(req, res, p);
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/generate-title'))) {
         const db = getActiveDb();
         const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(p.id);
@@ -247,7 +249,7 @@ export function createApp(config = {}) {
       if ((p = matchRoute(method, urlPath, 'POST /api/threads/:id/intelligence'))) return await files.saveIntelligence(req, res, p);
       if ((p = matchRoute(method, urlPath, 'GET /api/threads/:id'))) return threads.get(req, res, p);
       if ((p = matchRoute(method, urlPath, 'PATCH /api/threads/:id'))) return await threads.update(req, res, p);
-      if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id'))) return threads.delete(req, res, p);
+      if ((p = matchRoute(method, urlPath, 'DELETE /api/threads/:id'))) return await threads.delete(req, res, p);
 
       // Search / export / import
       if (method === 'GET' && urlPath === '/api/search') return messages.search(req, res, {}, query);
@@ -270,7 +272,8 @@ export function createApp(config = {}) {
       sendError(res, 404, `Not found: ${method} ${urlPath}`);
     } catch (err) {
       console.error(`Error handling ${method} ${urlPath}:`, err);
-      if (err.message?.includes('UNIQUE constraint')) sendError(res, 409, 'Conflict: ' + err.message);
+      if (err.gatewayError) sendError(res, 502, `Gateway: ${err.message}`);
+      else if (err.message?.includes('UNIQUE constraint')) sendError(res, 409, 'Conflict: ' + err.message);
       else sendError(res, 500, err.message || 'Internal server error');
     }
   }
@@ -343,6 +346,7 @@ export function createApp(config = {}) {
     shutdown: closeAll,
     closeAllDbs: closeAll,
     gatewayClient,
+    gatewaySync,
     setupBrowserWs,
     debugLogger,
     dataDir: DATA_DIR,
@@ -368,6 +372,9 @@ function migrate(db) {
   try { db.exec('ALTER TABLE threads ADD COLUMN sort_order INTEGER DEFAULT 0'); } catch { /* exists */ }
   try { db.exec('ALTER TABLE threads ADD COLUMN unread_count INTEGER DEFAULT 0'); } catch { /* exists */ }
   try { db.prepare('ALTER TABLE threads ADD COLUMN metadata TEXT DEFAULT NULL').run(); } catch {}
+  // When the connector first saw this thread's gateway session (gateway sync). NULL = never
+  // synced: the thread's state is pushed to the gateway, never pulled or deleted from it.
+  try { db.exec('ALTER TABLE threads ADD COLUMN gateway_seen_at INTEGER DEFAULT NULL'); } catch { /* exists */ }
   db.exec(`CREATE TABLE IF NOT EXISTS unread_messages (thread_id TEXT NOT NULL, message_id TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (thread_id, message_id), FOREIGN KEY (thread_id) REFERENCES threads(id) ON DELETE CASCADE)`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_unread_thread ON unread_messages(thread_id)');
   ensureFts(db);

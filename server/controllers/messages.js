@@ -1,5 +1,4 @@
 import { send, sendError, parseBody } from '../util/http.js';
-import { buildContextPreamble } from '../util/context.js';
 
 export class MessageController {
   constructor({ getActiveDb, getWorkspaces, broadcast }) {
@@ -58,13 +57,6 @@ export class MessageController {
     if (!db.prepare('SELECT id FROM messages WHERE id = ? AND thread_id = ?').get(params.messageId, params.id)) return sendError(res, 404, 'Message not found');
     db.prepare('DELETE FROM messages WHERE id = ?').run(params.messageId);
     send(res, 200, { ok: true });
-  }
-
-  contextFill(req, res, params) {
-    const db = this.getActiveDb();
-    const thread = db.prepare('SELECT * FROM threads WHERE id = ?').get(params.id);
-    if (!thread) return sendError(res, 404, 'Thread not found');
-    send(res, 200, buildContextPreamble(db, params.id, thread.last_session_id, thread.session_key));
   }
 
   search(req, res, params, query) {

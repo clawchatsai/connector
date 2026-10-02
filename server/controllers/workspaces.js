@@ -2,16 +2,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { send, sendError, parseBody } from '../util/http.js';
 import { validateAgent } from '../config.js';
-import { cleanGatewaySession, cleanGatewaySessions } from '../gateway-cleanup.js';
+import { cleanGatewaySession } from '../gateway-cleanup.js';
 
 export class WorkspaceController {
-  constructor({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir, broadcast }) {
+  constructor({ getDb, closeDb, getWorkspaces, setWorkspaces, dataDir, broadcast, sync }) {
     this.getDb = getDb;
     this.closeDb = closeDb;
     this.getWorkspaces = getWorkspaces;
     this.setWorkspaces = setWorkspaces;
     this.dataDir = dataDir;
     this.broadcast = broadcast;
+    this.sync = sync;
   }
 
   getAll(req, res) {
@@ -33,7 +34,10 @@ export class WorkspaceController {
     if (ws.workspaces[name]) return sendError(res, 409, 'Workspace already exists');
     let agent = 'main';
     try { agent = validateAgent(body.agent || 'main'); } catch { agent = 'main'; }
-    ws.workspaces[name] = { name, label: label || name, color: body.color || null, icon: body.icon || null, agent, createdAt: Date.now() };
+    // Gateway first: the project's group must exist there before it exists here.
+    const finalLabel = await this.sync.push(() => this.sync.projectCreated(label || name));
+    const order = Math.max(-1, ...Object.values(ws.workspaces).map(w => w.order ?? -1)) + 1;
+    ws.workspaces[name] = { name, label: finalLabel, color: body.color || null, icon: body.icon || null, agent, createdAt: Date.now(), order };
     this.setWorkspaces(ws);
     this.getDb(name);
     send(res, 201, { workspace: ws.workspaces[name] });
@@ -43,7 +47,10 @@ export class WorkspaceController {
     const body = await parseBody(req);
     const ws = this.getWorkspaces();
     if (!ws.workspaces[params.name]) return sendError(res, 404, 'Workspace not found');
-    if (body.label !== undefined) ws.workspaces[params.name].label = body.label;
+    if (body.label !== undefined && body.label !== ws.workspaces[params.name].label) {
+      const current = ws.workspaces[params.name].label;
+      ws.workspaces[params.name].label = await this.sync.push(() => this.sync.projectRenamed(params.name, current, body.label));
+    }
     if (body.color !== undefined) ws.workspaces[params.name].color = body.color;
     if (body.icon !== undefined) ws.workspaces[params.name].icon = body.icon;
     if (body.lastThread !== undefined) ws.workspaces[params.name].lastThread = body.lastThread;
@@ -66,17 +73,21 @@ export class WorkspaceController {
     send(res, 200, { workspace: ws.workspaces[params.name], migratedThreads });
   }
 
-  delete(req, res, params) {
+  async delete(req, res, params) {
     const ws = this.getWorkspaces();
     if (!ws.workspaces[params.name]) return sendError(res, 404, 'Workspace not found');
     if (Object.keys(ws.workspaces).length <= 1) return sendError(res, 400, 'Cannot delete the only workspace');
-    // Collect the workspace's gateway session keys before its DB is removed.
     let sessionKeys = [];
     try { sessionKeys = this.getDb(params.name).prepare('SELECT session_key FROM threads WHERE session_key IS NOT NULL').all().map(r => r.session_key); } catch { /* ok */ }
+    // Gateway first: its sessions, then the (now empty) group.
+    const label = ws.workspaces[params.name].label;
+    await this.sync.push(async () => {
+      for (const key of sessionKeys) await this.sync.deleteSession(key);
+      await this.sync.projectDeleted(label);
+    });
     this.closeDb(params.name);
     const dbPath = path.join(this.dataDir, `${params.name}.db`);
     for (const suffix of ['', '-wal', '-shm']) { try { fs.unlinkSync(dbPath + suffix); } catch { /* ok */ } }
-    cleanGatewaySessions(sessionKeys).then(n => { if (n > 0) console.log(`Cleaned ${n} gateway sessions for workspace: ${params.name}`); });
     delete ws.workspaces[params.name];
     if (ws.active === params.name) ws.active = Object.keys(ws.workspaces)[0] || null;
     this.setWorkspaces(ws);
@@ -87,6 +98,8 @@ export class WorkspaceController {
     const body = await parseBody(req);
     if (!Array.isArray(body.order)) return sendError(res, 400, 'order must be an array of workspace names');
     const ws = this.getWorkspaces();
+    const labels = body.order.filter(name => ws.workspaces[name]).map(name => ws.workspaces[name].label);
+    await this.sync.push(() => this.sync.projectsReordered(labels));
     body.order.forEach((name, i) => { if (ws.workspaces[name]) ws.workspaces[name].order = i; });
     this.setWorkspaces(ws);
     send(res, 200, { ok: true, workspaces: Object.values(ws.workspaces) });
