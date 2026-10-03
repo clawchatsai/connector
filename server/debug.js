@@ -1,6 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+/** Frames that may carry a user-entered secret (question.resolve answers, incl. secret-store values) are logged with the values masked. */
+export function redactFrame(data) {
+  if (typeof data !== 'string' || !data.includes('question.resolve')) return data;
+  try {
+    const msg = JSON.parse(data);
+    if (msg?.type === 'req' && msg.method === 'question.resolve' && msg.params?.answers?.answers) {
+      const masked = Object.fromEntries(Object.entries(msg.params.answers.answers).map(([k, v]) => [k, Array.isArray(v) ? v.map(() => '[redacted]') : '[redacted]']));
+      return JSON.stringify({ ...msg, params: { ...msg.params, answers: { answers: masked } } });
+    }
+  } catch { /* not JSON: log nothing sensitive-looking */ return '[unparseable question.resolve frame omitted]'; }
+  return data;
+}
+
 export class DebugLogger {
   constructor(baseDir) {
     this.baseDir = path.join(baseDir, '..', 'debug');
@@ -22,7 +35,7 @@ export class DebugLogger {
   }
 
   logFrame(direction, data) {
-    if (this.active && this.wsStream) this.wsStream.write(`${new Date().toISOString()} ${direction} ${data}\n`);
+    if (this.active && this.wsStream) this.wsStream.write(`${new Date().toISOString()} ${direction} ${redactFrame(data)}\n`);
   }
 
   saveDump(payload) {
