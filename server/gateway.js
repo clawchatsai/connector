@@ -1,12 +1,16 @@
 import path from 'node:path';
 import { WebSocket as WS } from 'ws';
 import { loadOrCreateDeviceIdentity, buildDeviceAuth } from './bootstrap/identity.js';
+import { ApprovalClient } from './approval-client.js';
 
 // Per-session run/transcript events; hidden sessions' ones are dropped by the lens.
 const RUN_EVENTS = new Set(['chat', 'agent', 'session.tool', 'session.operation', 'session.observer']);
+const SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.questions'];
+// After the last browser leaves, the approval-client connection stays this long (P2P reconnects, reloads).
+const APPROVAL_CLIENT_GRACE_MS = 10_000;
 
 export class GatewayClient {
-  constructor({ dataDir, debugLogger, gatewayWsUrl, authToken }) {
+  constructor({ dataDir, debugLogger, gatewayWsUrl, authToken, approvalClientGraceMs = APPROVAL_CLIENT_GRACE_MS }) {
     this.dataDir = dataDir;
     this.debugLogger = debugLogger;
     this.gatewayWsUrl = gatewayWsUrl;
@@ -19,6 +23,40 @@ export class GatewayClient {
     this._externalBroadcastTargets = [];
     this._rpc = new Map(); // request id → { resolve, reject, timer } for connector-originated RPCs
     this._rpcSeq = 0;
+    // Approval events only while a browser is attached (server/approval-client.js).
+    this._externalBrowserCount = () => 0;
+    this._approvalGraceMs = approvalClientGraceMs;
+    this._approvalStopTimer = null;
+    this.approvalClient = new ApprovalClient({
+      gatewayWsUrl,
+      debugLogger,
+      connectParams: nonce => this._connectParams(nonce, ['approvals']),
+      onEvent: data => this.broadcastToBrowsers(data),
+    });
+  }
+
+  /** Gateway connect params; `caps` differ between the main and the approval-client connection. */
+  _connectParams(nonce, caps) {
+    const identity = loadOrCreateDeviceIdentity(path.join(this.dataDir, 'device-identity.json'));
+    const device = buildDeviceAuth(identity, { clientId: 'gateway-client', clientMode: 'backend', role: 'operator', scopes: SCOPES, token: this.authToken, nonce });
+    return { minProtocol: 3, maxProtocol: 4, client: { id: 'gateway-client', version: '0.1.0', platform: 'node', mode: 'backend' }, role: 'operator', scopes: SCOPES, device, auth: { token: this.authToken }, caps };
+  }
+
+  /** Browsers attached over the DataChannel (src/index.ts); local WebSocket browsers are counted here. */
+  setExternalBrowserCount(fn) { this._externalBrowserCount = fn; this.browsersChanged(); }
+
+  /** A browser attached or left: hold the approval-client connection while any is attached. */
+  browsersChanged() {
+    if (this._closed) return;
+    const count = this.browserClients.size + this._externalBrowserCount();
+    if (count > 0) {
+      clearTimeout(this._approvalStopTimer);
+      this._approvalStopTimer = null;
+      this.approvalClient.start();
+    } else if (this.approvalClient.running && !this._approvalStopTimer) {
+      this._approvalStopTimer = setTimeout(() => { this._approvalStopTimer = null; this.approvalClient.stop(); }, this._approvalGraceMs);
+      this._approvalStopTimer.unref?.();
+    }
   }
 
   connect() {
@@ -54,9 +92,7 @@ export class GatewayClient {
     }
 
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
-      const identity = loadOrCreateDeviceIdentity(path.join(this.dataDir, 'device-identity.json'));
-      const device = buildDeviceAuth(identity, { clientId: 'gateway-client', clientMode: 'backend', role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.questions'], token: this.authToken, nonce: msg.payload?.nonce || '' });
-      this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: { minProtocol: 3, maxProtocol: 4, client: { id: 'gateway-client', version: '0.1.0', platform: 'node', mode: 'backend' }, role: 'operator', scopes: ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.questions'], device, auth: { token: this.authToken }, caps: ['tool-events'] } }));
+      this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: this._connectParams(msg.payload?.nonce || '', ['tool-events']) }));
       return;
     }
     if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); this.sync?.onConnected(); this.request('sessions.subscribe', {}).catch(e => console.warn(`[lens] sessions.subscribe failed: ${e.message}`)); this.lens?.seed().catch(e => console.warn(`[lens] seed failed: ${e.message}`)); }
@@ -132,6 +168,9 @@ export class GatewayClient {
     this._reconnectTimer = null;
     this._failPendingRpcs('connector stopping');
     this.connected = false;
+    clearTimeout(this._approvalStopTimer);
+    this._approvalStopTimer = null;
+    this.approvalClient.stop();
     const ws = this.ws;
     this.ws = null;
     if (ws) {
@@ -147,12 +186,13 @@ export class GatewayClient {
 
   addBrowserClient(ws) {
     this.browserClients.set(ws, {});
+    this.browsersChanged();
     if (ws.readyState === WS.OPEN) {
       ws.send(JSON.stringify({ type: 'clawchats', event: 'gateway-status', connected: this.connected }));
     }
   }
 
-  removeBrowserClient(ws) { this.browserClients.delete(ws); }
+  removeBrowserClient(ws) { this.browserClients.delete(ws); this.browsersChanged(); }
 
 
   addBroadcastTarget(fn) { this._externalBroadcastTargets.push(fn); }

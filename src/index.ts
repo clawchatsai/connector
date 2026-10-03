@@ -57,6 +57,8 @@ interface AppInstance {
     forwardFromBrowser: (data: string) => void;
     addBroadcastTarget: (fn: (data: string) => void) => void;
     removeBroadcastTarget: (fn: (data: string) => void) => void;
+    browsersChanged: () => void;
+    setExternalBrowserCount: (fn: () => number) => void;
   };
   setupBrowserWs: (wss: unknown) => void;
   debugLogger: {
@@ -77,7 +79,27 @@ const MAX_DC_MESSAGE_SIZE = 64 * 1024;
 const DC_CHUNK_SIZE = MAX_DC_MESSAGE_SIZE - 512; // room for the chunk envelope
 
 /** Active DataChannel connections: connectionId → send function */
-const connectedClients = new Map<string, { send: (data: string) => void }>();
+// Authenticated DataChannel browsers. Adding or removing one tells the gateway client, which holds the
+// approval-client gateway connection only while a browser is attached (server/approval-client.js).
+class BrowserClientMap<V> extends Map<string, V> {
+  override set(key: string, value: V): this {
+    const added = !this.has(key);
+    super.set(key, value);
+    if (added) app?.gatewayClient.browsersChanged();
+    return this;
+  }
+  override delete(key: string): boolean {
+    const removed = super.delete(key);
+    if (removed) app?.gatewayClient.browsersChanged();
+    return removed;
+  }
+  override clear(): void {
+    const had = this.size > 0;
+    super.clear();
+    if (had) app?.gatewayClient.browsersChanged();
+  }
+}
+const connectedClients = new BrowserClientMap<{ send: (data: string) => void }>();
 
 /** Reassembly buffers for chunked RPC requests from browser (large uploads). */
 const rpcReqChunkBuffers = new Map<string, {
@@ -348,6 +370,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
 
   // 4. Connect createApp's gateway client (handles persistence + event relay)
   app.gatewayClient.connect();
+  app.gatewayClient.setExternalBrowserCount(() => connectedClients.size);
 
   // Wire DataChannel clients as broadcast targets so they receive gateway events.
   // Frames over the DataChannel limit (e.g. a complete chat.history snapshot) go as chunks.
