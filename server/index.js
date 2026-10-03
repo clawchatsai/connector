@@ -49,7 +49,6 @@ export function createApp(config = {}) {
       _globalDb = new Database(path.join(DATA_DIR, 'global.db'));
       _globalDb.exec('PRAGMA journal_mode = WAL');
       _globalDb.exec(`CREATE TABLE IF NOT EXISTS custom_emojis (name TEXT NOT NULL, pack TEXT NOT NULL DEFAULT 'slackmojis', url TEXT NOT NULL, mime_type TEXT, created_at INTEGER DEFAULT (strftime('%s','now')), PRIMARY KEY (name, pack))`);
-      _globalDb.exec(`CREATE TABLE IF NOT EXISTS prompts (id TEXT PRIMARY KEY, title TEXT NOT NULL, content TEXT NOT NULL, category TEXT DEFAULT '', variables TEXT DEFAULT '[]', created_at INTEGER, updated_at INTEGER)`);
       return _globalDb;
     },
     close() { if (_globalDb) { _globalDb.close(); _globalDb = null; } }
@@ -156,23 +155,6 @@ export function createApp(config = {}) {
       if (method === 'PUT' && urlPath === '/api/workspace/file') return await handleWorkspaceFileWrite(req, res, query);
       if (method === 'DELETE' && urlPath === '/api/workspace/file') return handleWorkspaceFileDelete(req, res, query);
       if (method === 'POST' && urlPath === '/api/workspace/upload') return await handleWorkspaceUpload(req, res, query);
-
-      // Prompt library
-      if (method === 'GET' && urlPath === '/api/prompts') {
-        const rows = globalDbCache.get().prepare('SELECT * FROM prompts ORDER BY created_at ASC').all();
-        return send(res, 200, rows.map(r => ({ id: r.id, title: r.title, content: r.content, category: r.category, variables: JSON.parse(r.variables || '[]'), createdAt: r.created_at, updatedAt: r.updated_at })));
-      }
-      if (method === 'PUT' && urlPath === '/api/prompts') {
-        const body = await parseBody(req);
-        const prompts = Array.isArray(body) ? body : [];
-        const db = globalDbCache.get();
-        const upsert = db.prepare('INSERT OR REPLACE INTO prompts (id, title, content, category, variables, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
-        db.transaction(() => {
-          db.prepare('DELETE FROM prompts').run();
-          for (const p of prompts) upsert.run(p.id, p.title, p.content, p.category || '', JSON.stringify(p.variables || []), p.createdAt || Date.now(), p.updatedAt || Date.now());
-        })();
-        return send(res, 200, { ok: true });
-      }
 
       // Settings & misc
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);
