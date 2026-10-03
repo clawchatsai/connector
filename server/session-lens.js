@@ -28,7 +28,7 @@ export const ROW_FIELDS = new Set([
   'createdAt', 'updatedAt', 'lastActivityAt', 'lastInteractionAt',
   'status', 'hasActiveRun', 'activeRunIds', 'lastRunId', 'lastRunError',
   'model', 'modelProvider', 'thinkingLevel', 'contextTokens', 'totalTokens', 'totalTokensFresh',
-  'inputTokens', 'outputTokens', 'permissionMode',
+  'inputTokens', 'outputTokens', 'permissionMode', 'contextBudgetStatus',
 ]);
 
 // `sessions.changed` envelope fields (snapshot fields are spread next to these).
