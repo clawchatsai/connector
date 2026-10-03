@@ -1319,6 +1319,18 @@ async function handleExportHistory(api: PluginApi, mode?: string): Promise<void>
   }
 }
 
+async function handleImportDates(): Promise<void> {
+  // @ts-expect-error — server/ is plain JS with no .d.ts
+  const mod: { importLegacyThreadDates: (dataDir: string) => { found: number; imported: number } } = await import('../server/store/legacy-threads.js');
+  try {
+    const { found, imported } = mod.importLegacyThreadDates(path.join(CONFIG_DIR, 'data'));
+    console.log(`Chat creation dates: ${found} found in the old ClawChats databases, ${imported} new imported.`);
+  } catch (err) {
+    console.error(`import-dates failed: ${(err as Error).message}`);
+    process.exitCode = 1;
+  }
+}
+
 async function handleStatus(): Promise<void> {
   // CLI runs in a separate process — module-level vars are null here.
   // Query the live service via the health endpoint instead.
@@ -1503,6 +1515,10 @@ const plugin: OpenClawPluginDefinition = {
       cmd.command('export-history [check]')
         .description('Export ClawChats chats the gateway has no history for, for the gateway importer ("check" = report only)')
         .action((mode: unknown) => handleExportHistory(api, mode === undefined ? undefined : String(mode)));
+
+      cmd.command('import-dates')
+        .description('Copy chat creation dates from the old ClawChats databases (one-off migration; safe to re-run)')
+        .action(() => handleImportDates());
 
       cmd.command('import <path>')
         .description('Import databases and config from a folder (e.g. migrate from old data directory)')

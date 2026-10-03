@@ -3,6 +3,7 @@
 //
 //   project_styles  color/icon per gateway session group (groups are just {name, position})
 //   thread_extras   per-session ClawChats data (Intelligence panel etc.), keyed by session key
+//   legacy_created  creation time of chats from before the gateway recorded createdAt
 
 export function createExtrasStore(getGlobalDb) {
   let ready = false;
@@ -10,6 +11,7 @@ export function createExtrasStore(getGlobalDb) {
     const g = getGlobalDb();
     if (!ready) {
       g.exec(`CREATE TABLE IF NOT EXISTS project_styles (name TEXT PRIMARY KEY, color TEXT, icon TEXT, updated_at INTEGER NOT NULL)`);
+      g.exec(`CREATE TABLE IF NOT EXISTS legacy_created (session_key TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS thread_extras (session_key TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (session_key, kind))`);
       ready = true;
     }
@@ -58,6 +60,19 @@ export function createExtrasStore(getGlobalDb) {
         if (p?.label && (p.color || p.icon)) n += ins.run(p.label, p.color || null, p.icon || null, Date.now()).changes;
       }
       return n;
+    },
+
+    /** Store legacy creation times ([{ sessionKey, createdAt }]); never overwrites. */
+    seedLegacyCreatedAt(rows) {
+      const ins = db().prepare('INSERT OR IGNORE INTO legacy_created (session_key, created_at) VALUES (?, ?)');
+      let n = 0;
+      for (const r of rows || []) if (r?.sessionKey && r.createdAt > 0) n += ins.run(r.sessionKey, r.createdAt).changes;
+      return n;
+    },
+
+    /** Map of session key -> legacy creation time (ms). */
+    getLegacyCreatedAt() {
+      return new Map(db().prepare('SELECT session_key, created_at FROM legacy_created').all().map(r => [r.session_key, r.created_at]));
     },
 
     getThreadExtra(sessionKey, kind) {

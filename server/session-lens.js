@@ -9,7 +9,8 @@
 //   - drops `chat`/`agent` run events of sessions ClawChats doesn't show;
 //   - filters/trims the responses to browser-issued `sessions.list|subscribe|search`;
 //   - keeps the browser from tearing down the connector's own session subscription;
-//   - applies project-style side effects of browser-issued group renames/deletes.
+//   - applies project-style side effects of browser-issued group renames/deletes;
+//   - fills `createdAt` on listed rows from `clawchats import-dates` when the gateway has none.
 //
 // Visible = a root, direct, user chat: `agent:<id>:dashboard:<id>` (gateway-created) or
 // `agent:<id>:<project>:chat:<id>` (legacy ClawChats). Everything else is hidden.
@@ -257,8 +258,18 @@ export class SessionLens {
   }
 
   _visibleRows(rows) {
+    // Creation times of pre-gateway chats (their gateway row has no createdAt). Read per list so
+    // `import-dates` applies without a restart; the browser store merges rows, so filling list
+    // responses is enough.
+    let legacy = null;
+    try { legacy = this.extras?.getLegacyCreatedAt?.(); } catch (e) { this.log.warn?.(`[lens] legacy dates: ${e.message}`); }
     const out = [];
-    for (const row of rows || []) if (row && this.observe(row.key, row)) out.push(trimRow(row));
+    for (const row of rows || []) {
+      if (!row || !this.observe(row.key, row)) continue;
+      const trimmed = trimRow(row);
+      if (!trimmed.createdAt && legacy?.has(row.key)) trimmed.createdAt = legacy.get(row.key);
+      out.push(trimmed);
+    }
     return out;
   }
 

@@ -166,3 +166,14 @@ test('session.message only for chats a browser subscribed to', () => {
   l.outbound(JSON.stringify({ type: 'req', id: 'u', method: 'sessions.messages.unsubscribe', params: { key: CHAT, subscriptionId: 'tab1' } }));
   assert.equal(l.sessionMessage(msg), null);
 });
+
+test('listed rows without createdAt get the legacy creation time; gateway values win', () => {
+  const extras = { getLegacyCreatedAt: () => new Map([[LEGACY, 111], [CHAT, 222]]) };
+  const { l } = lens(extras);
+  l.outbound(JSON.stringify({ type: 'req', id: 'c1', method: 'sessions.list', params: {} }));
+  const res = l.response({ type: 'res', id: 'c1', ok: true, payload: { sessions: [
+    { key: LEGACY, label: 'old', kind: 'direct' },
+    { key: CHAT, label: 'new', kind: 'direct', createdAt: 999 },
+  ] } });
+  assert.deepEqual(res.payload.sessions.map(s => s.createdAt), [111, 999]);
+});
