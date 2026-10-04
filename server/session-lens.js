@@ -27,7 +27,7 @@ export const ROW_FIELDS = new Set([
   'category', 'pinned', 'pinnedAt', 'archived', 'archivedAt',
   'unread', 'lastReadAt', 'markedUnreadAt',
   'createdAt', 'updatedAt', 'lastActivityAt', 'lastInteractionAt',
-  'status', 'hasActiveRun', 'activeRunIds', 'lastRunId', 'lastRunError',
+  'status', 'hasActiveRun', 'activeRunIds', 'lastRunId', 'lastRunError', 'endedAt', 'agentStatus',
   'model', 'modelProvider', 'thinkingLevel', 'contextTokens', 'totalTokens', 'totalTokensFresh',
   'inputTokens', 'outputTokens', 'permissionMode', 'contextBudgetStatus', 'fastMode', 'effectiveFastMode',
 ]);
