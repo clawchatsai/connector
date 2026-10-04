@@ -176,6 +176,7 @@ interface PluginApi {
   ) => void;
   runtime: {
     requestRestart?: (reason: string) => void;
+    llm?: { complete: (params: Record<string, unknown>) => Promise<{ text?: string; provider?: string; model?: string }> };
   };
   config?: Record<string, unknown>;
 }
@@ -357,6 +358,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     gatewayUrl:    process.env.GATEWAY_WS_URL || 'ws://localhost:18789',
     authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
     gatewayToken,  // For WS auth to local OpenClaw gateway
+    llm:           api.runtime?.llm, // host-run completions (chat-title fallback, /api/title)
     openaiApiKey:  (() => {
       // Resolve OpenAI API key: openclaw config → env var
       try {
