@@ -13,6 +13,7 @@ import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
 import { handleStatic } from './controllers/static.js';
 import { handleAgents } from './controllers/agents.js';
+import { createTitleHandler } from './controllers/title.js';
 import { createSettingsHandlers } from './controllers/settings.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
@@ -36,6 +37,7 @@ export function createApp(config = {}) {
   const gatewayToken   = config.gatewayToken !== undefined ? config.gatewayToken : authToken;
   const gatewayUrl     = config.gatewayUrl   || GATEWAY_WS_URL;
   const openaiApiKey   = config.openaiApiKey || null;
+  const handleTitle    = createTitleHandler(config.llm); // api.runtime.llm (plugin mode only)
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -162,6 +164,7 @@ export function createApp(config = {}) {
       if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res, { openaiApiKey });
       if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime() });
       if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
+      if (method === 'POST' && urlPath === '/api/title') return await handleTitle(req, res);
 
       // ClawChats-only extras (see EXTRAS.md)
       if (method === 'GET' && urlPath === '/api/extras/project-styles') {
