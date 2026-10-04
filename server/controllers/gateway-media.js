@@ -9,17 +9,26 @@ import { sendError } from '../util/http.js';
 // User-sent attachments live in the gateway's inbound media store (`media://inbound/<file>`),
 // served by the Control UI's authenticated assistant-media route:
 //   /__<platform>__/assistant-media?source=media://inbound/<file>&sessionKey=…&agentId=…
-// The route is matched by shape (no brand string), and only plain inbound sources pass.
+// The same route serves raw `MEDIA:<path>` lines left in assistant text (claude-cli replies),
+// which the Control UI parses client-side (chat-message-local-media.ts). Local sources need a
+// sessionKey: the gateway then applies that session's file-read policy (it refuses e.g.
+// /etc/passwd and its own config). `meta=1` (a GET returning the availability JSON the Control
+// UI uses for "Unavailable · <reason>") passes; `allow` (admin outside-folder grant, POST) and
+// `mediaTicket` don't. The route is matched by shape (no brand string).
 const ALLOWED_PREFIX = '/api/chat/media/outgoing/';
 const INBOUND_ROUTE = /^\/__[a-z0-9-]+__\/assistant-media\?/;
 const INBOUND_SOURCE = /^media:\/\/inbound\/[^/?#\\]+$/;
+const LOCAL_SOURCE = /^(?:\/|~\/|\.\/|file:|[a-zA-Z]:[\\/])|^[^:]+$/;
 
 export function isAllowedMediaTarget(target) {
   if (typeof target !== 'string' || target.includes('..')) return false;
   if (target.startsWith(ALLOWED_PREFIX)) return true;
   if (!INBOUND_ROUTE.test(target)) return false;
   const q = new URLSearchParams(target.slice(target.indexOf('?') + 1));
-  return INBOUND_SOURCE.test(q.get('source') || '') && !q.has('meta') && !q.has('allow') && !q.has('mediaTicket');
+  if ((q.has('meta') && q.getAll('meta').join() !== '1') || q.has('allow') || q.has('mediaTicket')) return false;
+  const source = q.get('source') || '';
+  if (INBOUND_SOURCE.test(source)) return true;
+  return !!source && !source.includes('\0') && LOCAL_SOURCE.test(source) && !!q.get('sessionKey');
 }
 
 export function createGatewayMediaHandler({ gatewayWsUrl, gatewayToken }) {
