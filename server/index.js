@@ -8,7 +8,7 @@ import { Database } from './bootstrap/native.js';
 import { GATEWAY_WS_URL, AUTH_TOKEN, discoverWorkspaceDir } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
-import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload } from './controllers/filesystem.js';
+import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload, handleWorkspaceCreate } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
 import { handleStatic } from './controllers/static.js';
@@ -157,6 +157,7 @@ export function createApp(config = {}) {
       if (method === 'PUT' && urlPath === '/api/workspace/file') return await handleWorkspaceFileWrite(req, res, query);
       if (method === 'DELETE' && urlPath === '/api/workspace/file') return handleWorkspaceFileDelete(req, res, query);
       if (method === 'POST' && urlPath === '/api/workspace/upload') return await handleWorkspaceUpload(req, res, query);
+      if (method === 'POST' && urlPath === '/api/workspace/create') return handleWorkspaceCreate(req, res, query);
 
       // Settings & misc
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);

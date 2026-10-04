@@ -7,6 +7,13 @@ import { parseMultipart } from '../util/multipart.js';
 const HOME = os.homedir();
 const ALLOWED_FILE_DIRS = [HOME, '/tmp'];
 
+// Resolves a `~`-relative or absolute path; returns null unless it is HOME or inside it
+// (a bare prefix check would also admit siblings such as /home/user2).
+function resolveInHome(p) {
+  const resolved = path.resolve(p.replace(/^~/, HOME));
+  return resolved === HOME || resolved.startsWith(HOME + path.sep) ? resolved : null;
+}
+
 export function handleServeFile(req, res, query, workspaceDir) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
@@ -39,8 +46,8 @@ export function handleWorkspaceList(req, res, query) {
   const reqPath = query.path || '~/.openclaw/workspace';
   const depth = parseInt(query.depth || '2', 10);
   const showHidden = query.hidden === '1' || query.hidden === 'true';
-  const resolved = path.resolve(reqPath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  const resolved = resolveInHome(reqPath);
+  if (!resolved) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved)) return sendError(res, 404, 'Path not found');
 
   const files = [{ path: resolved + '/', type: 'dir', name: path.basename(resolved), size: 0 }];
@@ -89,8 +96,8 @@ export function handleWorkspaceFileRead(req, res, query, workspaceDir) {
 export async function handleWorkspaceFileWrite(req, res, query) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
-  const resolved = path.resolve(filePath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Can only write to workspace directory');
+  const resolved = resolveInHome(filePath);
+  if (!resolved) return sendError(res, 403, 'Can only write to workspace directory');
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const dir = path.dirname(resolved);
@@ -102,8 +109,8 @@ export async function handleWorkspaceFileWrite(req, res, query) {
 export function handleWorkspaceFileDelete(req, res, query) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
-  const resolved = path.resolve(filePath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  const resolved = resolveInHome(filePath);
+  if (!resolved) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved)) return sendError(res, 404, 'Path not found');
   try {
     const stat = fs.statSync(resolved);
@@ -115,8 +122,8 @@ export function handleWorkspaceFileDelete(req, res, query) {
 export async function handleWorkspaceUpload(req, res, query) {
   const targetDir = query.path;
   if (!targetDir) return sendError(res, 400, 'Missing path parameter');
-  const resolved = path.resolve(targetDir.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  const resolved = resolveInHome(targetDir);
+  if (!resolved) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) return sendError(res, 404, 'Target directory not found');
   if (!(req.headers['content-type'] || '').includes('multipart/form-data')) return sendError(res, 400, 'Expected multipart/form-data');
 
@@ -138,4 +145,24 @@ export async function handleWorkspaceUpload(req, res, query) {
     uploaded.push({ name: path.basename(finalPath), size: data.length });
   }
   send(res, 200, { ok: true, uploaded });
+}
+
+// Creates one empty file or folder named `name` inside the directory `path`.
+export function handleWorkspaceCreate(req, res, query) {
+  const { path: parentPath, name, type } = query;
+  if (!parentPath || !name) return sendError(res, 400, 'Missing path or name parameter');
+  if (type !== 'file' && type !== 'dir') return sendError(res, 400, 'type must be file or dir');
+  if (name === '.' || name === '..' || /[/\\\0]/.test(name) || name.trim() !== name) return sendError(res, 400, 'Invalid name');
+  const parent = resolveInHome(parentPath);
+  if (!parent) return sendError(res, 403, 'Access denied');
+  if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) return sendError(res, 404, 'Target directory not found');
+  const target = path.join(parent, name);
+  try {
+    if (type === 'dir') fs.mkdirSync(target);
+    else fs.writeFileSync(target, '', { flag: 'wx' });
+  } catch (err) {
+    if (err.code === 'EEXIST') return sendError(res, 409, `"${name}" already exists`);
+    return sendError(res, 500, 'Create failed: ' + err.message);
+  }
+  send(res, 200, { ok: true, path: target + (type === 'dir' ? '/' : ''), type });
 }
