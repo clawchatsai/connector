@@ -61,11 +61,13 @@ export function handleWorkspaceList(req, res, query) {
   send(res, 200, { files, cwd: resolved });
 }
 
-export function handleWorkspaceFileRead(req, res, query) {
+// Reads any file the gateway user can read (file links in chat open any path, as the agent
+// wrote it): `~` is home, relative paths resolve against the agent workspace. Writes and
+// deletes stay limited to HOME.
+export function handleWorkspaceFileRead(req, res, query, workspaceDir) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
-  const resolved = path.resolve(filePath.replace(/^~/, HOME));
-  if (!resolved.startsWith(HOME)) return sendError(res, 403, 'Access denied');
+  const resolved = path.resolve(workspaceDir, filePath.replace(/^~(?=\/|$)/, HOME));
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return sendError(res, 404, 'File not found');
 
   const stat = fs.statSync(resolved);

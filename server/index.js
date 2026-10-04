@@ -153,7 +153,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/file') return handleServeFile(req, res, query, workspaceDir);
       if (method === 'GET' && urlPath === '/api/gw-media') return handleGatewayMedia(req, res, query);
       if (method === 'GET' && urlPath === '/api/workspace') return handleWorkspaceList(req, res, query);
-      if (method === 'GET' && urlPath === '/api/workspace/file') return handleWorkspaceFileRead(req, res, query);
+      if (method === 'GET' && urlPath === '/api/workspace/file') return handleWorkspaceFileRead(req, res, query, workspaceDir);
       if (method === 'PUT' && urlPath === '/api/workspace/file') return await handleWorkspaceFileWrite(req, res, query);
       if (method === 'DELETE' && urlPath === '/api/workspace/file') return handleWorkspaceFileDelete(req, res, query);
       if (method === 'POST' && urlPath === '/api/workspace/upload') return await handleWorkspaceUpload(req, res, query);
