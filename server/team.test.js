@@ -33,6 +33,12 @@ function harness(reply, { preparedTitle = 'Team title', titler = null } = {}) {
         const agentId = /^agent:([^:]+):/.exec(params.sessionKey)[1];
         const runId = params.idempotencyKey;
         Promise.resolve(reply(agentId, params.message)).then(text => {
+          if (text && typeof text === 'object') { // { partial, state }: streamed some text, then aborted/error
+            team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: 'delta', message: { role: 'assistant', content: [{ type: 'text', text: text.partial }] } } });
+            team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: 'delta', deltaText: ' more' } });
+            team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: text.state, errorMessage: text.error } });
+            return;
+          }
           const state = text === null ? 'aborted' : 'final';
           const payload = { runId, sessionKey: params.sessionKey, state };
           if (text && text !== 'NO_REPLY') payload.message = { role: 'assistant', content: [{ type: 'text', text }] };
@@ -187,6 +193,45 @@ test('a team chat needs two agents; removing down to one is refused', async () =
   await assert.rejects(h.team.createRoom({ agentIds: ['dev'] }), /at least two/);
   const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
   assert.throws(() => h.team.removeAgent(roomKey, 'dev'), /at least two/);
-  h.team.addAgent(roomKey, 'main');
+  await h.team.addAgent(roomKey, 'main');
   assert.deepEqual(h.team.removeAgent(roomKey, 'dev').agents.map(a => a.agentId), ['atlas', 'main']);
+});
+
+test('stop: a partial reply is posted marked stopped; a reply that finished anyway is posted', async () => {
+  const pending = [];
+  const h = harness(agent => new Promise(resolve => pending.push({ agent, resolve })));
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@all go', userLabel: 'H' });
+  for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+  assert.equal(pending.length, 2);
+  await h.team.stop(roomKey);
+  pending.find(p => p.agent === 'dev').resolve({ partial: 'half an', state: 'aborted' });
+  pending.find(p => p.agent === 'atlas').resolve('atlas finished anyway');
+  await h.settle();
+  const room = h.room(roomKey);
+  assert.ok(room.includes('[Dev]\n\nhalf an more\n\n*[stopped]*'));
+  assert.ok(room.includes('[Atlas]\n\natlas finished anyway'));
+  assert.equal(h.calls.filter(c => c.method === 'chat.send').length, 2); // no follow-up round after Stop
+});
+
+test('a failed turn shows in the room with its partial text', async () => {
+  const h = harness(agent => agent === 'dev' ? { partial: 'started', state: 'error', error: 'runtime died' } : 'NO_REPLY');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: 'hello', userLabel: 'H' });
+  await h.settle();
+  assert.equal(h.room(roomKey).at(-1), "[Dev]\n\nstarted more\n\n⚠️ *Couldn't finish this reply: runtime died*");
+});
+
+test('working session labels are unique per room; unknown agents are refused', async () => {
+  const h = harness(() => 'ok');
+  const a = (await h.team.createRoom({ agentIds: ['dev', 'atlas'] })).roomKey;
+  const b = (await h.team.createRoom({ agentIds: ['dev', 'atlas'] })).roomKey;
+  await h.team.send(a, { text: '@dev hi', userLabel: 'H' });
+  await h.team.send(b, { text: '@dev hi', userLabel: 'H' });
+  await h.settle();
+  const labels = h.calls.filter(c => c.method === 'sessions.create' && c.params.label).map(c => c.params.label);
+  assert.equal(labels.length, 2);
+  assert.notEqual(labels[0], labels[1]);
+  await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'ghost'] }), /unknown agent: ghost/);
+  await assert.rejects(h.team.addAgent(a, 'ghost'), /unknown agent/);
 });

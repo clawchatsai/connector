@@ -123,12 +123,19 @@ export class TeamCoordinator {
   onGatewayEvent(msg) {
     if (msg?.event !== 'chat') return;
     const p = msg.payload;
-    if (!p?.runId || !['final', 'aborted', 'error'].includes(p.state)) return;
-    const w = this._waiters.get(p.runId);
+    const w = p?.runId && this._waiters.get(p.runId);
     if (!w) return; // includes the stray `error` that follows a silent final
+    if (p.state === 'delta') {
+      // Streamed text so far, kept for a Stop mid-reply: first delta carries the message, later
+      // ones the appended text (`replace`: the whole text).
+      if (p.message && !w.text) w.text = messageText(p.message);
+      else if (typeof p.deltaText === 'string') w.text = p.replace ? p.deltaText : (w.text || '') + p.deltaText;
+      return;
+    }
+    if (!['final', 'aborted', 'error'].includes(p.state)) return;
     this._waiters.delete(p.runId);
     clearTimeout(w.timer);
-    w.resolve(p);
+    w.resolve({ ...p, partialText: w.text || '' });
   }
 
   // ── Agents ─────────────────────────────────────────────────────────
@@ -185,6 +192,9 @@ export class TeamCoordinator {
     }
     for (const a of agents) if (!members.some(m => m.agentId === a)) members.push({ agentId: a });
     if (members.length < 2) throw new Error('a team chat needs at least two agents');
+    const known = new Set((await this.agents()).map(a => a.agentId));
+    const unknown = members.find(m => !known.has(m.agentId));
+    if (unknown) throw new Error(`unknown agent: ${unknown.agentId}`);
 
     const roomKey = `agent:${members[0].agentId}:dashboard:${crypto.randomUUID()}`;
     // Register first so the lens never shows a working session or forwards a half-made room.
@@ -205,7 +215,8 @@ export class TeamCoordinator {
     return this.room(roomKey);
   }
 
-  addAgent(roomKey, agentId) {
+  async addAgent(roomKey, agentId) {
+    if (!(await this.agents()).some(a => a.agentId === agentId)) throw new Error(`unknown agent: ${agentId}`);
     if (!this.store.addMember(roomKey, agentId)) return null;
     this._changed();
     return this.room(roomKey);
@@ -287,7 +298,14 @@ export class TeamCoordinator {
       const history = await this._roomEntries(roomKey);
       const results = await Promise.all(targets.map(agentId =>
         this._turn(roomKey, agentId, agents, history, round === 1 ? mode : 'followup', stopped)
-          .catch(e => { this.log.warn?.(`[team] ${agentId} in ${roomKey}: ${e.message}`); this._status(roomKey, `${agentId}: ${e.message}`); return null; })));
+          .catch(async e => {
+            // Shown in the room, like a failed turn in a normal chat, not only as a passing toast.
+            this.log.warn?.(`[team] ${agentId} in ${roomKey}: ${e.message}`);
+            const self = agents.find(a => a.agentId === agentId) || { agentId, name: agentId };
+            const note = `${e.partial ? `${e.partial}\n\n` : ''}⚠️ *Couldn't finish this reply: ${e.message}*`;
+            await this._post(roomKey, self, note).catch(() => this._status(roomKey, `${agentId}: ${e.message}`));
+            return null;
+          })));
       const replied = results.filter(r => r?.text);
       if (!replied.length || stopped()) break;
       // Next round: agents that replied or were named, if a sibling said something they haven't seen.
@@ -324,18 +342,31 @@ export class TeamCoordinator {
       live.running.delete(agentId);
       this._status(roomKey);
     }
+    const clean = t => {
+      const own = splitLabel((t || '').trim());
+      return (own.label && norm(own.label) === norm(self.name) ? own.body : (t || '')).trim(); // agent copied the room format
+    };
     if (result.state !== 'final') {
-      if (result.state === 'error') throw new Error(result.errorMessage || 'run failed');
-      return { agentId, text: null };
+      // Stopped or failed mid-reply: the agent's session keeps what it said, so the room shows it too
+      // (a normal chat keeps a stopped reply's partial text the same way).
+      const partial = clean(result.partialText);
+      if (result.state === 'aborted') {
+        if (partial && !SILENT.test(partial)) await this._post(roomKey, self, `${partial}\n\n*[stopped]*`);
+        return { agentId, text: null };
+      }
+      throw Object.assign(new Error(result.errorMessage || 'run failed'), { partial });
     }
-    let text = result.message ? messageText(result.message) : await this._lastReply(workKey);
-    text = (text || '').trim();
-    const own = splitLabel(text);
-    if (own.label && norm(own.label) === norm(self.name)) text = own.body.trim(); // agent copied the room format
-    if (!text || SILENT.test(text) || stopped()) return { agentId, text: null };
+    const text = clean(result.message ? messageText(result.message) : await this._lastReply(workKey));
+    if (!text || SILENT.test(text)) return { agentId, text: null };
+    await this._post(roomKey, self, text);
+    // A reply that finished after Stop is still posted (the agent said it), but starts no new round.
+    return { agentId, text: stopped() ? null : text };
+  }
+
+  /** Post an agent's message into the room. */
+  async _post(roomKey, self, text) {
     const res = await this.request('chat.inject', { sessionKey: roomKey, message: text, label: self.name.slice(0, 100) });
-    if (res?.messageId) this.store.recordEntry(roomKey, res.messageId, { type: 'agent', agentId });
-    return { agentId, text };
+    if (res?.messageId) this.store.recordEntry(roomKey, res.messageId, { type: 'agent', agentId: self.agentId });
   }
 
   _prompt(self, agents, fresh, mode) {
@@ -365,7 +396,7 @@ export class TeamCoordinator {
     this.store.setWorkKey(roomKey, self.agentId, workKey); // before create: the lens hides it from the first event
     this._workKeysChanged();
     try {
-      await this.request('sessions.create', { key: workKey, agentId: self.agentId, label: `${self.name} · team chat` });
+      await this.request('sessions.create', { key: workKey, agentId: self.agentId, label: `${self.name} · team chat ${roomKey.slice(-8)}` }); // labels are unique per gateway
     } catch (e) {
       this.store.setWorkKey(roomKey, self.agentId, null);
       this._workKeysChanged();

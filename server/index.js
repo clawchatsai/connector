@@ -240,8 +240,10 @@ export function createApp(config = {}) {
       if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/agents'))) {
         const { agentId } = await parseBody(req);
         if (typeof agentId !== 'string' || !agentId) return sendError(res, 400, 'agentId is required');
-        const room = team.addAgent(p.room, agentId);
-        return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+        try {
+          const room = await team.addAgent(p.room, agentId);
+          return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+        } catch (e) { return sendError(res, 400, e.message); }
       }
       if ((p = matchRoute(method, urlPath, 'DELETE /api/team/:room/agents/:agentId'))) {
         try {
