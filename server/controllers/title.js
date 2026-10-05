@@ -19,12 +19,12 @@ export function normalizeTitle(raw) {
 }
 
 /**
+ * Direct completion where the main model's provider has a direct transport; CLI and harness
+ * runtimes (claude-cli, codex, …) only run in isolated agent-runtime mode.
  * @param {{ complete?: (params: object) => Promise<{ text?: string }> }} llm  api.runtime.llm
  */
-export function createTitleHandler(llm) {
-  // Direct completion where the main model's provider has a direct transport; CLI and harness
-  // runtimes (claude-cli, codex, …) only run in isolated agent-runtime mode.
-  async function complete(message) {
+function createCompletion(llm) {
+  return async function complete(message) {
     const base = { messages: [{ role: 'user', content: message }], systemPrompt: TITLE_PROMPT, purpose: 'clawchats.title', maxTokens: 64 };
     try {
       return await llm.complete(base);
@@ -32,7 +32,23 @@ export function createTitleHandler(llm) {
       if (err?.code === 'LLM_COMPLETION_NOT_AUTHORIZED') throw err;
       return await llm.complete({ ...base, maxTokens: undefined, execution: { mode: 'isolated-agent-runtime', timeoutMs: TIMEOUT_MS } });
     }
-  }
+  };
+}
+
+/** message → title or null (null also when the host has no plugin model completion). */
+export function createTitler(llm) {
+  const complete = createCompletion(llm);
+  return async message => {
+    if (typeof llm?.complete !== 'function' || typeof message !== 'string' || !message.trim()) return null;
+    return normalizeTitle((await complete(Array.from(message.trim()).slice(0, SOURCE_MAX_CHARS).join('')))?.text);
+  };
+}
+
+/**
+ * @param {{ complete?: (params: object) => Promise<{ text?: string }> }} llm  api.runtime.llm
+ */
+export function createTitleHandler(llm) {
+  const complete = createCompletion(llm);
 
   return async function handleTitle(req, res) {
     if (typeof llm?.complete !== 'function') return sendError(res, 501, 'This OpenClaw version has no plugin model completion');

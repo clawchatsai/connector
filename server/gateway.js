@@ -91,6 +91,9 @@ export class GatewayClient {
       return;
     }
 
+    // Connector-side observers (team chat run tracking) see every event before the lens filters.
+    if (msg.type === 'event' && this.onEvent) { try { this.onEvent(msg); } catch (e) { console.error('[gateway] event observer:', e.message); } }
+
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
       this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: this._connectParams(msg.payload?.nonce || '', ['tool-events']) }));
       return;

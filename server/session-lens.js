@@ -14,6 +14,8 @@
 //
 // Visible = a root, direct, user chat: `agent:<id>:dashboard:<id>` (gateway-created) or
 // `agent:<id>:<project>:chat:<id>` (legacy ClawChats). Everything else is hidden.
+// Team chat working sessions (server/team.js) are hidden too, but their run events are
+// forwarded: the room shows each agent's reply streaming.
 
 const DASHBOARD_KEY = /^agent:[^:]+:dashboard:[^:]+$/;
 const LEGACY_CHAT_KEY = /^agent:[^:]+:[^:]+:chat:[^:]+$/;
@@ -116,11 +118,13 @@ export class SessionLens {
    * @param {(data: string) => void} opts.broadcast  send a frame to all browsers
    * @param {(method: string, params: object, timeoutMs?: number) => Promise<any>} [opts.request]  connector-originated gateway RPC
    * @param {object} [opts.extras]  ExtrasStore (project style side effects)
+   * @param {object} [opts.team]    TeamCoordinator (`isWorkKey`, `onSessionDeleted`)
    */
-  constructor({ broadcast, request, extras, logger = console }) {
+  constructor({ broadcast, request, extras, team, logger = console }) {
     this.broadcast = broadcast;
     this.request = request;
     this.extras = extras;
+    this.team = team;
     this.log = logger;
     this.hidden = new Set(); // candidate-shaped keys a row revealed as not a user chat
     this.pending = new Map(); // browser req id -> { method, params }
@@ -137,16 +141,16 @@ export class SessionLens {
     const verdict = rowVerdict(row);
     if (verdict === true) this.hidden.add(key);
     else if (verdict === false) this.hidden.delete(key);
-    return !this.hidden.has(key);
+    return this.isVisible(key);
   }
 
   isVisible(key) {
-    return isCandidateKey(key) && !this.hidden.has(key);
+    return isCandidateKey(key) && !this.hidden.has(key) && !this.team?.isWorkKey(key);
   }
 
-  /** chat/agent run events: visible chats plus the connector's own utility sessions. */
+  /** chat/agent run events: visible chats, team chat working sessions, utility sessions. */
   forwardsRunEvent(key) {
-    return isUtilityKey(key) || this.isVisible(key);
+    return isUtilityKey(key) || this.isVisible(key) || !!this.team?.isWorkKey(key);
   }
 
   /** Seed `hidden` from a full roster so partial events of child sessions stay hidden. */
@@ -169,6 +173,9 @@ export class SessionLens {
     if (!payload || typeof payload !== 'object') return null;
     const key = payload.sessionKey;
     if (!key) return { type: 'event', event: 'sessions.changed', payload: trimEvent(payload) }; // catalog/groups
+    if (payload.reason === 'delete' && this.team) {
+      try { this.team.onSessionDeleted(key); } catch (e) { this.log.warn?.(`[lens] team delete: ${e.message}`); }
+    }
     if (!this.observe(key, payload.session || payload)) return null;
     if (payload.reason === 'delete' && this.extras) this.extras.deleteThreadExtras?.(key);
     return { type: 'event', event: 'sessions.changed', payload: trimEvent(payload) };
