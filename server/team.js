@@ -226,7 +226,7 @@ export class TeamCoordinator {
     const r = this.store.getRoom(roomKey);
     if (!r) return null;
     if (r.members.length <= 2 && r.members.some(m => m.agentId === agentId)) throw new Error('a team chat needs at least two agents');
-    // The working session stays (it's that agent's history); it shows up as its own chat again.
+    // The working session stays, hidden: it's the agent's memory of this room if it's added back.
     this.store.removeMember(roomKey, agentId);
     this._workKeysChanged();
     this._changed();
@@ -352,6 +352,8 @@ export class TeamCoordinator {
       const partial = clean(result.partialText);
       if (result.state === 'aborted') {
         if (partial && !SILENT.test(partial)) await this._post(roomKey, self, `${partial}\n\n*[stopped]*`);
+        // Some runtimes (claude-cli) finish the reply after the abort was acknowledged: post it once it lands.
+        else this._recoverAfterAbort(roomKey, self, workKey);
         return { agentId, text: null };
       }
       throw Object.assign(new Error(result.errorMessage || 'run failed'), { partial });
@@ -361,6 +363,25 @@ export class TeamCoordinator {
     await this._post(roomKey, self, text);
     // A reply that finished after Stop is still posted (the agent said it), but starts no new round.
     return { agentId, text: stopped() ? null : text };
+  }
+
+  /**
+   * After Stop, a reply that still landed in the agent's session (the runtime ignored the abort) is
+   * posted to the room marked stopped, so the room matches what the agent believes it said.
+   * Polls until the session is idle (max ~3 min); gives up if the agent starts another turn.
+   */
+  _recoverAfterAbort(roomKey, self, workKey, { intervalMs = 3000, tries = 60 } = {}) {
+    let n = 0;
+    const check = async () => {
+      if (this._rooms.get(roomKey)?.running.has(self.agentId) || !this.store.getRoom(roomKey)) return;
+      try {
+        const s = (await this.request('sessions.describe', { key: workKey }, 5000))?.session;
+        if (s?.hasActiveRun && ++n < tries) { setTimeout(check, intervalMs).unref?.(); return; }
+        const text = (await this._lastReply(workKey) || '').trim();
+        if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`);
+      } catch (e) { this.log.warn?.(`[team] recover after stop: ${e.message}`); }
+    };
+    setTimeout(check, intervalMs).unref?.();
   }
 
   /** Post an agent's message into the room. */

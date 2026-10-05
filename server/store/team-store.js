@@ -4,7 +4,9 @@
 //   team_rooms    a room = a gateway session that never runs; its transcript is the shared timeline;
 //                 source_key = the chat it was converted from (its history shows above the room)
 //   team_members  one working session per agent per room (created on the agent's first turn);
-//                 seen_at = timestamp of the newest room entry the agent has been given
+//                 seen_at = timestamp of the newest room entry the agent has been given;
+//                 removed = 1: agent taken out of the room; its session stays hidden and is reused
+//                 if the agent is added back
 //   team_entries  author of each injected room entry (the transcript only has a "[Label]" prefix)
 
 const DISCUSS_ROUNDS = 3;
@@ -27,12 +29,13 @@ export function createTeamStore(getGlobalDb) {
       g.exec(`CREATE TABLE IF NOT EXISTS team_rooms (room_key TEXT PRIMARY KEY, discuss INTEGER NOT NULL DEFAULT 0, source_key TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_members (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, work_key TEXT, seen_at INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL, PRIMARY KEY (room_key, agent_id))`);
       g.exec(`CREATE INDEX IF NOT EXISTS team_members_work ON team_members (work_key)`);
+      if (!g.prepare('PRAGMA table_info(team_members)').all().some(c => c.name === 'removed')) g.exec('ALTER TABLE team_members ADD COLUMN removed INTEGER NOT NULL DEFAULT 0');
       g.exec(`CREATE TABLE IF NOT EXISTS team_entries (room_key TEXT NOT NULL, message_id TEXT NOT NULL, author_type TEXT NOT NULL, agent_id TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (room_key, message_id))`);
       ready = true;
     }
     return g;
   }
-  const members = roomKey => db().prepare('SELECT * FROM team_members WHERE room_key = ? ORDER BY position').all(roomKey);
+  const members = roomKey => db().prepare('SELECT * FROM team_members WHERE room_key = ? AND removed = 0 ORDER BY position').all(roomKey);
 
   return {
     DISCUSS_ROUNDS,
@@ -59,19 +62,17 @@ export function createTeamStore(getGlobalDb) {
       return this.getRoom(roomKey);
     },
 
-    /** Adds an agent at the end; no-op if already a member. Returns false if the room is unknown. */
+    /** Adds an agent at the end (an agent removed earlier comes back with its session). Returns false if the room is unknown. */
     addMember(roomKey, agentId) {
       if (!this.getRoom(roomKey)) return false;
       const pos = db().prepare('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM team_members WHERE room_key = ?').get(roomKey).p;
-      db().prepare('INSERT OR IGNORE INTO team_members (room_key, agent_id, work_key, seen_at, position) VALUES (?, ?, NULL, 0, ?)').run(roomKey, agentId, pos);
+      db().prepare('INSERT INTO team_members (room_key, agent_id, work_key, seen_at, position) VALUES (?, ?, NULL, 0, ?) ON CONFLICT(room_key, agent_id) DO UPDATE SET removed = 0, position = excluded.position WHERE removed = 1').run(roomKey, agentId, pos);
       return true;
     },
 
-    /** Removes an agent; returns its working session key (or null). */
+    /** Takes an agent out of the room; its working session stays hidden (reused if it's added back). */
     removeMember(roomKey, agentId) {
-      const m = db().prepare('SELECT work_key FROM team_members WHERE room_key = ? AND agent_id = ?').get(roomKey, agentId);
-      db().prepare('DELETE FROM team_members WHERE room_key = ? AND agent_id = ?').run(roomKey, agentId);
-      return m?.work_key || null;
+      db().prepare('UPDATE team_members SET removed = 1 WHERE room_key = ? AND agent_id = ?').run(roomKey, agentId);
     },
 
     setWorkKey(roomKey, agentId, workKey) {
@@ -88,7 +89,7 @@ export function createTeamStore(getGlobalDb) {
 
     /** Drops the room; returns the working session keys it had. */
     deleteRoom(roomKey) {
-      const work = members(roomKey).map(m => m.work_key).filter(Boolean);
+      const work = db().prepare('SELECT work_key FROM team_members WHERE room_key = ? AND work_key IS NOT NULL').all(roomKey).map(m => m.work_key);
       const g = db();
       g.prepare('DELETE FROM team_members WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_entries WHERE room_key = ?').run(roomKey);
@@ -98,7 +99,7 @@ export function createTeamStore(getGlobalDb) {
 
     /** { roomKey, agentId } of a working session, or null. */
     workSession(workKey) {
-      const m = db().prepare('SELECT room_key, agent_id FROM team_members WHERE work_key = ?').get(workKey);
+      const m = db().prepare('SELECT room_key, agent_id FROM team_members WHERE work_key = ? AND removed = 0').get(workKey);
       return m ? { roomKey: m.room_key, agentId: m.agent_id } : null;
     },
 

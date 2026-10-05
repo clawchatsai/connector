@@ -235,3 +235,41 @@ test('working session labels are unique per room; unknown agents are refused', a
   await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'ghost'] }), /unknown agent: ghost/);
   await assert.rejects(h.team.addAgent(a, 'ghost'), /unknown agent/);
 });
+
+test('stop: a reply the runtime finished after the abort is recovered from the agent session', async () => {
+  const h = harness(() => 'x');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  const workKey = 'agent:dev:dashboard:w1';
+  h.sessions.set(workKey, [{ role: 'user', content: 'prompt', timestamp: 1 }]);
+  h.team._recoverAfterAbort(roomKey, { agentId: 'dev', name: 'Dev' }, workKey, { intervalMs: 1 });
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(h.room(roomKey).length, 0); // nothing landed: nothing posted
+  h.sessions.get(workKey).push({ role: 'assistant', content: [{ type: 'text', text: 'late full answer' }], timestamp: 2 });
+  h.team._recoverAfterAbort(roomKey, { agentId: 'dev', name: 'Dev' }, workKey, { intervalMs: 1 });
+  await new Promise(r => setTimeout(r, 20));
+  assert.deepEqual(h.room(roomKey), ['[Dev]\n\nlate full answer\n\n*[stopped]*']);
+});
+
+test('a removed agent keeps its hidden session and gets it back when re-added', async () => {
+  const h = harness(agent => `${agent} ok`);
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas', 'main'] });
+  await h.team.send(roomKey, { text: '@dev hi', userLabel: 'H' });
+  await h.settle();
+  const devWork = h.team.room(roomKey).agents.find(a => a.agentId === 'dev').workKey;
+  h.team.removeAgent(roomKey, 'dev');
+  assert.deepEqual(h.team.room(roomKey).agents.map(a => a.agentId), ['atlas', 'main']);
+  assert.equal(h.team.isWorkKey(devWork), true); // still hidden from the thread list
+  await h.team.addAgent(roomKey, 'dev');
+  const back = h.team.room(roomKey).agents.find(a => a.agentId === 'dev');
+  assert.equal(back.workKey, devWork);
+  h.team.onSessionDeleted(roomKey);
+  assert.ok(h.calls.some(c => c.method === 'sessions.delete' && c.params.key === devWork));
+});
+
+test('team_members migration adds the removed column to an existing table', () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE team_members (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, work_key TEXT, seen_at INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL, PRIMARY KEY (room_key, agent_id))');
+  const store = createTeamStore(() => db);
+  assert.deepEqual(store.listRooms(), []);
+  assert.ok(db.prepare('PRAGMA table_info(team_members)').all().some(c => c.name === 'removed'));
+});
