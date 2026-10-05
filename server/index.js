@@ -13,11 +13,13 @@ import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
 import { handleStatic } from './controllers/static.js';
 import { handleAgents } from './controllers/agents.js';
-import { createTitleHandler } from './controllers/title.js';
+import { createTitleHandler, createTitler } from './controllers/title.js';
 import { createSettingsHandlers } from './controllers/settings.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
+import { createTeamStore } from './store/team-store.js';
 import { SessionLens } from './session-lens.js';
+import { TeamCoordinator } from './team.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -70,7 +72,11 @@ export function createApp(config = {}) {
   const extras = createExtrasStore(() => globalDbCache.get());
   try { const n = extras.seedFromWorkspaces(getWorkspaces()); if (n) console.log(`[extras] seeded ${n} project style(s) from workspaces.json`); }
   catch (e) { console.error('[extras] style seed failed:', e.message); }
-  gatewayClient.lens = new SessionLens({ broadcast, request: (m, p, t) => gatewayClient.request(m, p, t), extras });
+  const gwRequest = (m, p, t) => gatewayClient.request(m, p, t);
+  // Team chats: several agents in one thread (server/team.js).
+  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, broadcast, titler: createTitler(config.llm) });
+  gatewayClient.onEvent = msg => team.onGatewayEvent(msg);
+  gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
 
   // A session's working root, for relative file links (gateway resolveSessionWorkspaceRoots:
   // spawnedCwd before sessionRoot). Cached briefly; null when the gateway can't say.
@@ -216,6 +222,50 @@ export function createApp(config = {}) {
         return send(res, 200, { ok: true });
       }
 
+      // Team chats (server/team.js; EXTRAS.md). Room keys contain ':' and are URL-encoded.
+      if (method === 'GET' && urlPath === '/api/team') return send(res, 200, { rooms: team.rooms() });
+      if (method === 'POST' && urlPath === '/api/team') {
+        const body = await parseBody(req);
+        try { return send(res, 200, { room: await team.createRoom(body) }); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'GET /api/team/:room'))) {
+        const room = team.room(p.room);
+        return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+      }
+      if ((p = matchRoute(method, urlPath, 'PATCH /api/team/:room'))) {
+        const room = team.setDiscuss(p.room, (await parseBody(req)).discuss);
+        return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/agents'))) {
+        const { agentId } = await parseBody(req);
+        if (typeof agentId !== 'string' || !agentId) return sendError(res, 400, 'agentId is required');
+        try {
+          const room = await team.addAgent(p.room, agentId);
+          return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+        } catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'DELETE /api/team/:room/agents/:agentId'))) {
+        try {
+          const room = team.removeAgent(p.room, p.agentId);
+          return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+        } catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/send'))) {
+        try { return send(res, 200, await team.send(p.room, await parseBody(req))); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/unconvert'))) {
+        try {
+          const sourceKey = await team.unconvert(p.room);
+          return sourceKey ? send(res, 200, { sourceKey }) : sendError(res, 404, 'Not a team chat');
+        } catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/stop'))) {
+        await team.stop(p.room);
+        return send(res, 200, { ok: true });
+      }
+
 
       sendError(res, 404, `Not found: ${method} ${urlPath}`);
     } catch (err) {
@@ -269,6 +319,7 @@ export function createApp(config = {}) {
     shutdown: closeAll,
     gatewayClient,
     extras,
+    team,
     setupBrowserWs,
     debugLogger,
     dataDir: DATA_DIR,
