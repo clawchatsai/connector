@@ -53,6 +53,7 @@ interface AuthSession {
   failCount: number;
   createdAt: number;
   timeoutHandle: ReturnType<typeof setTimeout>;
+  dc: DataChannelSend;
 }
 
 // ---------------------------------------------------------------------------
@@ -62,11 +63,26 @@ interface AuthSession {
 /** Tracks per-connection auth state */
 const authSessions = new Map<string, AuthSession>();
 
+/**
+ * Connections that completed auth. This is the only thing that grants access:
+ * a connection whose auth session was dropped (timeout, rate limit, eviction)
+ * is NOT authenticated, it is blocked until it reconnects.
+ */
+const authenticatedConnections = new Set<string>();
+
 /** Rate limiting: connectionIds blocked after too many failures */
 const blockedConnections = new Map<string, number>(); // connectionId → unblock timestamp
 
 /** TOTP replay prevention */
 let lastUsedTotpStep = 0;
+
+/**
+ * Gateway-wide auth-full lockout. Per-connection limits alone reset on every
+ * reconnect, so failures are also counted across all connections.
+ */
+let globalFailCount = 0;
+let globalLockoutCount = 0;
+let globalLockedUntil = 0;
 
 /** Max nonces to prevent memory leaks from connection storms */
 const MAX_PENDING_NONCES = 10;
@@ -74,6 +90,9 @@ const MAX_PENDING_NONCES = 10;
 const AUTH_TIMEOUT_MS = 60_000; // 60s — enough time to open authenticator app and enter code
 const MAX_FAILURES = 5;
 const BLOCK_DURATION_MS = 60_000;
+const GLOBAL_MAX_FAILURES = 5;
+const GLOBAL_LOCKOUT_BASE_MS = 60_000; // doubles per consecutive lockout
+const GLOBAL_LOCKOUT_MAX_MS = 60 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -115,6 +134,8 @@ export function initAuth(
       const old = authSessions.get(oldestKey)!;
       clearTimeout(old.timeoutHandle);
       authSessions.delete(oldestKey);
+      // Tell the evicted client so it reconnects instead of hanging
+      old.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'auth_timeout' }));
     }
   }
 
@@ -138,6 +159,7 @@ export function initAuth(
     failCount: 0,
     createdAt: Date.now(),
     timeoutHandle,
+    dc,
   });
 
   dc.send(JSON.stringify({
@@ -162,18 +184,16 @@ export async function handleAuthMessage(
   msg: Record<string, unknown>,
   config: AuthConfig,
 ): Promise<'authenticated' | 'pending' | 'pass' | 'blocked'> {
-  const session = authSessions.get(connectionId);
-
-  // No auth session = already authenticated or unknown connection
-  if (!session) {
+  if (authenticatedConnections.has(connectionId)) {
     return 'pass';
   }
 
-  // Already authenticated (shouldn't happen, but be safe)
-  if (session.state === 'authenticated') {
-    clearTimeout(session.timeoutHandle);
-    authSessions.delete(connectionId);
-    return 'pass';
+  const session = authSessions.get(connectionId);
+
+  // No auth session and never authenticated: the session was dropped (timeout,
+  // rate limit, eviction) or never started. Block; the client must reconnect.
+  if (!session || session.state !== 'awaiting-auth') {
+    return 'blocked';
   }
 
   // Only accept auth messages pre-auth
@@ -215,17 +235,25 @@ export async function handleAuthMessage(
     const sessionDays = msg['sessionDays'] as number || 7;
     const msgNonce = msg['nonce'] as string;
 
+    // Gateway-wide lockout: refuse without checking anything, so no guess is tested
+    if (Date.now() < globalLockedUntil) {
+      dc.send(JSON.stringify({ type: 'auth-failed', reason: 'rate_limited' }));
+      return 'pending';
+    }
+
     // Verify nonce
     if (msgNonce !== session.nonce) {
       return sendFailure(dc, connectionId, 'nonce_mismatch');
     }
 
-    // Verify Google ID token (skipped when not configured or in dev mode)
+    // Google ID token check. The frontend sends 'signaling-verified' on purpose
+    // (bd29058): login.clawchats.ai already did Google sign-in, so TOTP is the
+    // connector-side factor and the gateway-wide lockout above protects it.
     const skipGoogle = !config.google.clientId || config.google.clientId === 'dev-placeholder'
       || idToken === 'signaling-verified'
       || (config.devMode && idToken === 'dev-mode-no-google');
     if (skipGoogle) {
-      console.log('[Auth] Skipping Google ID token verification (not configured)');
+      console.log('[Auth] Skipping Google ID token verification (TOTP-only auth)');
     } else {
       try {
         await verifyGoogleIdToken(idToken, {
@@ -264,9 +292,13 @@ export async function handleAuthMessage(
         config.backupCodeHashes!.splice(backupIndex, 1);
         // Caller should persist the updated config
       } else {
+        recordGlobalFailure();
         return sendFailure(dc, connectionId, 'invalid_totp');
       }
     }
+
+    globalFailCount = 0;
+    globalLockoutCount = 0;
 
     // Issue session token
     const sessionToken = issueSessionToken(
@@ -282,6 +314,7 @@ export async function handleAuthMessage(
 
     clearTimeout(session.timeoutHandle);
     authSessions.delete(connectionId);
+    authenticatedConnections.add(connectionId);
 
     dc.send(JSON.stringify({
       type: 'auth-ok',
@@ -304,13 +337,14 @@ export function cleanupAuth(connectionId: string): void {
     clearTimeout(session.timeoutHandle);
     authSessions.delete(connectionId);
   }
+  authenticatedConnections.delete(connectionId);
 }
 
 /**
- * Check if a connection is authenticated (no longer in auth sessions).
+ * Check if a connection completed auth.
  */
 export function isAuthenticated(connectionId: string): boolean {
-  return !authSessions.has(connectionId);
+  return authenticatedConnections.has(connectionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +360,22 @@ function authSuccess(
     clearTimeout(session.timeoutHandle);
     authSessions.delete(connectionId);
   }
+  authenticatedConnections.add(connectionId);
   dc.send(JSON.stringify({ type: 'auth-ok' }));
   return 'authenticated';
+}
+
+function recordGlobalFailure(): void {
+  globalFailCount++;
+  if (globalFailCount < GLOBAL_MAX_FAILURES) return;
+  const duration = Math.min(
+    GLOBAL_LOCKOUT_BASE_MS * 2 ** globalLockoutCount,
+    GLOBAL_LOCKOUT_MAX_MS,
+  );
+  globalLockedUntil = Date.now() + duration;
+  globalLockoutCount++;
+  globalFailCount = 0;
+  console.warn(`[Auth] ${GLOBAL_MAX_FAILURES} failed TOTP attempts — full auth locked for ${duration / 1000}s`);
 }
 
 function sendFailure(
