@@ -21,7 +21,7 @@ import { SignalingClient } from './signaling-client.js';
 // Lazy-imported after ensureNativeModules() builds the native binary.
 // Top-level import would crash because node-datachannel .node file doesn't exist yet
 // when OpenClaw installs with --ignore-scripts.
-import type { DataChannelLike } from './webrtc-peer.js';
+import type { DataChannelLike, PeerChannelInfo } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
 
@@ -67,6 +67,13 @@ interface AppInstance {
     handleClientDisconnect: (ws: unknown) => void;
   };
   dataDir: string;
+  /** Gateway sharing (server/peer/sharing.js); null when the host gave no peer transport. */
+  sharing: {
+    setShares: (shares: unknown[]) => void;
+    onShareRevoked: (shareId: string) => void;
+    servePeer: (o: { dc: DataChannelLike; dtls: { local: string; remote: string }; shareId: string; requesterGatewayId: string }) => unknown;
+  } | null;
+  peerKey: { publicKey: string; fingerprint: string };
 }
 
 /**
@@ -122,6 +129,31 @@ let signaling: SignalingClient | null = null;
 let webrtcPeer: WebRTCPeerManagerType | null = null;
 let healthServer: http.Server | null = null;
 let _stopRequested = false;
+
+// Gateway sharing: links this gateway is opening to another gateway (it offers), by share.
+const PEER_OPEN_TIMEOUT_MS = 30_000;
+const peerOpens = new Map<string, { resolve: (v: { dc: DataChannelLike; dtls: { local: string; remote: string } }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout>; connectionId?: string }>();
+
+/** Open a peer DataChannel to the owner gateway of a share (through the signal server). */
+function openPeerLink(shareId: string): Promise<{ dc: DataChannelLike; dtls: { local: string; remote: string } }> {
+  if (!signaling?.isConnected) return Promise.reject(new Error('Not connected to ClawChats'));
+  const prev = peerOpens.get(shareId);
+  if (prev) prev.reject(new Error('superseded'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { peerOpens.delete(shareId); reject(new Error("Couldn't reach their gateway")); }, PEER_OPEN_TIMEOUT_MS);
+    timer.unref?.();
+    peerOpens.set(shareId, { resolve, reject, timer });
+    signaling!.send({ type: 'peer-connect-request', shareId });
+  });
+}
+
+function settlePeerOpen(shareId: string, outcome: { dc: DataChannelLike; dtls: { local: string; remote: string } } | Error): void {
+  const p = peerOpens.get(shareId);
+  if (!p) return;
+  peerOpens.delete(shareId);
+  clearTimeout(p.timer);
+  if (outcome instanceof Error) p.reject(outcome); else p.resolve(outcome);
+}
 
 // ---------------------------------------------------------------------------
 // Types for OpenClaw plugin API (minimal — these come from the plugin SDK)
@@ -359,6 +391,13 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
     gatewayToken,  // For WS auth to local OpenClaw gateway
     llm:           api.runtime?.llm, // host-run completions (chat-title fallback, /api/title)
+    // Gateway sharing: the server side signs grants and runs guest turns; the host provides the
+    // signal server link and the WebRTC transport.
+    peer: {
+      gatewayId: () => loadConfig()?.gatewayId || '',
+      signal: (msg: Record<string, unknown>) => signaling?.send(msg),
+      openPeer: (shareId: string) => openPeerLink(shareId),
+    },
     openaiApiKey:  (() => {
       // Resolve OpenAI API key: openclaw config → env var
       try {
@@ -393,7 +432,16 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   signaling = new SignalingClient(config.serverUrl, config.userId, config.apiKey, {
     gatewayId: config.gatewayId,
     hostname: _hostname,
+    peerPubKey: app.peerKey?.publicKey,
   });
+
+  // Gateway sharing: share list and revocations from the signal server
+  signaling.on('share-list', (shares: unknown[]) => app?.sharing?.setShares(shares));
+  signaling.on('share-revoked', ({ shareId, connectionId }: { shareId: string; connectionId: string }) => {
+    app?.sharing?.onShareRevoked(shareId);
+    if (connectionId) webrtcPeer?.closePeer(connectionId);
+  });
+  signaling.on('share-grant-rejected', (shareId: string) => ctx.logger.warn(`[sharing] signal server rejected the grant for ${shareId}`));
 
   signaling.on('connected', () => {
     ctx.logger.info('Connected to signaling server');
@@ -418,6 +466,32 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     ctx.logger.info(`Browser connected via DataChannel: ${connectionId}`);
     setupDataChannelHandler(dc, connectionId, ctx);
     signaling?.reportConnectionCount(webrtcPeer?.activeCount ?? 0);
+  });
+
+  // Gateway sharing: a DataChannel with another gateway. Never on the browser path.
+  webrtcPeer.on('peer-datachannel', (dc: DataChannelLike, info: PeerChannelInfo) => {
+    if (info.role === 'owner' && info.peer) {
+      ctx.logger.info(`[sharing] peer link from ${info.peer.requesterGatewayId} (share ${info.peer.shareId})`);
+      app?.sharing?.servePeer({ dc, dtls: info.dtls, shareId: info.peer.shareId, requesterGatewayId: info.peer.requesterGatewayId });
+      return;
+    }
+    for (const [shareId, p] of peerOpens) if (p.connectionId === info.connectionId) settlePeerOpen(shareId, { dc, dtls: info.dtls });
+  });
+
+  signaling.on('peer-connect-ready', async ({ shareId, connectionId, iceServers }: { shareId: string; connectionId: string; iceServers: unknown[] }) => {
+    const p = peerOpens.get(shareId);
+    if (!p || !webrtcPeer) return;
+    p.connectionId = connectionId;
+    try {
+      const offer = await webrtcPeer.createOffer(connectionId, iceServers as any[]);
+      signaling?.send({ type: 'ice-offer', connectionId, sdp: offer.sdp, candidates: offer.candidates });
+    } catch (e) { settlePeerOpen(shareId, new Error(`peer offer failed: ${(e as Error).message}`)); }
+  });
+  signaling.on('peer-connect-rejected', ({ shareId, reason }: { shareId: string; reason: string }) => {
+    settlePeerOpen(shareId, new Error(reason === 'owner_offline' ? 'Their gateway is offline' : `Peer link refused (${reason})`));
+  });
+  signaling.on('ice-answer', ({ connectionId, sdp, candidates }: { connectionId: string; sdp: string; candidates: unknown[] }) => {
+    webrtcPeer?.handleAnswer(connectionId, sdp, candidates).catch(e => ctx.logger.warn(`[sharing] answer failed: ${(e as Error).message}`));
   });
 
   webrtcPeer.on('datachannel-closed', (connectionId: string) => {
@@ -502,7 +576,8 @@ async function stopClawChats(ctx: PluginServiceContext): Promise<void> {
     connectedClients.delete(id);
   }
 
-  // 2. Close all WebRTC peer connections
+  // 2. Close all WebRTC peer connections (browsers and gateway-sharing links)
+  for (const [shareId] of peerOpens) settlePeerOpen(shareId, new Error('connector stopping'));
   webrtcPeer?.closeAll();
   webrtcPeer = null;
 

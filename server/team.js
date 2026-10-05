@@ -83,10 +83,11 @@ export class TeamCoordinator {
    * @param {(method: string, params: object, timeoutMs?: number) => Promise<any>} opts.request  gateway RPC
    * @param {(data: string) => void} opts.broadcast  frame to all browsers
    */
-  constructor({ store, request, broadcast, titler = null, logger = console }) {
+  constructor({ store, request, broadcast, titler = null, remote = null, logger = console }) {
     this.store = store;
     this.request = request;
     this.broadcast = broadcast;
+    this.remote = remote; // other people's agents (peer/sharing.js): remoteAgents(), turn(), abort()
     this.titler = titler; // main-model title fallback (controllers/title.js createTitler)
     this.log = logger;
     this._workKeys = null;     // cached Set of working session keys
@@ -133,13 +134,21 @@ export class TeamCoordinator {
 
   // ── Agents ─────────────────────────────────────────────────────────
 
+  /** This gateway's agents, plus agents shared with it ("Jarvis · Kamil", ids `peer:<share>:<agent>`). */
   async agents() {
-    if (this._agents && Date.now() - this._agents.at < AGENTS_TTL_MS) return this._agents.list;
-    const res = await this.request('agents.list', {});
-    const list = (res?.agents || []).map(a => ({ agentId: a.id, name: a.identity?.name || a.name || a.id }));
-    this._agents = { at: Date.now(), list };
-    return list;
+    if (!this._agents || Date.now() - this._agents.at >= AGENTS_TTL_MS) {
+      const res = await this.request('agents.list', {});
+      this._agents = { at: Date.now(), list: (res?.agents || []).map(a => ({ agentId: a.id, name: a.identity?.name || a.name || a.id })) };
+    }
+    return [...this._agents.list, ...this._remoteAgents()];
   }
+
+  _remoteAgents() {
+    try { return (this.remote?.remoteAgents() || []).map(a => ({ agentId: a.agentId, name: a.name, remote: true, ownerName: a.ownerName })); }
+    catch { return []; }
+  }
+
+  static isRemote(agentId) { return String(agentId || '').startsWith('peer:'); }
 
   async _named(agentIds) {
     const all = await this.agents();
@@ -164,7 +173,12 @@ export class TeamCoordinator {
       discuss: r.discuss,
       sourceKey: r.sourceKey,
       createdAt: r.createdAt,
-      agents: r.members.map(m => ({ agentId: m.agentId, workKey: m.workKey })),
+      agents: r.members.map(m => {
+        if (!TeamCoordinator.isRemote(m.agentId)) return { agentId: m.agentId, workKey: m.workKey };
+        const a = this._remoteAgents().find(x => x.agentId === m.agentId);
+        // A share that ended keeps its member, shown as unavailable.
+        return { agentId: m.agentId, workKey: null, remote: true, name: a?.name || null, ownerName: a?.ownerName || null, available: !!a };
+      }),
       running: live ? [...live.running.keys()] : [],
       queued: live?.queued || 0,
     };
@@ -294,8 +308,9 @@ export class TeamCoordinator {
     const live = this._rooms.get(roomKey);
     if (!live) return;
     live.gen++;
-    await Promise.all([...live.running.values()].map(r =>
-      this.request('chat.abort', { sessionKey: r.workKey, runId: r.runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`))));
+    await Promise.all([...live.running.entries()].map(([agentId, r]) => r.remote
+      ? this.remote?.abort(agentId, r.runId).catch(e => this.log.warn?.(`[team] remote abort: ${e.message}`))
+      : this.request('chat.abort', { sessionKey: r.workKey, runId: r.runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`))));
     this._status(roomKey);
   }
 
@@ -345,6 +360,7 @@ export class TeamCoordinator {
     const fresh = history.filter(e => e.ts > member.seenAt && authors[e.id]?.agentId !== agentId);
     if (!fresh.length) return null;
 
+    if (TeamCoordinator.isRemote(agentId)) return this._remoteTurn(roomKey, self, fresh, agents, mode, stopped);
     const workKey = member.workKey || await this._createWorkSession(roomKey, self);
     const message = this._prompt(self, agents, fresh, mode);
     const runId = `team-${crypto.randomUUID()}`;
@@ -383,6 +399,45 @@ export class TeamCoordinator {
     await this._post(roomKey, self, text);
     // A reply that finished after Stop is still posted (the agent said it), but starts no new round.
     return { agentId, text: stopped() ? null : text };
+  }
+
+  /**
+   * A turn of someone else's agent: runs on their gateway over the peer link (peer/sharing.js).
+   * Streamed text reaches the browser as `team-remote-delta` (there's no local working session).
+   */
+  async _remoteTurn(roomKey, self, fresh, agents, mode, stopped) {
+    if (!this.remote) throw new Error('sharing is not available');
+    const agentId = self.agentId;
+    const runId = `team-${crypto.randomUUID()}`;
+    const live = this._live(roomKey);
+    const delta = (text, done = false) => this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-remote-delta', roomKey, agentId, runId, text, ...(done ? { done: true } : {}) }));
+    live.running.set(agentId, { remote: true, runId });
+    this._status(roomKey);
+    let result, partial = '';
+    try {
+      this.store.setSeenAt(roomKey, agentId, Math.max(...fresh.map(e => e.ts)));
+      result = await this.remote.turn(agentId, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode) },
+        { onDelta: text => { partial = text; delta(text); } });
+    } catch (e) {
+      throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
+    } finally {
+      live.running.delete(agentId);
+      delta('', true);
+      this._status(roomKey);
+    }
+    const text = String(result?.text || '').trim();
+    if (result?.state === 'aborted') {
+      if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`);
+      return { agentId, text: null };
+    }
+    if (!text || SILENT.test(text)) return { agentId, text: null };
+    await this._post(roomKey, self, text);
+    return { agentId, text: stopped() ? null : text };
+  }
+
+  async _roomTitle(roomKey) {
+    const s = (await this.request('sessions.describe', { key: roomKey }, 5000).catch(() => null))?.session;
+    return s?.label || s?.derivedTitle || 'team chat';
   }
 
   /**

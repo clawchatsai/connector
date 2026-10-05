@@ -21,6 +21,8 @@ import { createExtrasStore } from './store/extras-store.js';
 import { createTeamStore } from './store/team-store.js';
 import { SessionLens } from './session-lens.js';
 import { TeamCoordinator } from './team.js';
+import { SharingManager } from './peer/sharing.js';
+import { loadOrCreatePeerKey } from './peer/keys.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -45,7 +47,7 @@ export function createApp(config = {}) {
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  function closeAll() { gatewayClient?.close(); globalDbCache.close?.(); }
+  function closeAll() { sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -75,9 +77,16 @@ export function createApp(config = {}) {
   try { const n = extras.seedFromWorkspaces(getWorkspaces()); if (n) console.log(`[extras] seeded ${n} project style(s) from workspaces.json`); }
   catch (e) { console.error('[extras] style seed failed:', e.message); }
   const gwRequest = (m, p, t) => gatewayClient.request(m, p, t);
+  // Gateway sharing (server/peer/): other people's agents in team chats, and ours in theirs. The
+  // plugin host (src/index.ts) supplies the signal server link and the peer transport (config.peer).
+  const peerKey = loadOrCreatePeerKey(DATA_DIR);
+  const sharing = config.peer ? new SharingManager({
+    getDb: () => globalDbCache.get(), request: gwRequest, key: peerKey, broadcast,
+    gatewayId: config.peer.gatewayId, signal: config.peer.signal, openPeer: config.peer.openPeer,
+  }) : null;
   // Team chats: several agents in one thread (server/team.js).
-  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, broadcast, titler: createTitler(config.llm) });
-  gatewayClient.onEvent = msg => team.onGatewayEvent(msg);
+  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, broadcast, titler: createTitler(config.llm), remote: sharing });
+  gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
 
   // A session's working root, for relative file links (gateway resolveSessionWorkspaceRoots:
@@ -230,6 +239,22 @@ export function createApp(config = {}) {
         return send(res, 200, { ok: true });
       }
 
+      // Gateway sharing (server/peer/sharing.js). Approve/revoke happen here, behind this gateway's TOTP.
+      if (method === 'GET' && urlPath === '/api/sharing') {
+        if (!sharing) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
+        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents() });
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        try { return send(res, 200, { grant: sharing.approve(p.id, await parseBody(req)) }); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/revoke'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        sharing.revoke(p.id);
+        return send(res, 200, { ok: true });
+      }
+
       // Team chats (server/team.js; EXTRAS.md). Room keys contain ':' and are URL-encoded.
       if (method === 'GET' && urlPath === '/api/team') return send(res, 200, { rooms: team.rooms() });
       if (method === 'POST' && urlPath === '/api/team') {
@@ -328,6 +353,8 @@ export function createApp(config = {}) {
     gatewayClient,
     extras,
     team,
+    sharing,
+    peerKey,
     setupBrowserWs,
     debugLogger,
     dataDir: DATA_DIR,

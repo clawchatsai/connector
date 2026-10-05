@@ -23,6 +23,22 @@ export interface IceOffer {
   connectionId: string;
   sdp: string;
   candidates: unknown[];
+  /** Set when another gateway is the offerer (gateway sharing). */
+  peer?: { shareId: string; requesterGatewayId: string };
+}
+
+/** Gateway sharing: a DataChannel to another gateway, with the DTLS fingerprints each side signs. */
+export interface PeerChannelInfo {
+  connectionId: string;
+  role: 'owner' | 'requester';
+  peer?: { shareId: string; requesterGatewayId: string };
+  dtls: { local: string; remote: string };
+}
+
+/** sha-256 DTLS fingerprint from an SDP ("" when absent). */
+function sdpFingerprint(sdp: string | undefined): string {
+  const m = /^a=fingerprint:sha-256\s+([0-9A-Fa-f:]+)\s*$/m.exec(String(sdp || ''));
+  return m ? m[1].toUpperCase() : '';
 }
 
 export interface IceServers {
@@ -94,6 +110,8 @@ export class WebRTCPeerManager extends EventEmitter {
   private pendingIceServers: Map<string, any[]> = new Map();
   private peerConnections: Map<string, any> = new Map();
   private activeChannels: Map<string, DataChannelLike> = new Map();
+  /** Gateway-sharing connections: never handed to the browser path, not counted as devices. */
+  private peerInfo: Map<string, PeerChannelInfo> = new Map();
 
   constructor() {
     super();
@@ -144,6 +162,8 @@ export class WebRTCPeerManager extends EventEmitter {
     const pc = new RTCPeerConnection({ iceServers: normalized } as any);
     this.peerConnections.set(connectionId, pc);
 
+    if (offer.peer) this.peerInfo.set(connectionId, { connectionId, role: 'owner', peer: offer.peer, dtls: { local: '', remote: sdpFingerprint(sdp) } });
+
     // W3C-standard ondatachannel
     pc.ondatachannel = (event: any) => {
       const channel = event.channel;
@@ -178,6 +198,8 @@ export class WebRTCPeerManager extends EventEmitter {
     // Create and set local answer
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    const info = this.peerInfo.get(connectionId);
+    if (info) info.dtls.local = sdpFingerprint(pc.localDescription?.sdp || answer.sdp);
 
     console.log(`[WebRTCPeerManager] Answer created for connection ${connectionId}`);
 
@@ -186,6 +208,44 @@ export class WebRTCPeerManager extends EventEmitter {
       sdp: answer.sdp!,
       candidates: [],
     };
+  }
+
+  /**
+   * Gateway sharing: open a connection to another gateway (this side offers). The DataChannel is
+   * emitted as 'peer-datachannel' once open, after handleAnswer() has applied the other side's answer.
+   */
+  async createOffer(connectionId: string, iceServers: any[]): Promise<{ sdp: string; candidates: unknown[] }> {
+    const normalized = (iceServers?.length ? iceServers : [{ urls: 'stun:stun.l.google.com:19302' }]).flatMap((s: any) => {
+      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+      return urls.map((url: string) => ({ urls: url, ...(s.username && { username: s.username }), ...(s.credential && { credential: s.credential }) }));
+    });
+    const pc = new RTCPeerConnection({ iceServers: normalized } as any);
+    this.peerConnections.set(connectionId, pc);
+    pc.onicecandidate = (event: any) => {
+      if (event.candidate) this.emit('ice-candidate-local', { connectionId, candidate: event.candidate.toJSON ? event.candidate.toJSON() : event.candidate });
+    };
+    const dc = (pc as any).createDataChannel('clawchats-peer');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    this.peerInfo.set(connectionId, { connectionId, role: 'requester', dtls: { local: sdpFingerprint(pc.localDescription?.sdp || offer.sdp), remote: '' } });
+    dc.onopen = () => this._handleDataChannel(dc, connectionId);
+    return { sdp: pc.localDescription?.sdp || offer.sdp!, candidates: [] };
+  }
+
+  /** Gateway sharing: the other gateway's answer to createOffer(). */
+  async handleAnswer(connectionId: string, sdp: string, candidates: unknown[]): Promise<void> {
+    const pc = this.peerConnections.get(connectionId);
+    const info = this.peerInfo.get(connectionId);
+    if (!pc || info?.role !== 'requester') return;
+    info.dtls.remote = sdpFingerprint(sdp);
+    await pc.setRemoteDescription(new RTCSessionDescription({ sdp, type: 'answer' } as any));
+    for (const c of candidates || []) { try { await pc.addIceCandidate(new RTCIceCandidate(c as any)); } catch { /* ignore */ } }
+  }
+
+  /** Close a gateway-sharing connection (e.g. the share was revoked). */
+  closePeer(connectionId: string): void {
+    this.activeChannels.get(connectionId)?.close();
+    try { this.peerConnections.get(connectionId)?.close(); } catch { /* gone */ }
   }
 
   handleIceCandidate(connectionId: string, candidate: unknown): void {
@@ -220,10 +280,14 @@ export class WebRTCPeerManager extends EventEmitter {
     }
     this.peerConnections.clear();
     this.pendingIceServers.clear();
+    this.peerInfo.clear();
   }
 
+  /** Browser connections (gateway-sharing links aren't devices). */
   get activeCount(): number {
-    return this.activeChannels.size;
+    let n = 0;
+    for (const id of this.activeChannels.keys()) if (!this.peerInfo.has(id)) n++;
+    return n;
   }
 
   private _handleDataChannel(dc: any, connectionId: string): void {
@@ -244,9 +308,13 @@ export class WebRTCPeerManager extends EventEmitter {
         this.peerConnections.delete(connectionId);
       }
 
-      this.emit('datachannel-closed', connectionId);
+      const info = this.peerInfo.get(connectionId);
+      this.peerInfo.delete(connectionId);
+      this.emit(info ? 'peer-datachannel-closed' : 'datachannel-closed', connectionId);
     });
 
-    this.emit('datachannel', channel, connectionId);
+    const info = this.peerInfo.get(connectionId);
+    if (info) this.emit('peer-datachannel', channel, info);
+    else this.emit('datachannel', channel, connectionId);
   }
 }

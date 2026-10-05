@@ -25,6 +25,8 @@ interface IceOffer {
   connectionId: string;
   sdp: string;
   candidates: unknown[];
+  /** Set when the offer comes from another gateway (gateway sharing), not a browser. */
+  peer?: { shareId: string; requesterGatewayId: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,8 @@ export class SignalingClient extends EventEmitter {
   private readonly apiKey: string;
   private readonly gatewayId?: string;
   private readonly hostname?: string;
+  /** This connector's Ed25519 public key for gateway sharing (base64 SPKI). */
+  private readonly peerPubKey?: string;
 
   private ws: WebSocket | null = null;
 
@@ -72,13 +76,14 @@ export class SignalingClient extends EventEmitter {
   /** Timer handle for ping-timeout watchdog. */
   private pingWatchdog: ReturnType<typeof setTimeout> | null = null;
 
-  constructor(serverUrl: string, userId: string, apiKey: string, opts?: { gatewayId?: string; hostname?: string }) {
+  constructor(serverUrl: string, userId: string, apiKey: string, opts?: { gatewayId?: string; hostname?: string; peerPubKey?: string }) {
     super();
     this.serverUrl = serverUrl;
     this.userId = userId;
     this.apiKey = apiKey;
     this.gatewayId = opts?.gatewayId;
     this.hostname = opts?.hostname;
+    this.peerPubKey = opts?.peerPubKey;
   }
 
   // -------------------------------------------------------------------------
@@ -138,6 +143,11 @@ export class SignalingClient extends EventEmitter {
     this._send({ type: 'ice-candidate', connectionId, candidate });
   }
 
+  /** Gateway sharing messages (share-grant, share-revoke, peer-connect-request, ice-offer to a peer). */
+  send(payload: Record<string, unknown>): void {
+    this._send(payload);
+  }
+
   // -------------------------------------------------------------------------
   // Internal — socket lifecycle
   // -------------------------------------------------------------------------
@@ -171,6 +181,7 @@ export class SignalingClient extends EventEmitter {
           pluginVersion: PLUGIN_VERSION,
           ...(this.gatewayId ? { gatewayId: this.gatewayId } : {}),
           ...(this.hostname ? { hostname: this.hostname } : {}),
+          ...(this.peerPubKey ? { peerPubKey: this.peerPubKey } : {}),
         });
 
         // Resolve the connect() promise: the socket is open and auth is in flight
@@ -257,10 +268,32 @@ export class SignalingClient extends EventEmitter {
           connectionId: (msg['connectionId'] as string) ?? '',
           sdp: (msg['sdp'] as string) ?? '',
           candidates: (msg['candidates'] as unknown[]) ?? [],
+          ...(msg['peer'] ? { peer: msg['peer'] as IceOffer['peer'] } : {}),
         };
         this.emit('ice-offer', offer);
         break;
       }
+
+      // ── Gateway sharing (signal server sharing.js) ──
+      case 'share-list':
+        this.emit('share-list', (msg['shares'] as unknown[]) ?? []);
+        break;
+      case 'share-revoked':
+        this.emit('share-revoked', { shareId: msg['shareId'] as string, connectionId: msg['connectionId'] as string });
+        break;
+      case 'share-grant-rejected':
+        this.emit('share-grant-rejected', msg['shareId'] as string);
+        break;
+      case 'peer-connect-ready':
+        this.emit('peer-connect-ready', { shareId: msg['shareId'] as string, connectionId: msg['connectionId'] as string, iceServers: (msg['iceServers'] as unknown[]) ?? [] });
+        break;
+      case 'peer-connect-rejected':
+        this.emit('peer-connect-rejected', { shareId: msg['shareId'] as string, reason: (msg['reason'] as string) ?? 'rejected' });
+        break;
+      case 'ice-answer':
+        // Only for links this gateway opened to another gateway (it is the offerer there).
+        this.emit('ice-answer', { connectionId: msg['connectionId'] as string, sdp: (msg['sdp'] as string) ?? '', candidates: (msg['candidates'] as unknown[]) ?? [] });
+        break;
 
       case 'ice-servers': {
         // ICE server config (STUN/TURN) arrives before the offer for a connection.

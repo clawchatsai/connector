@@ -8,7 +8,7 @@ import { SessionLens } from './session-lens.js';
 const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'Dev' } }, { id: 'atlas', identity: { name: 'Atlas' } }];
 
 /** Fake gateway. `reply(agentId, prompt)` returns the agent's reply text, null (abort) or a promise. */
-function harness(reply, { preparedTitle = 'Team title', titler = null } = {}) {
+function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null } = {}) {
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
   let clock = 1_000, seq = 0;
@@ -52,7 +52,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null } = {}) {
     }
   };
   const db = new Database(':memory:');
-  team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {} } });
+  team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, remote, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {} } });
   const room = key => (sessions.get(key) || []).map(m => m.content[0].text);
   const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r)); for (const c of team._chains.values()) await c; };
   return { team, calls, room, settle, events, sessions };
@@ -294,4 +294,53 @@ test('team_members migration adds the removed column to an existing table', () =
   const store = createTeamStore(() => db);
   assert.deepEqual(store.listRooms(), []);
   assert.ok(db.prepare('PRAGMA table_info(team_members)').all().some(c => c.name === 'removed'));
+});
+
+test('shared (remote) agents: in the roster, turns over the peer link, streamed, stoppable, failures noted', async () => {
+  const calls = [];
+  let mode = 'ok', release;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (agentId, args, { onDelta }) => {
+      calls.push({ agentId, args });
+      onDelta('rem');
+      if (mode === 'offline') throw new Error("Couldn't reach Kamil's gateway");
+      if (mode === 'hang') { await new Promise(r => { release = r; }); return { state: 'aborted', text: 'half' }; }
+      return { state: 'final', text: 'remote hi' };
+    },
+    abort: async (agentId, turnId) => { calls.push({ abort: agentId, turnId }); release?.(); },
+  };
+  const h = harness(agent => `${agent} local`, { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  const room = h.team.room(roomKey);
+  assert.deepEqual(room.agents[1], { agentId: 'peer:sh1:jarvis', workKey: null, remote: true, name: 'Jarvis · Kamil', ownerName: 'Kamil', available: true });
+
+  await h.team.send(roomKey, { text: '@all hi', userLabel: 'H' });
+  await h.settle();
+  assert.ok(h.room(roomKey).includes('[Jarvis · Kamil]\n\nremote hi'));
+  assert.equal(calls[0].args.roomId, roomKey);
+  assert.match(calls[0].args.message, /You are Jarvis · Kamil/);
+  assert.ok(h.events.some(e => e.event === 'team-remote-delta' && e.text === 'rem'));
+  assert.ok(h.events.some(e => e.event === 'team-remote-delta' && e.done));
+  // no hidden working session is made for a remote agent
+  assert.equal(h.calls.filter(c => c.method === 'sessions.create' && /jarvis/.test(c.params.key || '')).length, 0);
+
+  mode = 'offline';
+  await h.team.send(roomKey, { text: '@jarvis·kamil ping', userLabel: 'H' });
+  await h.team.send(roomKey, { text: '@all ping', userLabel: 'H' });
+  await h.settle();
+  assert.match(h.room(roomKey).at(-1) + h.room(roomKey).at(-2), /Couldn't finish this reply: Couldn't reach Kamil's gateway/);
+
+  mode = 'hang';
+  await h.team.send(roomKey, { text: '@all long', userLabel: 'H' });
+  for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+  await h.team.stop(roomKey);
+  await h.settle();
+  assert.ok(calls.some(c => c.abort === 'peer:sh1:jarvis'));
+  assert.ok(h.room(roomKey).includes('[Jarvis · Kamil]\n\nhalf\n\n*[stopped]*'));
+
+  // A share that ended: member stays, marked unavailable; unknown remote ids are refused.
+  remote.remoteAgents = () => [];
+  assert.equal(h.team.room(roomKey).agents[1].available, false);
+  await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'peer:sh9:ghost'] }), /unknown agent/);
 });
