@@ -168,10 +168,32 @@ test('converting an existing chat keeps it as the agent working session; delete 
   assert.equal(lens.forwardsRunEvent(source), true);
   assert.equal(lens.isVisible(created.roomKey), true);
 
+  await h.team.send(created.roomKey, { text: '@dev hi', userLabel: 'H' });
+  await h.settle();
+  const devWork = h.team.room(created.roomKey).agents.find(a => a.agentId === 'dev').workKey;
   lens.sessionsChanged({ sessionKey: created.roomKey, reason: 'delete' });
   assert.equal(h.team.room(created.roomKey), null);
   assert.equal(h.team.isWorkKey(source), false);
-  assert.ok(h.calls.some(c => c.method === 'sessions.delete' && c.params.key === source));
+  assert.equal(lens.isVisible(source), true); // the user's own chat comes back
+  assert.ok(!h.calls.some(c => c.method === 'sessions.delete' && c.params.key === source)); // never deleted
+  assert.ok(h.calls.some(c => c.method === 'sessions.delete' && c.params.key === devWork));
+});
+
+test('unconvert: back to the original chat; only converted rooms', async () => {
+  const h = harness(agent => `${agent} ok`);
+  const source = 'agent:atlas:dashboard:orig';
+  h.sessions.set(source, []);
+  const { roomKey } = await h.team.createRoom({ sourceKey: source, agentIds: ['dev'] });
+  await h.team.send(roomKey, { text: '@all hi', userLabel: 'H' });
+  await h.settle();
+  const devWork = h.team.room(roomKey).agents.find(a => a.agentId === 'dev').workKey;
+  assert.equal(await h.team.unconvert(roomKey), source);
+  assert.equal(h.team.room(roomKey), null);
+  assert.equal(h.team.isWorkKey(source), false);
+  const deleted = h.calls.filter(c => c.method === 'sessions.delete').map(c => c.params.key);
+  assert.deepEqual(deleted.sort(), [devWork, roomKey].sort());
+  const fresh = (await h.team.createRoom({ agentIds: ['dev', 'atlas'] })).roomKey;
+  await assert.rejects(h.team.unconvert(fresh), /not converted/);
 });
 
 test('room title: gateway titler first, main-model titler when it has no utility model', async () => {

@@ -107,14 +107,7 @@ export class TeamCoordinator {
 
   /** The gateway reported a session deleted. */
   onSessionDeleted(key) {
-    if (this.store.getRoom(key)) {
-      this.stop(key);
-      const work = this.store.deleteRoom(key);
-      this._workKeysChanged();
-      for (const w of work) this.request('sessions.delete', { key: w }).catch(e => this.log.warn?.(`[team] delete ${w}: ${e.message}`));
-      this._changed();
-      return;
-    }
+    if (this.store.getRoom(key)) { this._dissolve(key); return; }
     const ws = this.store.workSession(key);
     if (ws) { this.store.setWorkKey(ws.roomKey, ws.agentId, null); this._workKeysChanged(); }
   }
@@ -213,6 +206,33 @@ export class TeamCoordinator {
     }
     this._changed();
     return this.room(roomKey);
+  }
+
+  /**
+   * Turn a converted team chat back into the chat it came from: the room and the other agents'
+   * working sessions go, the original chat stays (with what its agent saw while it was a team).
+   * Returns the original chat's key.
+   */
+  async unconvert(roomKey) {
+    const room = this.store.getRoom(roomKey);
+    if (!room) return null;
+    if (!room.sourceKey) throw new Error('this team chat was not converted from a chat');
+    this._dissolve(roomKey);
+    await this.request('sessions.delete', { key: roomKey }).catch(e => this.log.warn?.(`[team] delete room ${roomKey}: ${e.message}`));
+    return room.sourceKey;
+  }
+
+  /**
+   * Forget a room and delete its working sessions — except the chat it was converted from, which is
+   * the user's own chat and becomes a normal thread again (deleting the room must never delete it).
+   */
+  _dissolve(roomKey) {
+    const source = this.store.getRoom(roomKey)?.sourceKey;
+    this.stop(roomKey);
+    const work = this.store.deleteRoom(roomKey).filter(w => w !== source);
+    this._workKeysChanged();
+    for (const w of work) this.request('sessions.delete', { key: w }).catch(e => this.log.warn?.(`[team] delete ${w}: ${e.message}`));
+    this._changed();
   }
 
   async addAgent(roomKey, agentId) {
