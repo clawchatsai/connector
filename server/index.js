@@ -72,6 +72,21 @@ export function createApp(config = {}) {
   catch (e) { console.error('[extras] style seed failed:', e.message); }
   gatewayClient.lens = new SessionLens({ broadcast, request: (m, p, t) => gatewayClient.request(m, p, t), extras });
 
+  // A session's working root, for relative file links (gateway resolveSessionWorkspaceRoots:
+  // spawnedCwd before sessionRoot). Cached briefly; null when the gateway can't say.
+  const sessionRoots = new Map(); // key -> { root, at }
+  async function sessionRoot(key) {
+    const hit = sessionRoots.get(key);
+    if (hit && Date.now() - hit.at < 60_000) return hit.root;
+    let root = null;
+    try {
+      const s = (await gatewayClient.request('sessions.describe', { key }, 5000))?.session;
+      root = s?.spawnedCwd || s?.sessionRoot || null;
+    } catch { /* fall back to the workspace */ }
+    sessionRoots.set(key, { root, at: Date.now() });
+    return root;
+  }
+
   // Instantiate controllers
   const handleGatewayMedia = createGatewayMediaHandler({ gatewayWsUrl: gatewayUrl, gatewayToken });
 
@@ -153,7 +168,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/file') return handleServeFile(req, res, query, workspaceDir);
       if (method === 'GET' && urlPath === '/api/gw-media') return handleGatewayMedia(req, res, query);
       if (method === 'GET' && urlPath === '/api/workspace') return handleWorkspaceList(req, res, query);
-      if (method === 'GET' && urlPath === '/api/workspace/file') return handleWorkspaceFileRead(req, res, query, workspaceDir);
+      if (method === 'GET' && urlPath === '/api/workspace/file') return handleWorkspaceFileRead(req, res, query, workspaceDir, query.session ? await sessionRoot(query.session) : null);
       if (method === 'PUT' && urlPath === '/api/workspace/file') return await handleWorkspaceFileWrite(req, res, query);
       if (method === 'DELETE' && urlPath === '/api/workspace/file') return handleWorkspaceFileDelete(req, res, query);
       if (method === 'POST' && urlPath === '/api/workspace/upload') return await handleWorkspaceUpload(req, res, query);

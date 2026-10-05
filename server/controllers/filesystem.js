@@ -68,16 +68,121 @@ export function handleWorkspaceList(req, res, query) {
   send(res, 200, { files, cwd: resolved });
 }
 
+const MAX_HINTS = 40;
+const MAX_SEARCH_DIRS = 400;
+
+function isFile(p) {
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
+function exists(p) {
+  try { fs.statSync(p); return true; } catch { return false; }
+}
+
+function addMatch(matches, candidate) {
+  if (!isFile(candidate)) return;
+  try { matches.set(fs.realpathSync(candidate), candidate); } catch { /* vanished */ }
+}
+
+// True when the file sits in a git main checkout (`.git` is a folder), false in a linked
+// worktree (`.git` is a file) or outside git.
+function inMainCheckout(file) {
+  for (let dir = path.dirname(file); ; dir = path.dirname(dir)) {
+    try { return fs.statSync(path.join(dir, '.git')).isDirectory(); } catch { /* keep walking */ }
+    if (dir === path.dirname(dir)) return false;
+  }
+}
+
+// One distinct file wins; among several, a single one in a git main checkout wins (other chats'
+// worktrees carry copies of the same file). Anything else is ambiguous.
+function pickMatch(matches) {
+  const found = [...matches.values()];
+  if (found.length <= 1) return found[0] ?? null;
+  const main = found.filter(inMainCheckout);
+  return main.length === 1 ? main[0] : null;
+}
+
+// Directory children worth searching: no dot-folders, no node_modules.
+function childDirs(dir) {
+  try {
+    return fs.readdirSync(dir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules')
+      .map(e => path.join(dir, e.name));
+  } catch { return []; }
+}
+
+// The hint's folder no longer exists (typically a worktree removed after its branch merged). Search
+// two levels below the parent of its nearest surviving ancestor, kept inside HOME, for the file.
+function searchAroundGoneHint(hint, p, matches, searched) {
+  let survivor = path.dirname(hint);
+  while (!exists(survivor) && survivor !== path.dirname(survivor)) survivor = path.dirname(survivor);
+  const insideHome = d => d.startsWith(HOME + path.sep);
+  const base = insideHome(path.dirname(survivor)) ? path.dirname(survivor) : insideHome(survivor) ? survivor : null;
+  if (!base || searched.has(base)) return;
+  searched.add(base);
+  let budget = MAX_SEARCH_DIRS;
+  for (const child of childDirs(base)) {
+    if (--budget < 0) return;
+    addMatch(matches, path.join(child, p));
+    for (const grandchild of childDirs(child)) {
+      if (--budget < 0) return;
+      addMatch(matches, path.join(grandchild, p));
+    }
+  }
+}
+
+/**
+ * Where a file reference from chat points (specs/file-link-check.md in the clawchats repo).
+ * `~` is home and absolute paths stand as written. A relative path tries the session root, then
+ * the agent workspace. Failing those it tries every ancestor of each hint (absolute paths from
+ * the same turn's tool calls, e.g. a `cd` target); if none matches, hints whose folder is gone get
+ * a bounded search near where they were. Ties go to a git main checkout (pickMatch).
+ * Returns the absolute path, or null.
+ */
+export function resolveReadPath(filePath, { roots = [], hints = [] } = {}) {
+  const p = filePath.replace(/^~(?=\/|$)/, HOME);
+  if (path.isAbsolute(p)) return isFile(p) ? path.resolve(p) : null;
+  for (const root of roots) {
+    if (!root) continue;
+    const candidate = path.resolve(root, p);
+    if (isFile(candidate)) return candidate;
+  }
+  const absHints = [...new Set(hints.slice(0, MAX_HINTS)
+    .map(h => h.replace(/^~(?=\/|$)/, HOME))
+    .filter(h => path.isAbsolute(h))
+    .map(h => path.resolve(h)))];
+  const matches = new Map(); // real path -> path as found
+  const tried = new Set();
+  for (const hint of absHints) {
+    for (let dir = hint; ; dir = path.dirname(dir)) {
+      if (!tried.has(dir)) {
+        tried.add(dir);
+        addMatch(matches, path.resolve(dir, p));
+      }
+      if (dir === path.dirname(dir)) break;
+    }
+  }
+  if (matches.size) return pickMatch(matches);
+  const searched = new Set();
+  for (const hint of absHints) {
+    if (!exists(hint)) searchAroundGoneHint(hint, p, matches, searched);
+  }
+  return pickMatch(matches);
+}
+
 // Reads any file the gateway user can read (file links in chat open any path, as the agent
-// wrote it): `~` is home, relative paths resolve against the agent workspace. Writes and
-// deletes stay limited to HOME.
-export function handleWorkspaceFileRead(req, res, query, workspaceDir) {
+// wrote it); resolution in resolveReadPath. `stat=1` answers {path, size} instead of the
+// content, so a click can check a link before opening the pane. `hints` is newline-separated.
+// Writes and deletes stay limited to HOME.
+export function handleWorkspaceFileRead(req, res, query, workspaceDir, sessionRoot = null) {
   const filePath = query.path;
   if (!filePath) return sendError(res, 400, 'Missing path parameter');
-  const resolved = path.resolve(workspaceDir, filePath.replace(/^~(?=\/|$)/, HOME));
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return sendError(res, 404, 'File not found');
+  const hints = query.hints ? query.hints.split('\n').filter(Boolean) : [];
+  const resolved = resolveReadPath(filePath, { roots: [sessionRoot, workspaceDir], hints });
+  if (!resolved) return sendError(res, 404, 'File not found');
 
   const stat = fs.statSync(resolved);
+  if (query.stat) return send(res, 200, { path: resolved, size: stat.size });
   const ext = path.extname(resolved).toLowerCase().slice(1);
   const binaryMime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon', pdf: 'application/pdf', mp3: 'audio/mpeg', mp4: 'video/mp4', wav: 'audio/wav', ogg: 'audio/ogg', webm: 'video/webm' };
   const mime = binaryMime[ext];
