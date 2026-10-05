@@ -1,9 +1,32 @@
 // ExtrasStore: ClawChats-only data the gateway has no place for. Lives in the global DB.
 // Registry of what belongs here: EXTRAS.md at the repo root.
 //
-//   project_styles  color/icon per gateway session group (groups are just {name, position})
+//   project_styles  color/icon and new-chat preset per gateway session group (groups are just {name, position})
 //   thread_extras   per-session ClawChats data (Intelligence panel etc.), keyed by session key
 //   legacy_created  creation time of chats from before the gateway recorded createdAt
+
+// New-chat preset: what a new chat in the project starts with. Every field is optional;
+// a missing field means the gateway default. `cwd` and `projectId` are exclusive places.
+const PRESET_STRINGS = ['agentId', 'cwd', 'projectId', 'projectLabel', 'permissionMode', 'model', 'thinkingLevel'];
+const PERMISSION_MODES = new Set(['read-only', 'guarded', 'workspace', 'full']);
+
+export function cleanPreset(p) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return null;
+  const out = {};
+  for (const k of PRESET_STRINGS) {
+    if (typeof p[k] === 'string' && p[k].trim()) out[k] = p[k].trim().slice(0, 1000);
+  }
+  if (out.permissionMode && !PERMISSION_MODES.has(out.permissionMode)) delete out.permissionMode;
+  if (out.projectId) delete out.cwd;
+  else delete out.projectLabel;
+  if (typeof p.fastMode === 'boolean') out.fastMode = p.fastMode;
+  return Object.keys(out).length ? out : null;
+}
+
+function parsePreset(text) {
+  if (!text) return null;
+  try { return cleanPreset(JSON.parse(text)); } catch { return null; }
+}
 
 export function createExtrasStore(getGlobalDb) {
   let ready = false;
@@ -11,6 +34,7 @@ export function createExtrasStore(getGlobalDb) {
     const g = getGlobalDb();
     if (!ready) {
       g.exec(`CREATE TABLE IF NOT EXISTS project_styles (name TEXT PRIMARY KEY, color TEXT, icon TEXT, updated_at INTEGER NOT NULL)`);
+      if (!g.prepare('PRAGMA table_info(project_styles)').all().some(c => c.name === 'preset')) g.exec('ALTER TABLE project_styles ADD COLUMN preset TEXT');
       g.exec(`CREATE TABLE IF NOT EXISTS legacy_created (session_key TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS thread_extras (session_key TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (session_key, kind))`);
       ready = true;
@@ -19,19 +43,22 @@ export function createExtrasStore(getGlobalDb) {
   }
 
   return {
-    /** { [groupName]: { color, icon } } */
+    /** { [groupName]: { color, icon, preset } } */
     getProjectStyles() {
       const out = {};
-      for (const r of db().prepare('SELECT name, color, icon FROM project_styles').all()) out[r.name] = { color: r.color, icon: r.icon };
+      for (const r of db().prepare('SELECT name, color, icon, preset FROM project_styles').all()) {
+        out[r.name] = { color: r.color, icon: r.icon, preset: parsePreset(r.preset) };
+      }
       return out;
     },
 
-    /** Set color and/or icon; absent fields keep their value, null clears. */
-    setProjectStyle(name, { color, icon } = {}) {
+    /** Set color, icon and/or new-chat preset; absent fields keep their value, null clears. */
+    setProjectStyle(name, { color, icon, preset } = {}) {
       if (!name) return;
-      const cur = db().prepare('SELECT color, icon FROM project_styles WHERE name = ?').get(name) || {};
-      db().prepare('INSERT INTO project_styles (name, color, icon, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET color = excluded.color, icon = excluded.icon, updated_at = excluded.updated_at')
-        .run(name, color !== undefined ? color : (cur.color ?? null), icon !== undefined ? icon : (cur.icon ?? null), Date.now());
+      const cur = db().prepare('SELECT color, icon, preset FROM project_styles WHERE name = ?').get(name) || {};
+      const nextPreset = preset === undefined ? (cur.preset ?? null) : (cleanPreset(preset) ? JSON.stringify(cleanPreset(preset)) : null);
+      db().prepare('INSERT INTO project_styles (name, color, icon, preset, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET color = excluded.color, icon = excluded.icon, preset = excluded.preset, updated_at = excluded.updated_at')
+        .run(name, color !== undefined ? color : (cur.color ?? null), icon !== undefined ? icon : (cur.icon ?? null), nextPreset, Date.now());
     },
 
     renameProjectStyle(from, to) {

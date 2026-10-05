@@ -174,7 +174,7 @@ export function createApp(config = {}) {
       }
       if ((p = matchRoute(method, urlPath, 'PUT /api/extras/project-styles/:name'))) {
         const body = await parseBody(req);
-        extras.setProjectStyle(p.name, { color: body.color, icon: body.icon });
+        extras.setProjectStyle(p.name, { color: body.color, icon: body.icon, preset: body.preset });
         broadcast(JSON.stringify({ type: 'clawchats', event: 'project-styles-changed' }));
         return send(res, 200, { styles: extras.getProjectStyles() });
       }

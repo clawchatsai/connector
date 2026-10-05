@@ -29,7 +29,7 @@ export const ROW_FIELDS = new Set([
   'createdAt', 'updatedAt', 'lastActivityAt', 'lastInteractionAt',
   'status', 'hasActiveRun', 'activeRunIds', 'lastRunId', 'lastRunError', 'endedAt', 'agentStatus',
   'model', 'modelProvider', 'thinkingLevel', 'contextTokens', 'totalTokens', 'totalTokensFresh',
-  'inputTokens', 'outputTokens', 'permissionMode', 'contextBudgetStatus', 'fastMode', 'effectiveFastMode',
+  'inputTokens', 'outputTokens', 'permissionMode', 'workspaceDir', 'contextBudgetStatus', 'fastMode', 'effectiveFastMode',
 ]);
 
 // `sessions.changed` envelope fields (snapshot fields are spread next to these).

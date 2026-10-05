@@ -8,7 +8,7 @@ Add a row here whenever a ClawChats feature needs storage the gateway lacks.
 
 | Feature | Table | Key | Notes |
 |---|---|---|---|
-| Project color / icon | `project_styles` | group name | Gateway groups are only `{name, position}`. Renames/deletes issued by ClawChats (`sessions.groups.rename/delete`) move/drop the style (SessionLens). A rename done elsewhere leaves the style on the old name. |
+| Project color / icon / new-chat preset | `project_styles` | group name | Gateway groups are only `{name, position}`. `preset` (JSON) holds what a new chat in the project starts with: `agentId`, `cwd` or `projectId` (+ `projectLabel`), `permissionMode`, `model`, `thinkingLevel`, `fastMode`; sanitized by `cleanPreset`. Renames/deletes issued by ClawChats (`sessions.groups.rename/delete`) move/drop the style (SessionLens). A rename done elsewhere leaves the style on the old name. |
 | Per-thread extras | `thread_extras` | session key + kind | e.g. Intelligence panel versions. Dropped when the gateway reports the session deleted. |
 | Legacy creation times | `legacy_created` | session key | Filled by the one-off `ocplatform clawchats import-dates` (insert-or-ignore, safe to re-run) from the pre-gateway `<project>.db` files (`threads.created_at`), `server/store/legacy-threads.js`. The gateway has no `createdAt` for those sessions and `sessions.patch` can't set it. SessionLens fills `createdAt` on listed rows that lack it. The command can be removed once all installs have run it; the table stays. |
 | Prompt library | `prompts` | id | Unchanged. |
