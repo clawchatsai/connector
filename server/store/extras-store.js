@@ -4,6 +4,7 @@
 //   project_styles  color/icon and new-chat preset per gateway session group (groups are just {name, position})
 //   thread_extras   per-session ClawChats data (Intelligence panel etc.), keyed by session key
 //   legacy_created  creation time of chats from before the gateway recorded createdAt
+//   bookmarks       messages the user bookmarked, keyed by id; one per (session key, message id)
 
 // New-chat preset: what a new chat in the project starts with. Every field is optional;
 // a missing field means the gateway default. `cwd` and `projectId` are exclusive places.
@@ -28,6 +29,16 @@ function parsePreset(text) {
   try { return cleanPreset(JSON.parse(text)); } catch { return null; }
 }
 
+const str = (v) => typeof v === 'string' && v.trim() ? v.trim() : '';
+const clip = (v, n) => str(v).slice(0, n);
+
+function bookmarkRow(r) {
+  return {
+    id: r.id, sessionKey: r.session_key, messageId: r.message_id, role: r.role, label: r.label,
+    snippet: r.snippet, chatTitle: r.chat_title, createdAt: r.created_at, updatedAt: r.updated_at,
+  };
+}
+
 export function createExtrasStore(getGlobalDb) {
   let ready = false;
   function db() {
@@ -37,6 +48,7 @@ export function createExtrasStore(getGlobalDb) {
       if (!g.prepare('PRAGMA table_info(project_styles)').all().some(c => c.name === 'preset')) g.exec('ALTER TABLE project_styles ADD COLUMN preset TEXT');
       g.exec(`CREATE TABLE IF NOT EXISTS legacy_created (session_key TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS thread_extras (session_key TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (session_key, kind))`);
+      g.exec(`CREATE TABLE IF NOT EXISTS bookmarks (id TEXT PRIMARY KEY, session_key TEXT NOT NULL, message_id TEXT NOT NULL, role TEXT, label TEXT NOT NULL, snippet TEXT NOT NULL, chat_title TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (session_key, message_id))`);
       ready = true;
     }
     return g;
@@ -113,7 +125,36 @@ export function createExtrasStore(getGlobalDb) {
     },
 
     deleteThreadExtras(sessionKey) {
-      if (sessionKey) db().prepare('DELETE FROM thread_extras WHERE session_key = ?').run(sessionKey);
+      if (!sessionKey) return;
+      db().prepare('DELETE FROM thread_extras WHERE session_key = ?').run(sessionKey);
+      db().prepare('DELETE FROM bookmarks WHERE session_key = ?').run(sessionKey);
+    },
+
+    /** All bookmarks, newest first. */
+    listBookmarks() {
+      return db().prepare('SELECT * FROM bookmarks ORDER BY created_at DESC').all().map(bookmarkRow);
+    },
+
+    /** Bookmark a message; bookmarking it again returns the existing bookmark unchanged. */
+    addBookmark(id, { sessionKey, messageId, role, label, snippet, chatTitle } = {}) {
+      if (!id || !str(sessionKey) || !str(messageId)) return null;
+      const now = Date.now();
+      db().prepare('INSERT INTO bookmarks (id, session_key, message_id, role, label, snippet, chat_title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(session_key, message_id) DO NOTHING')
+        .run(id, sessionKey, messageId, role === 'user' ? 'user' : 'assistant', clip(label, 200) || 'Bookmark', clip(snippet, 600), clip(chatTitle, 200) || null, now, now);
+      return bookmarkRow(db().prepare('SELECT * FROM bookmarks WHERE session_key = ? AND message_id = ?').get(sessionKey, messageId));
+    },
+
+    /** Rename; returns the updated bookmark, or null if it doesn't exist. */
+    renameBookmark(id, label) {
+      const l = clip(label, 200);
+      if (!l) return null;
+      db().prepare('UPDATE bookmarks SET label = ?, updated_at = ? WHERE id = ?').run(l, Date.now(), id);
+      const r = db().prepare('SELECT * FROM bookmarks WHERE id = ?').get(id);
+      return r ? bookmarkRow(r) : null;
+    },
+
+    deleteBookmark(id) {
+      return db().prepare('DELETE FROM bookmarks WHERE id = ?').run(id).changes > 0;
     },
   };
 }
