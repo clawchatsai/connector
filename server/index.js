@@ -23,6 +23,7 @@ import { SessionLens } from './session-lens.js';
 import { TeamCoordinator } from './team.js';
 import { SharingManager } from './peer/sharing.js';
 import { loadOrCreatePeerKey } from './peer/keys.js';
+import { createGuestAgent } from './peer/guest-agent.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -247,6 +248,13 @@ export function createApp(config = {}) {
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
         try { return send(res, 200, { grant: sharing.approve(p.id, await parseBody(req)) }); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      if (method === 'POST' && urlPath === '/api/sharing/guest-agent') {
+        // Owner asks for a guest version of one of its agents (peer/guest-agent.js); changes this gateway's config.
+        const { agentId } = await parseBody(req);
+        if (typeof agentId !== 'string' || !agentId) return sendError(res, 400, 'agentId is required');
+        try { return send(res, 200, await createGuestAgent(gwRequest, agentId)); }
         catch (e) { return sendError(res, 400, e.message); }
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/revoke'))) {
