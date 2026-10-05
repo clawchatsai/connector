@@ -602,11 +602,9 @@ function setupDataChannelHandler(
           return;
 
         case 'pass':
-          // Already authenticated — process message normally.
-          // Note: if auth_timeout deleted the session but DC is still open,
-          // we get 'pass' for a potentially un-authed connection. This is
-          // acceptable because auth_timeout now triggers a P2P reconnect
-          // (Fix 4), which re-establishes the full auth flow.
+          // Completed auth on this connection — process message normally.
+          // A connection whose auth timed out or was rate-limited gets
+          // 'blocked', never 'pass'; the client reconnects (Fix 4).
           break;
       }
 
