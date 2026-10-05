@@ -183,6 +183,23 @@ export function createApp(config = {}) {
         broadcast(JSON.stringify({ type: 'clawchats', event: 'project-styles-changed' }));
         return send(res, 200, { ok: true });
       }
+      if (method === 'GET' && urlPath === '/api/extras/bookmarks') return send(res, 200, { bookmarks: extras.listBookmarks() });
+      if (method === 'POST' && urlPath === '/api/extras/bookmarks') {
+        const bookmark = extras.addBookmark(uuid(), await parseBody(req));
+        if (!bookmark) return sendError(res, 400, 'sessionKey and messageId are required');
+        broadcast(JSON.stringify({ type: 'clawchats', event: 'bookmarks-changed' }));
+        return send(res, 200, { bookmark });
+      }
+      if ((p = matchRoute(method, urlPath, 'PATCH /api/extras/bookmarks/:id'))) {
+        const bookmark = extras.renameBookmark(p.id, (await parseBody(req)).label);
+        if (!bookmark) return sendError(res, 404, 'Bookmark not found, or empty label');
+        broadcast(JSON.stringify({ type: 'clawchats', event: 'bookmarks-changed' }));
+        return send(res, 200, { bookmark });
+      }
+      if ((p = matchRoute(method, urlPath, 'DELETE /api/extras/bookmarks/:id'))) {
+        if (extras.deleteBookmark(p.id)) broadcast(JSON.stringify({ type: 'clawchats', event: 'bookmarks-changed' }));
+        return send(res, 200, { ok: true });
+      }
 
 
       sendError(res, 404, `Not found: ${method} ${urlPath}`);
