@@ -109,6 +109,12 @@ class BrowserClientMap<V> extends Map<string, V> {
 }
 const connectedClients = new BrowserClientMap<{ send: (data: string) => void }>();
 
+/** The local gateway's WebSocket URL (the app's gateway client and Desktop tunnels). */
+const GATEWAY_WS_URL = process.env.GATEWAY_WS_URL || 'ws://localhost:18789';
+/** Open Desktop tunnels per browser connection (server/desktop-tunnel.js); a viewer uses one or two. */
+const desktopTunnels = new Map<string, Set<{ close(): void }>>();
+const MAX_TUNNELS_PER_CONNECTION = 8;
+
 /** Reassembly buffers for chunked RPC requests from browser (large uploads). */
 const rpcReqChunkBuffers = new Map<string, {
   chunks: string[];
@@ -388,8 +394,8 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   app = serverModule.createApp({
     dataDir,
     port:          parseInt(process.env.PORT || '3001', 10),
-    gatewayUrl:    process.env.GATEWAY_WS_URL || 'ws://localhost:18789',
-    authToken:     process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
+    gatewayUrl:    GATEWAY_WS_URL,
+    authToken:    process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
     gatewayToken,  // For WS auth to local OpenClaw gateway
     llm:           api.runtime?.llm, // host-run completions (chat-title fallback, /api/title)
     // Gateway sharing: the server side signs grants and runs guest turns; the host provides the
@@ -469,6 +475,27 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     signaling?.reportConnectionCount(webrtcPeer?.activeCount ?? 0);
   });
 
+  // A Desktop view's tunnel to the gateway's desktop stream: only on an authenticated browser
+  // connection (webrtc-peer.ts already refuses gateway-sharing peers).
+  // @ts-expect-error — server/ is plain JS with no .d.ts
+  const { openDesktopTunnel } = await import('../server/desktop-tunnel.js');
+  webrtcPeer.on('tunnel-channel', (channel: any, connectionId: string) => {
+    const open = desktopTunnels.get(connectionId) ?? new Set();
+    if (!connectedClients.has(connectionId) || open.size >= MAX_TUNNELS_PER_CONNECTION) {
+      ctx.logger.warn(`Desktop tunnel refused for ${connectionId} (${connectedClients.has(connectionId) ? 'too many tunnels' : 'not signed in'})`);
+      try { channel.close(); } catch { /* gone */ }
+      return;
+    }
+    const tunnel = openDesktopTunnel(channel, { gatewayUrl: GATEWAY_WS_URL, log: ctx.logger });
+    if (!tunnel) return;
+    open.add(tunnel);
+    desktopTunnels.set(connectionId, open);
+    channel.addEventListener('close', () => {
+      open.delete(tunnel);
+      if (!open.size && desktopTunnels.get(connectionId) === open) desktopTunnels.delete(connectionId);
+    });
+  });
+
   // Gateway sharing: a DataChannel with another gateway. Never on the browser path.
   webrtcPeer.on('peer-datachannel', (dc: DataChannelLike, info: PeerChannelInfo) => {
     if (info.role === 'owner' && info.peer) {
@@ -498,6 +525,8 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   webrtcPeer.on('datachannel-closed', (connectionId: string) => {
     ctx.logger.info(`Browser disconnected: ${connectionId}`);
     connectedClients.delete(connectionId);
+    for (const tunnel of desktopTunnels.get(connectionId) ?? []) tunnel.close();
+    desktopTunnels.delete(connectionId);
     signaling?.reportConnectionCount(webrtcPeer?.activeCount ?? 0);
   });
 
