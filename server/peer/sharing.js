@@ -69,6 +69,8 @@ export class SharingManager {
       // Requester side: shares this side removed. The server can't bring them back by replaying an old grant.
       g.exec(`CREATE TABLE IF NOT EXISTS peer_removed (share_id TEXT PRIMARY KEY, removed_at INTEGER NOT NULL)`);
       // Owner side: agents created as guest versions here (their restrictions are checked on every turn).
+      // Keys the user compared out of band and marked as verified (per share; a different key isn't).
+      g.exec(`CREATE TABLE IF NOT EXISTS peer_key_verified (share_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, verified_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS peer_guest_agents (agent_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
       this._ready = true;
     }
@@ -110,13 +112,34 @@ export class SharingManager {
         out.usedToday = this._usage(s.id);
         const key = g?.grant.requesterPubKey || s.requester?.pubKey;
         out.theirKey = key ? fingerprint(key) : null;
+        out.keyVerified = !!key && this._keyVerified(s.id, key);
       } else {
         out.verified = !!this._verifiedGrant(s);
-        const pin = this._db().prepare('SELECT owner_pubkey FROM peer_pins WHERE share_id = ?').get(s.id)?.owner_pubkey;
+        const pin = this._theirKey(s);
         out.theirKey = pin ? fingerprint(pin) : null;
+        out.keyVerified = !!pin && this._keyVerified(s.id, pin);
       }
       return out;
     });
+  }
+
+  /** The other side's key this gateway trusts for a share (owner: from the signed grant; requester: the pin). */
+  _theirKey(s) {
+    if (s?.as === 'owner') return this._grant(s.id)?.grant.requesterPubKey || null;
+    return this._db().prepare('SELECT owner_pubkey FROM peer_pins WHERE share_id = ?').get(s?.id)?.owner_pubkey || null;
+  }
+
+  _keyVerified(shareId, pubKey) {
+    return this._db().prepare('SELECT pubkey FROM peer_key_verified WHERE share_id = ?').get(shareId)?.pubkey === pubKey;
+  }
+
+  /** The user compared "Their key" with the other person (by phone, chat…) and it matched. */
+  markKeyVerified(shareId) {
+    const key = this._theirKey(this._shares.find(x => x.id === shareId));
+    if (!key) throw new Error('Nothing to verify yet');
+    this._db().prepare('INSERT OR REPLACE INTO peer_key_verified (share_id, pubkey, verified_at) VALUES (?, ?, ?)').run(shareId, key, Date.now());
+    this._changed();
+    return { theirKey: fingerprint(key) };
   }
 
   // ── Owner side ─────────────────────────────────────────────────────

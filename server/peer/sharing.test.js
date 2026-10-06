@@ -259,3 +259,19 @@ test('acceptsPeer: only for a local grant to that requester gateway', () => {
   assert.equal(s.owner.acceptsPeer('sh1', 'gwH'), true);
   assert.equal(s.owner.acceptsPeer('sh1', 'gwEVE'), false);
 });
+
+test('keys start unverified; marking verified holds only for that exact key', () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  s.req.remoteAgents(); // pins the owner key
+  const o = () => s.owner.list()[0], r = () => s.req.list()[0];
+  assert.equal(o().keyVerified, false);
+  assert.match(o().theirKey, /^[0-9a-f]{4}(-[0-9a-f]{4}){4}$/);
+  s.owner.markKeyVerified('sh1');
+  s.req.markKeyVerified('sh1');
+  assert.equal(o().keyVerified, true);
+  assert.equal(r().keyVerified, true);
+  assert.equal(o().theirKey, s.kReq.fingerprint); // what the requester's ClawChats shows as "This gateway's key"
+  assert.equal(r().theirKey, s.kOwner.fingerprint);
+});

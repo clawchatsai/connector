@@ -258,6 +258,11 @@ export function createApp(config = {}) {
         try { const r = await createGuestAgent(gwRequest, agentId); sharing.markGuestAgent(r.agentId); return send(res, 200, r); }
         catch (e) { return sendError(res, 400, e.message); }
       }
+      if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/verify-key'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        try { return send(res, 200, sharing.markKeyVerified(p.id)); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/revoke'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
         sharing.revoke(p.id);
