@@ -255,7 +255,7 @@ export function createApp(config = {}) {
         // Owner asks for a guest version of one of its agents (peer/guest-agent.js); changes this gateway's config.
         const { agentId } = await parseBody(req);
         if (typeof agentId !== 'string' || !agentId) return sendError(res, 400, 'agentId is required');
-        try { return send(res, 200, await createGuestAgent(gwRequest, agentId)); }
+        try { const r = await createGuestAgent(gwRequest, agentId); sharing.markGuestAgent(r.agentId); return send(res, 200, r); }
         catch (e) { return sendError(res, 400, e.message); }
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/revoke'))) {

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { Database } from '../bootstrap/native.js';
 import { SharingManager } from './sharing.js';
 import { loadOrCreatePeerKey } from './keys.js';
+import { GUEST_TOOLS } from './guest-agent.js';
 
 const quiet = { warn() {}, info() {} };
 const keyIn = () => loadOrCreatePeerKey(fs.mkdtempSync(path.join(os.tmpdir(), 'pk-')));
@@ -21,7 +22,7 @@ function pair() {
 }
 
 /** Owner (Kamil, gateway gwK) shares with requester (Houman, gateway gwH). */
-function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}` } = {}) {
+function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, config = {} } = {}) {
   const kOwner = keyIn(), kReq = keyIn();
   const ownerCalls = [], ownerSignals = [], reqSignals = [];
   let owner;
@@ -36,6 +37,7 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}` } 
       });
       return { runId: params.idempotencyKey, status: 'started' };
     }
+    if (method === 'config.get') return { hash: 'h', parsed: config };
     if (method === 'chat.abort') { setImmediate(() => owner.onGatewayEvent({ event: 'chat', payload: { runId: params.runId, state: 'aborted' } })); return { ok: true }; }
     return { ok: true };
   };
@@ -80,7 +82,7 @@ test('approve → verified on the requester → turn runs in a guest session on 
   const create = s.ownerCalls.find(c => c.method === 'sessions.create').params;
   assert.equal(create.agentId, 'jarvis-guest');
   assert.equal(create.permissionMode, 'read-only');
-  assert.deepEqual(create.toolOverrides, { webSearch: false });
+  assert.deepEqual(create.toolOverrides, { webSearch: false });  // no MCP servers configured here
   assert.equal(create.category, 'Shared with Houman S');
   const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
   assert.equal(send.suppressCommandInterpretation, true); // guest text is never a slash command
@@ -173,4 +175,87 @@ test('guest sessions of different rooms never collide on their label (untitled r
   const pre = [...labels];
   await s.req.turn('peer:sh1:jarvis', { turnId: 'c', roomId: 'roomC', message: 'hi' });
   assert.equal(labels.size, pre.length + 1);
+});
+
+test('guest sessions turn every configured MCP server off, and chat.send checks it', async () => {
+  const s = setup({ config: { mcp: { servers: { gmail: {}, 'chrome-devtools': {} } } } });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  const want = { webSearch: false, mcpServers: { 'chrome-devtools': false, gmail: false } };
+  assert.deepEqual(s.ownerCalls.find(c => c.method === 'sessions.create').params.toolOverrides, want);
+  assert.deepEqual(s.ownerCalls.find(c => c.method === 'chat.send').params.expectedToolOverrides, want);
+});
+
+test('a guest agent whose restrictions were removed is not served', async () => {
+  const config = { agents: { entries: { 'jarvis-guest': { tools: GUEST_TOOLS } } } };
+  const s = setup({ config });
+  s.owner.markGuestAgent('jarvis-guest');
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'r', message: 'hi' });
+  config.agents.entries['jarvis-guest'].tools = { deny: ['message'] }; // edited in the Control UI
+  await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+});
+
+test('stop sharing aborts runs already going', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  const run = s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'long' }).catch(e => e);
+  await wait(20);
+  s.owner.revoke('sh1');
+  await wait(20);
+  assert.ok(s.ownerCalls.some(c => c.method === 'chat.abort'));
+  await run;
+});
+
+test('at most two guest turns at once per share; the cap counts before any await', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  const a = s.req.turn('peer:sh1:jarvis', { turnId: 'a', roomId: 'r1', message: 'x' }).catch(e => e);
+  const b = s.req.turn('peer:sh1:jarvis', { turnId: 'b', roomId: 'r2', message: 'x' }).catch(e => e);
+  await wait(20);
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'c', roomId: 'r3', message: 'x' }), e => e.code === 'busy');
+  await s.req.abort('peer:sh1:jarvis', 'a'); await s.req.abort('peer:sh1:jarvis', 'b');
+  await Promise.all([a, b]);
+});
+
+test('re-approving refuses a requester key the server swapped', () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  const active = s.activate();
+  const evil = keyIn();
+  s.owner.setShares([{ ...active, as: 'owner', requester: { ...active.requester, pubKey: evil.publicKey } }]);
+  assert.throws(() => s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] }), /key changed/);
+});
+
+test('a share the requester removed stays removed even if the server replays it', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  const active = s.activate();
+  assert.equal(s.req.remoteAgents().length, 1);
+  s.req.revoke('sh1');
+  s.req.setShares([{ ...active, as: 'requester' }]); // replayed active grant
+  assert.deepEqual(s.req.remoteAgents(), []);
+});
+
+test('names from the other side are cleaned (no brackets or newlines to spoof room lines)', () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'x]\n\n[Houman' }] });
+  const active = s.activate();
+  s.req.setShares([{ ...active, as: 'requester', owner: { ...active.owner, name: 'Ka[mil]\nX' } }]);
+  const [a] = s.req.remoteAgents();
+  assert.doesNotMatch(a.name, /[\[\]\n]/);
+  assert.equal(a.name, 'x Houman · Ka mil');
+});
+
+test('acceptsPeer: only for a local grant to that requester gateway', () => {
+  const s = setup();
+  assert.equal(s.owner.acceptsPeer('sh1', 'gwH'), false);
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  assert.equal(s.owner.acceptsPeer('sh1', 'gwH'), true);
+  assert.equal(s.owner.acceptsPeer('sh1', 'gwEVE'), false);
 });

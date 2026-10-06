@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGuestAgent, GUEST_TOOLS_DENY } from './guest-agent.js';
+import { createGuestAgent, GUEST_TOOLS, GUEST_TOOLS_DENY, hasGuestRestrictions } from './guest-agent.js';
 
 function fakeGateway() {
   const agents = [{ id: 'jarvis', identity: { name: 'Jarvis', emoji: '🤖' }, model: { primary: 'anthropic/claude-x' }, workspace: '/home/k/.openclaw/workspace' }];
@@ -32,9 +32,12 @@ test('guest agent: same model + personality, no private memory, deny list applie
   assert.equal(create.workspace, '/home/k/.openclaw/workspace-jarvis-guest'); // its own folder, next to (not inside) the original's
   assert.deepEqual(g.files['jarvis-guest'], { 'SOUL.md': 'be kind', 'IDENTITY.md': 'I am Jarvis' });
   const patch = g.calls.find(c => c.method === 'config.patch').params;
-  assert.deepEqual(JSON.parse(patch.raw), { agents: { entries: { 'jarvis-guest': { tools: { deny: GUEST_TOOLS_DENY } } } } });
+  assert.deepEqual(JSON.parse(patch.raw), { agents: { entries: { 'jarvis-guest': { tools: GUEST_TOOLS } } } });
   assert.equal(patch.baseHash, 'h1');
-  for (const t of ['message', 'cron', 'browser', 'nodes', 'sessions_send', 'sessions_history', 'gateway']) assert.ok(GUEST_TOOLS_DENY.includes(t), t);
+  // Allowlist (minimal profile) plus every group that reaches beyond its own folder denied on top.
+  assert.equal(GUEST_TOOLS.profile, 'minimal');
+  for (const t of ['group:sessions', 'group:messaging', 'group:automation', 'group:ui', 'group:nodes', 'group:plugins', 'group:agents',
+    'sessions_search', 'conversations_send', 'secrets', 'computer', 'message', 'cron', 'browser', 'gateway']) assert.ok(GUEST_TOOLS_DENY.includes(t), t);
 
   const again = await createGuestAgent(g.request, 'jarvis');
   assert.deepEqual(again, { agentId: 'jarvis-guest', name: 'Jarvis (guest)', created: false });
@@ -51,9 +54,19 @@ test('restrictions go on before anything else; a guest left without them is repa
   // Simulate a half-made guest (deny list lost), then reuse: it gets its restrictions back.
   delete g.config['jarvis-guest'];
   await createGuestAgent(g.request, 'jarvis');
-  assert.deepEqual(g.config['jarvis-guest'].tools.deny, GUEST_TOOLS_DENY);
+  assert.deepEqual(g.config['jarvis-guest'].tools, GUEST_TOOLS);
   // Already restricted: no needless config write.
   const patches = g.calls.filter(c => c.method === 'config.patch').length;
   await createGuestAgent(g.request, 'jarvis');
   assert.equal(g.calls.filter(c => c.method === 'config.patch').length, patches);
+});
+
+test('hasGuestRestrictions: only a policy at least as narrow as the guest one passes', () => {
+  assert.equal(hasGuestRestrictions(GUEST_TOOLS), true);
+  assert.equal(hasGuestRestrictions({ deny: GUEST_TOOLS_DENY }), false);                                   // old deny-only policy
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, profile: 'full' }), false);
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, alsoAllow: [...GUEST_TOOLS.alsoAllow, 'message'] }), false);
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, deny: GUEST_TOOLS_DENY.slice(1) }), false);
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, allow: ['*'] }), false);
+  assert.equal(hasGuestRestrictions(undefined), false);
 });

@@ -19,6 +19,10 @@ import {
 // Public interfaces
 // ---------------------------------------------------------------------------
 
+const MAX_PENDING_ICE = 200;
+const MAX_PEER_CONNECTIONS_PER_SHARE = 3;
+const PEER_OPEN_TIMEOUT_MS = 30_000;
+
 export interface IceOffer {
   connectionId: string;
   sdp: string;
@@ -122,6 +126,8 @@ export class WebRTCPeerManager extends EventEmitter {
       `[WebRTCPeerManager] Storing ICE servers for connection ${data.connectionId}`,
     );
     this.pendingIceServers.set(data.connectionId, data.iceServers as any[]);
+    // Entries for offers that never come would otherwise pile up.
+    while (this.pendingIceServers.size > MAX_PENDING_ICE) this.pendingIceServers.delete(this.pendingIceServers.keys().next().value!);
   }
 
   async handleOffer(
@@ -144,6 +150,12 @@ export class WebRTCPeerManager extends EventEmitter {
 
     console.log(`[WebRTCPeerManager] Handling ICE offer for connection ${connectionId}`);
 
+    // Another gateway dialling in: a few connections per share, and only ones that open soon.
+    if (offer.peer) {
+      const same = [...this.peerInfo.values()].filter(i => i.role === 'owner' && i.peer?.shareId === offer.peer!.shareId).length;
+      if (same >= MAX_PEER_CONNECTIONS_PER_SHARE) throw new Error(`too many peer connections for share ${offer.peer.shareId}`);
+    }
+
     const iceServers: any[] = this.pendingIceServers.get(connectionId) ?? [
       { urls: 'stun:stun.l.google.com:19302' },
     ];
@@ -162,7 +174,11 @@ export class WebRTCPeerManager extends EventEmitter {
     const pc = new RTCPeerConnection({ iceServers: normalized } as any);
     this.peerConnections.set(connectionId, pc);
 
-    if (offer.peer) this.peerInfo.set(connectionId, { connectionId, role: 'owner', peer: offer.peer, dtls: { local: '', remote: sdpFingerprint(sdp) } });
+    if (offer.peer) {
+      this.peerInfo.set(connectionId, { connectionId, role: 'owner', peer: offer.peer, dtls: { local: '', remote: sdpFingerprint(sdp) } });
+      const t = setTimeout(() => { if (!this.activeChannels.has(connectionId)) this.closePeer(connectionId); }, PEER_OPEN_TIMEOUT_MS);
+      t.unref?.();
+    }
 
     // W3C-standard ondatachannel
     pc.ondatachannel = (event: any) => {
@@ -246,6 +262,9 @@ export class WebRTCPeerManager extends EventEmitter {
   closePeer(connectionId: string): void {
     this.activeChannels.get(connectionId)?.close();
     try { this.peerConnections.get(connectionId)?.close(); } catch { /* gone */ }
+    this.peerConnections.delete(connectionId);
+    this.peerInfo.delete(connectionId);
+    this.pendingIceServers.delete(connectionId);
   }
 
   handleIceCandidate(connectionId: string, candidate: unknown): void {

@@ -3,34 +3,54 @@
 // The gateway can't restrict most tools per session (permission modes only cover file tools and
 // exec), so the real boundary is the agent's own config. A guest version has the original's model
 // and personality (SOUL.md, IDENTITY.md) but not its private memory (MEMORY.md, USER.md), its own
-// fresh workspace, and a tool deny list that removes messaging, scheduling, browsing, devices and
-// access to other sessions. Created only when the owner asks for it (ClawChats → Sharing).
+// fresh workspace, and an allowlist of tools: files and exec (which the session's permission mode
+// then limits: read-only, or guarded = the owner approves), images and PDFs. Everything that reaches
+// beyond its own folder (other sessions, messaging, scheduling, browsing, devices, plugins and MCP,
+// secrets, gateway config) is denied on top, so it stays out even if the profile list grows.
+// Created only when the owner asks for it (ClawChats → Sharing).
 
 import path from 'node:path';
 
-export const GUEST_TOOLS_DENY = [
-  'gateway', 'openclaw', 'cron', 'nodes', 'browser', 'canvas', 'message',
-  'sessions_spawn', 'sessions_send', 'sessions_history', 'sessions_list',
-  'discord', 'slack', 'telegram', 'whatsapp',
-];
+/** The guest's tool policy (gateway `agents.entries.<id>.tools`; tool groups per docs/gateway/config-tools/tool-policy.md). */
+export const GUEST_TOOLS = Object.freeze({
+  profile: 'minimal',
+  alsoAllow: ['group:fs', 'group:runtime', 'view_image', 'pdf'],
+  deny: [
+    'group:sessions', 'group:automation', 'group:ui', 'group:nodes', 'group:messaging', 'group:plugins',
+    'group:agents', 'group:memory', 'group:web',
+    'gateway', 'openclaw', 'cron', 'automations', 'plugins', 'secrets', 'personal_instructions', 'session_status',
+    'sessions', 'sessions_spawn', 'sessions_send', 'sessions_history', 'sessions_list', 'sessions_search', 'subagents',
+    'conversations_list', 'conversations_send', 'conversations_turn', 'message', 'nodes', 'computer', 'browser', 'canvas',
+    'terminal', 'portal', 'skill_workshop', 'agents_list', 'image_generate', 'music_generate', 'video_generate', 'tts',
+    'discord', 'slack', 'telegram', 'whatsapp',
+  ],
+});
+export const GUEST_TOOLS_DENY = GUEST_TOOLS.deny;
 const PERSONALITY_FILES = ['SOUL.md', 'IDENTITY.md'];
 export const guestName = name => `${name} (guest)`;
 
 const agentName = a => a?.identity?.name || a?.name || a?.id;
 const wait = ms => new Promise(r => setTimeout(r, ms));
 
+/** Whether an agent's configured tools are (at least) as narrow as the guest policy. */
+export function hasGuestRestrictions(tools) {
+  if (!tools || tools.profile !== GUEST_TOOLS.profile || tools.allow) return false;
+  const also = Array.isArray(tools.alsoAllow) ? tools.alsoAllow : [];
+  const deny = Array.isArray(tools.deny) ? tools.deny : [];
+  return also.every(t => GUEST_TOOLS.alsoAllow.includes(t)) && GUEST_TOOLS.deny.every(t => deny.includes(t));
+}
+
 /**
- * Make sure the guest's tool deny list is in the gateway config (idempotent; writes only when missing).
+ * Make sure the guest's tool policy is in the gateway config (idempotent; writes only when missing).
  * Runs before anything else touches a guest agent: a guest without it must never be shared.
  */
 export async function ensureGuestRestrictions(request, agentId) {
   const cfg = await request('config.get', {});
-  const deny = cfg?.parsed?.agents?.entries?.[agentId]?.tools?.deny;
-  if (Array.isArray(deny) && GUEST_TOOLS_DENY.every(t => deny.includes(t))) return false;
+  if (hasGuestRestrictions(cfg?.parsed?.agents?.entries?.[agentId]?.tools)) return false;
   await request('config.patch', {
-    raw: JSON.stringify({ agents: { entries: { [agentId]: { tools: { deny: GUEST_TOOLS_DENY } } } } }),
+    raw: JSON.stringify({ agents: { entries: { [agentId]: { tools: GUEST_TOOLS } } } }),
     ...(cfg?.hash ? { baseHash: cfg.hash } : {}),
-    replacePaths: [`agents.entries.${agentId}.tools.deny`],
+    replacePaths: [`agents.entries.${agentId}.tools`],
     note: `ClawChats sharing: guest restrictions for ${agentId}`,
   }, 60_000);
   return true;

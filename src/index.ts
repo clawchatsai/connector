@@ -72,6 +72,7 @@ interface AppInstance {
     setShares: (shares: unknown[]) => void;
     onShareRevoked: (shareId: string) => void;
     servePeer: (o: { dc: DataChannelLike; dtls: { local: string; remote: string }; shareId: string; requesterGatewayId: string }) => unknown;
+    acceptsPeer: (shareId: string, requesterGatewayId: string) => boolean;
   } | null;
   peerKey: { publicKey: string; fingerprint: string };
 }
@@ -503,6 +504,12 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   // Wire signaling ICE events to peer manager
   signaling.on('ice-offer', async (offer: { connectionId: string; sdp: string; candidates: unknown[] }) => {
     if (!webrtcPeer) return;
+    const peer = (offer as { peer?: { shareId: string; requesterGatewayId: string } }).peer;
+    // Another gateway: no WebRTC setup at all unless this side holds a grant for it.
+    if (peer && !app?.sharing?.acceptsPeer(peer.shareId, peer.requesterGatewayId)) {
+      ctx.logger.warn(`Refused peer offer for share ${peer.shareId}: no grant`);
+      return;
+    }
     try {
       const answer = await webrtcPeer.handleOffer(offer);
       signaling?.sendIceAnswer(answer.connectionId, answer.sdp, answer.candidates);
