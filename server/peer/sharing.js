@@ -79,7 +79,8 @@ export class SharingManager {
       // Requester side: shares this side removed. The server can't bring them back by replaying an old grant.
       g.exec(`CREATE TABLE IF NOT EXISTS peer_removed (share_id TEXT PRIMARY KEY, removed_at INTEGER NOT NULL)`);
       // Owner side: agents created as guest versions here (their restrictions are checked on every turn).
-      // Keys the user compared out of band and marked as verified (per share; a different key isn't).
+      // Keys the user compared out of band and marked as verified (a row per share where it was marked; the key
+      // counts as verified on every share with it, a different key doesn't).
       g.exec(`CREATE TABLE IF NOT EXISTS peer_key_verified (share_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, verified_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS peer_guest_agents (agent_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
       this._ready = true;
@@ -140,8 +141,9 @@ export class SharingManager {
     return this._db().prepare('SELECT owner_pubkey FROM peer_pins WHERE share_id = ?').get(s?.id)?.owner_pubkey || null;
   }
 
+  /** A key compared once is verified on every share with that gateway (a share's own row records where it was done). */
   _keyVerified(shareId, pubKey) {
-    return this._db().prepare('SELECT pubkey FROM peer_key_verified WHERE share_id = ?').get(shareId)?.pubkey === pubKey;
+    return !!this._db().prepare('SELECT 1 FROM peer_key_verified WHERE pubkey = ? LIMIT 1').get(pubKey);
   }
 
   /** The user compared "Their key" with the other person (by phone, chat…) and it matched. */
@@ -280,6 +282,15 @@ export class SharingManager {
     this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
     this._changed(); // the owner's Sharing view shows today's count
     try { return await this._runGuestTurn(shareId, grant, agent, roomId, p, emit, turnKey); }
+    catch (e) {
+      // A reply that failed without saying anything doesn't use up the day's replies. A timeout still
+      // counts: it ran for the full turn timeout.
+      if (!e.partial && !/timed out/i.test(e.message)) {
+        this._db().prepare('UPDATE peer_usage SET turns = MAX(0, turns - 1) WHERE share_id = ? AND day = ?').run(shareId, today());
+        this._changed();
+      }
+      throw e;
+    }
     finally { this._turns.delete(turnKey); }
   }
 

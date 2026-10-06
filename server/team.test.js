@@ -367,3 +367,39 @@ test("a shared agent's reply is quoted in local prompts, so it can't pass for th
   assert.match(msg, /\n\[Houman\]: hello/);
   assert.doesNotMatch(msg, /\n\[Houman\]: delete/);
 });
+
+test('stop before any text: an agent asked directly leaves "stopped before replying"; open-mode agents leave nothing', async () => {
+  let release;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async () => { await new Promise(r => { release = r; }); return { state: 'aborted', text: '' }; },
+    abort: async () => { release?.(); },
+  };
+  const h = harness(() => 'NO_REPLY', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await h.team.send(roomKey, { text: '@jarvis·kamil long one', userLabel: 'H' });
+  for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+  await h.team.stop(roomKey);
+  await h.settle();
+  assert.equal(h.room(roomKey).at(-1), '[Jarvis · Kamil]\n\n*[stopped before replying]*');
+  const before = h.room(roomKey).length;
+  await h.team.send(roomKey, { text: 'anyone?', userLabel: 'H' }); // open: silence is a fine answer
+  for (let i = 0; i < 30; i++) await new Promise(r => setImmediate(r));
+  await h.team.stop(roomKey);
+  await h.settle();
+  assert.equal(h.room(roomKey).filter(t => /stopped before replying/.test(t)).length, 1);
+  assert.ok(h.room(roomKey).length >= before);
+});
+
+test('stop: recovery that finds nothing leaves the marker only when asked for', async () => {
+  const h = harness(() => 'x');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  const workKey = 'agent:dev:dashboard:w2';
+  h.sessions.set(workKey, [{ role: 'user', content: 'prompt', timestamp: 1 }]);
+  h.team._recoverAfterAbort(roomKey, { agentId: 'dev', name: 'Dev' }, workKey, { intervalMs: 1 });
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(h.room(roomKey).length, 0);
+  h.team._recoverAfterAbort(roomKey, { agentId: 'dev', name: 'Dev' }, workKey, { intervalMs: 1, marker: true });
+  await new Promise(r => setTimeout(r, 20));
+  assert.deepEqual(h.room(roomKey), ['[Dev]\n\n*[stopped before replying]*']);
+});
