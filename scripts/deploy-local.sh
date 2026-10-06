@@ -15,8 +15,14 @@ FORCE=0
 [ "$1" = "--force" ] && FORCE=1
 
 # CONNECTOR_DIR overrides the target (used to test this script against a copy).
-D="${CONNECTOR_DIR:-$(ls -d ~/.openclaw/npm/projects/clawchatsai-connector-*/node_modules/@clawchatsai/connector 2>/dev/null | head -1)}"
-[ -n "$D" ] || { echo "installed connector not found under ~/.openclaw/npm/projects" >&2; exit 1; }
+# Otherwise the copy the gateway actually loads: `openclaw plugins update` installs each release into
+# a new ...openclaw-generation__g-<hash> dir and leaves the old ones, so globbing can pick a stale one.
+active_connector_dir() {
+  openclaw plugins inspect connector --json 2>/dev/null \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(j.plugin?.rootDir||j.install?.installPath||"")}catch{}})'
+}
+D="${CONNECTOR_DIR:-$(active_connector_dir)}"
+[ -n "$D" ] && [ -d "$D" ] || { echo "can't find the connector the gateway loads (openclaw plugins inspect connector --json); set CONNECTOR_DIR" >&2; exit 1; }
 MARKER="$D/.deployed-from"
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 SHA="$(git rev-parse HEAD)"
