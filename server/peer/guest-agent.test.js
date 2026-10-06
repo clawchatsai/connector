@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { createGuestAgent, GUEST_TOOLS_DENY } from './guest-agent.js';
 
 function fakeGateway() {
-  const agents = [{ id: 'jarvis', identity: { name: 'Jarvis', emoji: '🤖' }, model: { primary: 'anthropic/claude-x' } }];
+  const agents = [{ id: 'jarvis', identity: { name: 'Jarvis', emoji: '🤖' }, model: { primary: 'anthropic/claude-x' }, workspace: '/home/k/.openclaw/workspace' }];
   const files = { jarvis: { 'SOUL.md': 'be kind', 'IDENTITY.md': 'I am Jarvis', 'MEMORY.md': 'owner secrets', 'USER.md': 'owner profile' } };
   const calls = [];
   const config = {};
@@ -28,8 +28,8 @@ test('guest agent: same model + personality, no private memory, deny list applie
   const r = await createGuestAgent(g.request, 'jarvis');
   assert.deepEqual(r, { agentId: 'jarvis-guest', name: 'Jarvis (guest)', created: true });
   const create = g.calls.find(c => c.method === 'agents.create').params;
-  assert.deepEqual(create, { name: 'Jarvis (guest)', model: 'anthropic/claude-x', emoji: '🤖' });
-  assert.equal('workspace' in create, false); // its own fresh workspace
+  assert.deepEqual(create, { name: 'Jarvis (guest)', workspace: '/home/k/.openclaw/workspace-jarvis-guest', model: 'anthropic/claude-x', emoji: '🤖' });
+  assert.equal(create.workspace, '/home/k/.openclaw/workspace-jarvis-guest'); // its own folder, next to (not inside) the original's
   assert.deepEqual(g.files['jarvis-guest'], { 'SOUL.md': 'be kind', 'IDENTITY.md': 'I am Jarvis' });
   const patch = g.calls.find(c => c.method === 'config.patch').params;
   assert.deepEqual(JSON.parse(patch.raw), { agents: { entries: { 'jarvis-guest': { tools: { deny: GUEST_TOOLS_DENY } } } } });

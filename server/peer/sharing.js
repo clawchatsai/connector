@@ -185,7 +185,8 @@ export class SharingManager {
     this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
     this._changed(); // the owner's Sharing view shows today's count
 
-    const name = firstName({ name: grant.requesterName });
+    // Their full name, as the approval screen shows it ("Shared with Houman Test").
+    const name = String(grant.requesterName || 'Someone').replace(/[\n\r]/g, ' ').trim().slice(0, 60) || 'Someone';
     const permissionMode = ACCESS_MODES[grant.access] || 'read-only';
     const toolOverrides = { webSearch: false };
     const sessionKey = await this._guestSession(shareId, roomId, agent.id, { name, roomTitle: String(p.roomTitle || 'team chat').slice(0, 80), permissionMode, toolOverrides });

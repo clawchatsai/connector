@@ -6,6 +6,8 @@
 // fresh workspace, and a tool deny list that removes messaging, scheduling, browsing, devices and
 // access to other sessions. Created only when the owner asks for it (ClawChats → Sharing).
 
+import path from 'node:path';
+
 export const GUEST_TOOLS_DENY = [
   'gateway', 'openclaw', 'cron', 'nodes', 'browser', 'canvas', 'message',
   'sessions_spawn', 'sessions_send', 'sessions_history', 'sessions_list',
@@ -69,8 +71,13 @@ export async function createGuestAgent(request, agentId) {
 
   const name = guestName(agentName(src));
   const model = typeof src.model === 'string' ? src.model : src.model?.primary;
+  // Its own folder next to the original's workspace, not inside it (the default nests it in the
+  // agents' workspace, where the owner's main agent would see it as part of its own files).
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'guest';
+  const workspace = typeof src.workspace === 'string' && src.workspace.startsWith('/')
+    ? path.join(path.dirname(src.workspace.replace(/\/+$/, '')), `workspace-${slug}`) : undefined;
   const created = await request('agents.create', {
-    name, ...(model ? { model } : {}), ...(src.identity?.emoji ? { emoji: src.identity.emoji } : {}),
+    name, ...(workspace ? { workspace } : {}), ...(model ? { model } : {}), ...(src.identity?.emoji ? { emoji: src.identity.emoji } : {}),
   }, 60_000);
   const id = created.agentId;
 

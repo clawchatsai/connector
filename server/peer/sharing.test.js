@@ -81,7 +81,7 @@ test('approve → verified on the requester → turn runs in a guest session on 
   assert.equal(create.agentId, 'jarvis-guest');
   assert.equal(create.permissionMode, 'read-only');
   assert.deepEqual(create.toolOverrides, { webSearch: false });
-  assert.equal(create.category, 'Shared with Houman');
+  assert.equal(create.category, 'Shared with Houman S');
   const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
   assert.equal(send.suppressCommandInterpretation, true); // guest text is never a slash command
   assert.equal(send.expectedPermissionMode, 'read-only');
