@@ -143,3 +143,11 @@ test('share page embeds the envelope safely, and its decrypt code opens link and
   assert.deepEqual(await decryptShare(pw.envelope, { password: 'correct horse battery' }), payload);
   await assert.rejects(decryptShare(pw.envelope, { password: 'nope' }), { code: 'bad-password' });
 });
+
+test('whole-chat shares are accepted and uploaded like artifacts', async () => {
+  const { ops, h } = setup();
+  const r = await call(h.handleCreate, { envelope: ENV, title: 'A chat', type: 'chat' });
+  assert.equal(r.status, 201);
+  assert.equal(r.body.share.type, 'chat');
+  assert.ok(ops[0].body.includes('function chatPage'), 'the share page can render chats');
+});

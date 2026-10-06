@@ -17,7 +17,7 @@ import { buildSharePage } from '../share/viewer-page.js';
 const ID_RE = /^[A-Za-z0-9_-]{22}$/;
 const MAX_TITLE = 200;
 const MAX_PAGE_BYTES = 5 * 1024 * 1024;
-const TYPES = new Set(['html', 'svg', 'markdown', 'mermaid', 'csv', 'code']);
+const TYPES = new Set(['html', 'svg', 'markdown', 'mermaid', 'csv', 'code', 'chat']);
 const SWEEP_MS = 60 * 60 * 1000;
 const objectKey = id => `shares/${id}.html`;
 
