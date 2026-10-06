@@ -16,6 +16,8 @@
 import crypto from 'node:crypto';
 
 export const SILENT = /^\s*NO_REPLY\s*$/i;
+/** Room entry for an agent asked directly whose run was stopped before it said anything. */
+const STOPPED_EARLY = '*[stopped before replying]*';
 const LABEL_PREFIX = /^\[([^\]\n]{1,100})\]\n\n/;
 const TURN_TIMEOUT_MS = 15 * 60_000;
 const HISTORY_LIMIT = 80;
@@ -401,7 +403,7 @@ export class TeamCoordinator {
       if (result.state === 'aborted') {
         if (partial && !SILENT.test(partial)) await this._post(roomKey, self, `${partial}\n\n*[stopped]*`);
         // Some runtimes (claude-cli) finish the reply after the abort was acknowledged: post it once it lands.
-        else this._recoverAfterAbort(roomKey, self, workKey);
+        else this._recoverAfterAbort(roomKey, self, workKey, { marker: mode === 'addressed' });
         return { agentId, text: null };
       }
       throw Object.assign(new Error(result.errorMessage || 'run failed'), { partial });
@@ -440,6 +442,7 @@ export class TeamCoordinator {
     const text = String(result?.text || '').trim();
     if (result?.state === 'aborted') {
       if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`);
+      else if (mode === 'addressed') await this._post(roomKey, self, STOPPED_EARLY);
       return { agentId, text: null };
     }
     if (!text || SILENT.test(text)) return { agentId, text: null };
@@ -455,9 +458,10 @@ export class TeamCoordinator {
   /**
    * After Stop, a reply that still landed in the agent's session (the runtime ignored the abort) is
    * posted to the room marked stopped, so the room matches what the agent believes it said.
-   * Polls until the session is idle (max ~3 min); gives up if the agent starts another turn.
+   * Polls until the session is idle (max ~3 min); gives up if the agent starts another turn. With
+   * `marker` (the agent was asked directly), nothing landing still leaves "stopped before replying".
    */
-  _recoverAfterAbort(roomKey, self, workKey, { intervalMs = 3000, tries = 60 } = {}) {
+  _recoverAfterAbort(roomKey, self, workKey, { intervalMs = 3000, tries = 60, marker = false } = {}) {
     let n = 0;
     const check = async () => {
       if (this._rooms.get(roomKey)?.running.has(self.agentId) || !this.store.getRoom(roomKey)) return;
@@ -466,6 +470,7 @@ export class TeamCoordinator {
         if (s?.hasActiveRun && ++n < tries) { setTimeout(check, intervalMs).unref?.(); return; }
         const text = (await this._lastReply(workKey) || '').trim();
         if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`);
+        else if (marker) await this._post(roomKey, self, STOPPED_EARLY);
       } catch (e) { this.log.warn?.(`[team] recover after stop: ${e.message}`); }
     };
     setTimeout(check, intervalMs).unref?.();

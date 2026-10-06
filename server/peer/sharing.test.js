@@ -333,6 +333,25 @@ test('keys start unverified; marking verified holds only for that exact key', ()
   assert.equal(r().theirKey, s.kOwner.fingerprint);
 });
 
+test('a key verified on one share is verified on every share with that gateway, both directions', () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  const active = s.activate();
+  s.req.remoteAgents(); // pins Kamil's key
+  // Kamil also asks Houman: on Houman's gateway, sh2 is an owner share whose requester key is Kamil's.
+  const back = { id: 'sh2', status: 'pending', as: 'owner', requester: s.people.owner, owner: s.people.requester, agents: [] };
+  s.req.setShares([{ ...active, as: 'requester' }, back]);
+  const byId = id => s.req.list().find(x => x.id === id);
+  assert.equal(byId('sh2').theirKey, byId('sh1').theirKey);
+  assert.equal(byId('sh2').keyVerified, false);
+  s.req.markKeyVerified('sh1');
+  assert.equal(byId('sh1').keyVerified, true);
+  assert.equal(byId('sh2').keyVerified, true);
+  // Someone else's key stays unverified.
+  s.req.setShares([{ ...active, as: 'requester' }, { ...back, id: 'sh3', requester: { ...s.people.owner, pubKey: keyIn().publicKey } }]);
+  assert.equal(byId('sh3').keyVerified, false);
+});
+
 test('a pending request can be verified, and stays verified once approved', () => {
   const s = setup();
   const o = () => s.owner.list()[0];
@@ -341,4 +360,23 @@ test('a pending request can be verified, and stays verified once approved', () =
   assert.equal(o().keyVerified, true);
   s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
   assert.equal(o().keyVerified, true);
+});
+
+test('a reply that fails without text is not counted against the daily cap; one with partial text is', async () => {
+  const s = setup({ reply: () => null }); // runs stay open; the test ends them
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 5 });
+  s.activate();
+  // A guest version whose restrictions were removed: refused before it runs, nothing said.
+  s.owner.markGuestAgent('jarvis');
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'f1', roomId: 'room1', message: 'hi' }), e => e.code === 'unavailable');
+  assert.equal(s.owner.list()[0].usedToday, 0);
+  s.owner._db().prepare('DELETE FROM peer_guest_agents').run();
+  // Fails after streaming some text ("jar"): counted.
+  const p = s.req.turn('peer:sh1:jarvis', { turnId: 'f2', roomId: 'room1', message: 'hi' });
+  for (let i = 0; i < 50 && !s.ownerCalls.some(c => c.method === 'chat.send'); i++) await wait(2);
+  await wait(5);
+  const runId = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.idempotencyKey;
+  s.owner.onGatewayEvent({ event: 'chat', payload: { runId, state: 'error', errorMessage: 'provider down' } });
+  await assert.rejects(p);
+  assert.equal(s.owner.list()[0].usedToday, 1);
 });
