@@ -242,7 +242,8 @@ export function createApp(config = {}) {
 
       // Gateway sharing (server/peer/sharing.js). Approve/revoke happen here, behind this gateway's TOTP.
       if (method === 'GET' && urlPath === '/api/sharing') {
-        if (!sharing) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
+        // Enabled once the signal server has sharing on for this account (it then sends share lists).
+        if (!sharing?.serverEnabled) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
         return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents() });
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {

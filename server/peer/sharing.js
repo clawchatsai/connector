@@ -46,6 +46,7 @@ export class SharingManager {
   constructor({ getDb, request, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console }) {
     Object.assign(this, { getDb, request, key, gatewayId, signal, openPeer, broadcast, log });
     this._shares = [];            // latest share-list from the signal server
+    this.serverEnabled = false;   // the signal server sends a share-list only to accounts with sharing on
     this._links = new Map();      // shareId -> PeerLink (requester side, one per share)
     this._linking = new Map();    // shareId -> Promise<PeerLink>
     this._served = new Set();     // owner-side PeerLinks
@@ -70,6 +71,7 @@ export class SharingManager {
 
   /** `share-list` from the signal server. Ends links/grants for shares that are gone. */
   setShares(shares) {
+    this.serverEnabled = true;
     this._shares = Array.isArray(shares) ? shares : [];
     const live = new Set(this._shares.filter(s => s.status === 'active').map(s => s.id));
     for (const [shareId, link] of this._links) if (!live.has(shareId)) { link.close(); this._links.delete(shareId); }
