@@ -183,6 +183,7 @@ export class SharingManager {
     if (!roomId || typeof p.message !== 'string' || !p.message.trim()) throw Object.assign(new Error('Bad turn'), { code: 'bad_request' });
     if (this._usage(shareId) >= grant.dailyCap) throw Object.assign(new Error(`Daily limit reached (${grant.dailyCap} replies)`), { code: 'cap' });
     this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
+    this._changed(); // the owner's Sharing view shows today's count
 
     const name = firstName({ name: grant.requesterName });
     const permissionMode = ACCESS_MODES[grant.access] || 'read-only';
@@ -229,11 +230,16 @@ export class SharingManager {
       return row.session_key;
     }
     const key = `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
-    await this.request('sessions.create', {
-      key, agentId, permissionMode, toolOverrides,
-      label: `${name} · ${roomTitle} · ${shareId.slice(-4)}`.slice(0, 200), // labels are unique per gateway
-      category: `Shared with ${name}`.slice(0, 100),
+    // Labels are unique per gateway, and untitled rooms all fall back to "team chat": tag each room.
+    const tag = crypto.createHash('sha256').update(`${shareId}|${roomId}`).digest('hex').slice(0, 6);
+    const create = label => this.request('sessions.create', {
+      key, agentId, permissionMode, toolOverrides, label: label.slice(0, 200), category: `Shared with ${name}`.slice(0, 100),
     });
+    try { await create(`${name} · ${roomTitle} · ${tag}`); }
+    catch (e) {
+      if (!/label already in use/i.test(e.message)) throw e;
+      await create(`${name} · ${roomTitle} · ${tag}-${crypto.randomBytes(2).toString('hex')}`);
+    }
     db.prepare('INSERT OR REPLACE INTO peer_sessions (share_id, room_id, agent_id, session_key) VALUES (?, ?, ?, ?)').run(shareId, roomId, agentId, key);
     return key;
   }

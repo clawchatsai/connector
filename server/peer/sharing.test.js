@@ -151,3 +151,26 @@ test('abort reaches the owner run; the turn ends aborted', async () => {
   assert.deepEqual(await run, { state: 'aborted', text: 'jar' });
   assert.ok(s.ownerCalls.some(c => c.method === 'chat.abort'));
 });
+
+test('guest sessions of different rooms never collide on their label (untitled rooms), and a clash retries', async () => {
+  const labels = new Set();
+  const s = setup();
+  const orig = s.owner.request;
+  s.owner.request = async (method, params) => {
+    if (method === 'sessions.create') {
+      if (labels.has(params.label)) throw new Error(`label already in use: ${params.label}`);
+      labels.add(params.label);
+    }
+    return orig(method, params);
+  };
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'a', roomId: 'roomA', message: 'hi' }); // both untitled → "team chat"
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'b', roomId: 'roomB', message: 'hi' });
+  assert.equal(labels.size, 2);
+  // Even a clash with an unrelated session falls back to a fresh suffix.
+  labels.add([...labels][0].replace(/· [0-9a-f]{6}$/, '· ') + 'x'); // unrelated
+  const pre = [...labels];
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'c', roomId: 'roomC', message: 'hi' });
+  assert.equal(labels.size, pre.length + 1);
+});
