@@ -20,6 +20,8 @@ import {
 // ---------------------------------------------------------------------------
 
 const MAX_PENDING_ICE = 200;
+/** Label prefix of a Desktop tunnel channel (matches server/desktop-tunnel.js). */
+const TUNNEL_LABEL_PREFIX = 'tunnel:';
 const MAX_PEER_CONNECTIONS_PER_SHARE = 3;
 const PEER_OPEN_TIMEOUT_MS = 30_000;
 
@@ -183,6 +185,14 @@ export class WebRTCPeerManager extends EventEmitter {
     // W3C-standard ondatachannel
     pc.ondatachannel = (event: any) => {
       const channel = event.channel;
+      // A Desktop view's tunnel (server/desktop-tunnel.js): an extra channel on a browser
+      // connection. It isn't the connection's main channel, so closing it must not close the
+      // peer connection. Gateway-sharing peers never get one.
+      if (String(channel.label || '').startsWith(TUNNEL_LABEL_PREFIX)) {
+        if (this.peerInfo.has(connectionId)) { try { channel.close(); } catch { /* gone */ } return; }
+        this.emit('tunnel-channel', channel, connectionId);
+        return;
+      }
       this._handleDataChannel(channel, connectionId);
     };
 
