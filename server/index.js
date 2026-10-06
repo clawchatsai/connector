@@ -15,6 +15,7 @@ import { handleStatic } from './controllers/static.js';
 import { handleAgents } from './controllers/agents.js';
 import { createTitleHandler, createTitler } from './controllers/title.js';
 import { createSettingsHandlers } from './controllers/settings.js';
+import { createShareHandlers } from './controllers/shares.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
 import { createTeamStore } from './store/team-store.js';
@@ -40,6 +41,7 @@ export function createApp(config = {}) {
   const gatewayUrl     = config.gatewayUrl   || GATEWAY_WS_URL;
   const openaiApiKey   = config.openaiApiKey || null;
   const handleTitle    = createTitleHandler(config.llm); // api.runtime.llm (plugin mode only)
+  const shares         = createShareHandlers({ dataDir: DATA_DIR }); // share links → the user's own bucket
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -204,6 +206,12 @@ export function createApp(config = {}) {
         broadcast(JSON.stringify({ type: 'clawchats', event: 'project-styles-changed' }));
         return send(res, 200, { ok: true });
       }
+      // Share links: browser-encrypted envelopes uploaded to the user's own bucket (controllers/shares.js)
+      if (method === 'GET' && urlPath === '/api/extras/shares') return await shares.handleList(req, res);
+      if (method === 'POST' && urlPath === '/api/extras/shares/storage') return await shares.handleSetup(req, res);
+      if (method === 'DELETE' && urlPath === '/api/extras/shares/storage') return shares.handleForgetStorage(req, res);
+      if (method === 'POST' && urlPath === '/api/extras/shares') return await shares.handleCreate(req, res);
+      if ((p = matchRoute(method, urlPath, 'DELETE /api/extras/shares/:id'))) return await shares.handleRevoke(req, res, p.id);
       if (method === 'GET' && urlPath === '/api/extras/bookmarks') return send(res, 200, { bookmarks: extras.listBookmarks() });
       if (method === 'POST' && urlPath === '/api/extras/bookmarks') {
         const bookmark = extras.addBookmark(uuid(), await parseBody(req));

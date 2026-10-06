@@ -16,6 +16,7 @@ Add a row here whenever a ClawChats feature needs storage the gateway lacks.
 | Prompt library | `prompts` | id | Unchanged. |
 | Custom emojis | `custom_emojis` | name + pack | Unchanged. |
 | Settings | `data/settings.json` | — | Unchanged. |
+| Share links | `data/shares.json` (+ `data/share-storage.json`) | share id | Bring-your-own storage (`controllers/shares.js`, `share/`). The browser encrypts; the connector wraps the ciphertext in a self-contained viewer page (`share/viewer.html` + `viewer-decrypt.js`) and uploads it with S3 SigV4 (`share/s3.js`) to the user's own R2 bucket, set up from one R2 API token (`share/r2-setup.js`: creates `clawchats-shares`, turns on its r2.dev URL, derives S3 keys; the raw token isn't kept). `share-storage.json` (0600) holds the derived keys and is never sent to the browser. The index keeps id, url, title, type, mode and expiry, never the decryption key. Expired shares are deleted hourly and on list/create. |
 
 HTTP (P2P `rpc`):
 - `GET /api/extras/project-styles` → `{ styles: { [groupName]: { color, icon } } }`
@@ -26,6 +27,11 @@ HTTP (P2P `rpc`):
 - `POST /api/extras/bookmarks` `{ sessionKey, messageId, role, label, snippet, chatTitle }` → `{ bookmark }` (an existing bookmark on that message is returned unchanged)
 - `PATCH /api/extras/bookmarks/:id` `{ label }` → `{ bookmark }`
 - `DELETE /api/extras/bookmarks/:id`
+
+Share links:
+- `GET /api/extras/shares` → `{ configured, storage: { provider, bucket, publicBaseUrl } | null, shares: [...] }`
+- `POST /api/extras/shares/storage` `{ token }` (R2 API token, Admin Read & Write) → `{ storage }` after a test upload · `DELETE /api/extras/shares/storage` forgets it
+- `POST /api/extras/shares` `{ envelope, expiresAt?, title, type }` → `{ share }` · `DELETE /api/extras/shares/:id`
 
 Changes broadcast `{ type: 'clawchats', event: 'project-styles-changed' }` / `'bookmarks-changed'`.
 
