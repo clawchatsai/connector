@@ -15,6 +15,33 @@ const PERSONALITY_FILES = ['SOUL.md', 'IDENTITY.md'];
 export const guestName = name => `${name} (guest)`;
 
 const agentName = a => a?.identity?.name || a?.name || a?.id;
+const wait = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * Make sure the guest's tool deny list is in the gateway config (idempotent; writes only when missing).
+ * Runs before anything else touches a guest agent: a guest without it must never be shared.
+ */
+export async function ensureGuestRestrictions(request, agentId) {
+  const cfg = await request('config.get', {});
+  const deny = cfg?.parsed?.agents?.entries?.[agentId]?.tools?.deny;
+  if (Array.isArray(deny) && GUEST_TOOLS_DENY.every(t => deny.includes(t))) return false;
+  await request('config.patch', {
+    raw: JSON.stringify({ agents: { entries: { [agentId]: { tools: { deny: GUEST_TOOLS_DENY } } } } }),
+    ...(cfg?.hash ? { baseHash: cfg.hash } : {}),
+    replacePaths: [`agents.entries.${agentId}.tools.deny`],
+    note: `ClawChats sharing: guest restrictions for ${agentId}`,
+  }, 60_000);
+  return true;
+}
+
+/** A new agent is only usable once the gateway's config reload picked it up. */
+async function waitForAgent(request, agentId, { tries = 40, ms = 250 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    if (((await request('agents.list', {}))?.agents || []).some(a => a.id === agentId)) return true;
+    await wait(ms);
+  }
+  return false;
+}
 
 /** The guest version of `agentId` if it already exists (by name). */
 export function findGuestAgent(agents, agentId) {
@@ -30,9 +57,15 @@ export async function createGuestAgent(request, agentId) {
   const agents = (await request('agents.list', {}))?.agents || [];
   const src = agents.find(a => a.id === agentId);
   if (!src) throw new Error(`unknown agent: ${agentId}`);
-  if (/\(guest\)$/.test(agentName(src))) return { agentId: src.id, name: agentName(src), created: false };
+  if (/\(guest\)$/.test(agentName(src))) {
+    await ensureGuestRestrictions(request, src.id); // repairs a guest agent left without them
+    return { agentId: src.id, name: agentName(src), created: false };
+  }
   const existing = findGuestAgent(agents, agentId);
-  if (existing) return { agentId: existing.id, name: agentName(existing), created: false };
+  if (existing) {
+    await ensureGuestRestrictions(request, existing.id);
+    return { agentId: existing.id, name: agentName(existing), created: false };
+  }
 
   const name = guestName(agentName(src));
   const model = typeof src.model === 'string' ? src.model : src.model?.primary;
@@ -41,20 +74,19 @@ export async function createGuestAgent(request, agentId) {
   }, 60_000);
   const id = created.agentId;
 
-  // Personality only; never MEMORY.md / USER.md.
+  // Restrictions first: if anything after this fails, the agent is still safe to exist.
+  await ensureGuestRestrictions(request, id);
+  if (!(await waitForAgent(request, id))) throw new Error(`The gateway didn't load ${name} yet; try again`);
+
+  // Personality only; never MEMORY.md / USER.md. Best effort (a guest without it still works).
   for (const file of PERSONALITY_FILES) {
     const got = await request('agents.files.get', { agentId: src.id, name: file }).catch(() => null);
     const content = got?.file && !got.file.missing ? got.file.content : null;
-    if (typeof content === 'string' && content.trim()) await request('agents.files.set', { agentId: id, name: file, content });
+    if (typeof content !== 'string' || !content.trim()) continue;
+    for (let i = 0; i < 5; i++) {
+      try { await request('agents.files.set', { agentId: id, name: file, content }); break; }
+      catch (e) { if (i === 4 || !/not found/i.test(e.message)) break; await wait(400); }
+    }
   }
-
-  // Tool deny list on the guest agent (per-agent tools override the global ones).
-  const cfg = await request('config.get', {});
-  await request('config.patch', {
-    raw: JSON.stringify({ agents: { entries: { [id]: { tools: { deny: GUEST_TOOLS_DENY } } } } }),
-    ...(cfg?.hash ? { baseHash: cfg.hash } : {}),
-    replacePaths: [`agents.entries.${id}.tools.deny`],
-    note: `ClawChats sharing: guest version of ${agentName(src)}`,
-  }, 60_000);
   return { agentId: id, name, created: true };
 }
