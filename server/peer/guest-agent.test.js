@@ -36,8 +36,12 @@ test('guest agent: same model + personality, no private memory, deny list applie
   assert.equal(patch.baseHash, 'h1');
   // Allowlist (minimal profile) plus every group that reaches beyond its own folder denied on top.
   assert.equal(GUEST_TOOLS.profile, 'minimal');
+  // File tools pinned to the guest's own folder; nothing extra allowed beyond files + exec.
+  assert.equal(GUEST_TOOLS.fs.workspaceOnly, true);
+  assert.deepEqual(GUEST_TOOLS.alsoAllow, ['group:fs', 'group:runtime']);
   for (const t of ['group:sessions', 'group:messaging', 'group:automation', 'group:ui', 'group:nodes', 'group:plugins', 'group:agents',
-    'sessions_search', 'conversations_send', 'secrets', 'computer', 'message', 'cron', 'browser', 'gateway']) assert.ok(GUEST_TOOLS_DENY.includes(t), t);
+    'sessions_search', 'conversations_send', 'secrets', 'computer', 'message', 'cron', 'browser', 'gateway',
+    'view_image', 'pdf']) assert.ok(GUEST_TOOLS_DENY.includes(t), t); // view_image/pdf ignore permission mode: denied
 
   const again = await createGuestAgent(g.request, 'jarvis');
   assert.deepEqual(again, { agentId: 'jarvis-guest', name: 'Jarvis (guest)', created: false });
@@ -69,4 +73,9 @@ test('hasGuestRestrictions: only a policy at least as narrow as the guest one pa
   assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, deny: GUEST_TOOLS_DENY.slice(1) }), false);
   assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, allow: ['*'] }), false);
   assert.equal(hasGuestRestrictions(undefined), false);
+  // File tools must be workspace-pinned.
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, fs: undefined }), false);
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, fs: { workspaceOnly: false } }), false);
+  // A guest made before view_image/pdf were removed (still in alsoAllow) no longer passes.
+  assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, alsoAllow: ['group:fs', 'group:runtime', 'view_image', 'pdf'] }), false);
 });

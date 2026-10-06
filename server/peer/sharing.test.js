@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Database } from '../bootstrap/native.js';
-import { SharingManager } from './sharing.js';
+import { SharingManager, defangLocalPaths } from './sharing.js';
 import { loadOrCreatePeerKey } from './keys.js';
 import { GUEST_TOOLS } from './guest-agent.js';
 
@@ -199,6 +199,63 @@ test('a guest agent whose restrictions were removed is not served', async () => 
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
 });
 
+test('on connect, guests made earlier get the current restrictions; up-to-date and deleted ones are left alone', async () => {
+  const old = { profile: 'minimal', alsoAllow: ['group:fs', 'group:runtime', 'view_image', 'pdf'], deny: ['message'] };
+  const entries = { 'old-guest': { tools: old }, 'ok-guest': { tools: GUEST_TOOLS } };
+  const patches = [];
+  const request = async (method, params) => {
+    if (method === 'agents.list') return { agents: [{ id: 'old-guest' }, { id: 'ok-guest' }] };
+    if (method === 'config.get') return { hash: 'h', parsed: { agents: { entries } } };
+    if (method === 'config.patch') {
+      patches.push(params);
+      const { agents } = JSON.parse(params.raw);
+      // Like the gateway: shrinking an array needs its exact path in replacePaths.
+      for (const [id, { tools }] of Object.entries(agents.entries)) {
+        for (const k of ['alsoAllow', 'deny']) {
+          const was = entries[id]?.tools?.[k] || [];
+          if (was.some(t => !tools[k].includes(t)) && !params.replacePaths.includes(`agents.entries.${id}.tools.${k}`)) throw new Error(`would remove entries from agents.entries.${id}.tools.${k}`);
+        }
+      }
+      Object.assign(entries, agents.entries);
+      return { ok: true };
+    }
+    return { ok: true };
+  };
+  const db = new Database(':memory:');
+  const m = new SharingManager({ getDb: () => db, request, key: keyIn(), gatewayId: () => 'gwK', signal: () => {}, openPeer: async () => {}, log: quiet });
+  for (const id of ['old-guest', 'ok-guest', 'gone-guest']) m.markGuestAgent(id);
+  assert.deepEqual(await m.migrateGuestAgents(), ['old-guest']);
+  assert.equal(patches.length, 1);
+  assert.deepEqual(entries['old-guest'].tools, JSON.parse(JSON.stringify(GUEST_TOOLS)));
+  assert.deepEqual(await m.migrateGuestAgents(), []); // idempotent
+});
+
+test('guest text never carries a local image path the gateway would load', async () => {
+  // The gateway's prompt image detection (openclaw detectImageReferences, 2026.9.7).
+  const ext = 'png|jpe?g|gif|webp|bmp|heic|heif|tiff?|avif';
+  const gw = [
+    new RegExp(`file://[^\\s<>"'\`\\]]+\\.(?:${ext})`, 'gi'),
+    new RegExp(`(?:^|\\s|["'\`(])([A-Za-z]:[\\\\/][^\\s"'\`()\\[\\]]*\\.(?:${ext}))`, 'gi'),
+    new RegExp(`(?:^|\\s|["'\`(])((\\.\\.?/|[~/])[^\\s"'\`()\\[\\]]*\\.(?:${ext}))`, 'gi'),
+  ];
+  const loads = t => gw.some(r => { r.lastIndex = 0; return r.test(t); });
+  const bad = [
+    '/home/houman/.openclaw/workspace/qa/x.png', 'look ~/Pictures/a.jpg', '(../workspace/b.webp)',
+    '"./c.gif"', '/a/b.png,foo', 'x /a.png.bak/c.png', 'file:///etc/d.png', 'C:\\Users\\e.png', 'see`/f.jpeg`',
+  ];
+  for (const t of bad) {
+    assert.ok(loads(t), `fixture should match: ${t}`);
+    assert.ok(!loads(defangLocalPaths(t)), `still loads: ${t}`);
+  }
+  assert.equal(defangLocalPaths('hi there, 3/4 done').replace(/\u200b/g, ''), 'hi there, 3/4 done');
+
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'what is /home/houman/secret.png' });
+  assert.ok(!loads(s.ownerCalls.find(c => c.method === 'chat.send').params.message));
+});
+
 test('stop sharing aborts runs already going', async () => {
   const s = setup({ reply: () => null });
   s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
@@ -274,4 +331,14 @@ test('keys start unverified; marking verified holds only for that exact key', ()
   assert.equal(r().keyVerified, true);
   assert.equal(o().theirKey, s.kReq.fingerprint); // what the requester's ClawChats shows as "This gateway's key"
   assert.equal(r().theirKey, s.kOwner.fingerprint);
+});
+
+test('a pending request can be verified, and stays verified once approved', () => {
+  const s = setup();
+  const o = () => s.owner.list()[0];
+  assert.equal(o().theirKey, s.kReq.fingerprint);
+  s.owner.markKeyVerified('sh1');
+  assert.equal(o().keyVerified, true);
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  assert.equal(o().keyVerified, true);
 });

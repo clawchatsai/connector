@@ -16,12 +16,22 @@
 import crypto from 'node:crypto';
 import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
-import { hasGuestRestrictions } from './guest-agent.js';
+import { hasGuestRestrictions, ensureGuestRestrictions } from './guest-agent.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_DAILY_CAP = 50;
 const MAX_CONCURRENT_TURNS = 2;   // per share: the daily cap alone would allow 50 parallel 10-minute runs
 const ACCESS_MODES = { restricted: 'read-only', trusted: 'guarded' };
+/**
+ * The gateway loads any local image path or file:// URL written in a prompt (detectImageReferences),
+ * ignoring the agent's tool policy and fs.workspaceOnly, so a guest could type the path of one of the
+ * owner's screenshots and have the agent describe it. A zero-width space before each path with a file
+ * extension (and inside `file://`) stops that match; the agent still reads the text normally, and
+ * other text (`/commands`, `~`) passes through unchanged.
+ */
+export const defangLocalPaths = text => text
+  .replace(/file:\/\//gi, 'file:\u200b//')
+  .replace(/(^|[\s"'`(])(?=(?:\.\.?\/|[~/]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
 const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team chat on behalf of your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 
 const today = () => new Date().toISOString().slice(0, 10);
@@ -123,9 +133,10 @@ export class SharingManager {
     });
   }
 
-  /** The other side's key this gateway trusts for a share (owner: from the signed grant; requester: the pin). */
+  /** The other side's key this gateway trusts for a share (owner: from the signed grant, or the request's key
+   *  while pending, which approving pins; requester: the pin). Same source as list()'s "Their key". */
   _theirKey(s) {
-    if (s?.as === 'owner') return this._grant(s.id)?.grant.requesterPubKey || null;
+    if (s?.as === 'owner') return this._grant(s.id)?.grant.requesterPubKey || s.requester?.pubKey || null;
     return this._db().prepare('SELECT owner_pubkey FROM peer_pins WHERE share_id = ?').get(s?.id)?.owner_pubkey || null;
   }
 
@@ -164,6 +175,24 @@ export class SharingManager {
   /** Remember an agent created here as a guest version (ClawChats → Sharing). */
   markGuestAgent(agentId) {
     this._db().prepare('INSERT OR IGNORE INTO peer_guest_agents (agent_id, created_at) VALUES (?, ?)').run(agentId, Date.now());
+  }
+
+  /**
+   * Bring every guest version made here up to the current guest policy, on each gateway connect,
+   * so a tightened policy reaches existing guests without the owner re-approving their shares.
+   * Skips agents that no longer exist (patching them would leave a stray config entry).
+   */
+  async migrateGuestAgents() {
+    const ids = this._db().prepare('SELECT agent_id FROM peer_guest_agents').all().map(r => r.agent_id);
+    if (!ids.length) return [];
+    const live = new Set(((await this.request('agents.list', {}))?.agents || []).map(a => a.id));
+    const updated = [];
+    for (const id of ids.filter(i => live.has(i))) {
+      try { if (await ensureGuestRestrictions(this.request, id)) updated.push(id); }
+      catch (e) { this.log.warn?.(`[sharing] couldn't update guest restrictions for ${id}: ${e.message}`); }
+    }
+    if (updated.length) this.log.info?.(`[sharing] guest restrictions updated: ${updated.join(', ')}`);
+    return updated;
   }
 
   /** Approve (or change) a share: sign and store the grant, send it to the signal server. */
@@ -280,7 +309,7 @@ export class SharingManager {
     try {
       if (!this._grant(shareId)) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' }); // revoked while setting up
       await this.request('chat.send', {
-        sessionKey, message: `${GUEST_NOTE(name)}\n\n${p.message}`, deliver: false, idempotencyKey: runId,
+        sessionKey, message: defangLocalPaths(`${GUEST_NOTE(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
         timeoutMs: TURN_TIMEOUT_MS, suppressCommandInterpretation: true,
         expectedPermissionMode: permissionMode, expectedToolOverrides: toolOverrides,
       }, 30_000);

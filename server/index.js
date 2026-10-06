@@ -88,6 +88,7 @@ export function createApp(config = {}) {
   // Team chats: several agents in one thread (server/team.js).
   const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, broadcast, titler: createTitler(config.llm), remote: sharing });
   gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
+  gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); };
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
 
   // A session's working root, for relative file links (gateway resolveSessionWorkspaceRoots:
