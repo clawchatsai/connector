@@ -252,12 +252,16 @@ export async function handleWorkspaceUpload(req, res, query) {
   send(res, 200, { ok: true, uploaded });
 }
 
+function isBadName(name) {
+  return name === '.' || name === '..' || /[/\\\0]/.test(name) || name.trim() !== name;
+}
+
 // Creates one empty file or folder named `name` inside the directory `path`.
 export function handleWorkspaceCreate(req, res, query) {
   const { path: parentPath, name, type } = query;
   if (!parentPath || !name) return sendError(res, 400, 'Missing path or name parameter');
   if (type !== 'file' && type !== 'dir') return sendError(res, 400, 'type must be file or dir');
-  if (name === '.' || name === '..' || /[/\\\0]/.test(name) || name.trim() !== name) return sendError(res, 400, 'Invalid name');
+  if (isBadName(name)) return sendError(res, 400, 'Invalid name');
   const parent = resolveInHome(parentPath);
   if (!parent) return sendError(res, 403, 'Access denied');
   if (!fs.existsSync(parent) || !fs.statSync(parent).isDirectory()) return sendError(res, 404, 'Target directory not found');
@@ -271,3 +275,55 @@ export function handleWorkspaceCreate(req, res, query) {
   }
   send(res, 200, { ok: true, path: target + (type === 'dir' ? '/' : ''), type });
 }
+
+// `name` inside `dir`, or with " (2)", " (3)"... before the extension when that is taken.
+function freeName(dir, name) {
+  if (!exists(path.join(dir, name))) return name;
+  const ext = path.extname(name);
+  const stem = path.basename(name, ext);
+  for (let n = 2; ; n++) {
+    const candidate = `${stem} (${n})${ext}`;
+    if (!exists(path.join(dir, candidate))) return candidate;
+  }
+}
+
+// Moves (op 'move') or copies (op 'copy') `path` into directory `dir` as `name` (default: its
+// current name). An existing target is a 409 unless `unique=1`, which picks a free "name (2)".
+// Folders copy recursively; a folder can't go inside itself.
+function transfer(res, query, op) {
+  const { path: srcPath, dir: dirPath, unique } = query;
+  if (!srcPath || !dirPath) return sendError(res, 400, 'Missing path or dir parameter');
+  const src = resolveInHome(srcPath);
+  const dir = resolveInHome(dirPath);
+  if (!src || !dir || src === HOME) return sendError(res, 403, 'Access denied');
+  if (!exists(src)) return sendError(res, 404, 'Path not found');
+  if (!exists(dir) || !fs.statSync(dir).isDirectory()) return sendError(res, 404, 'Target directory not found');
+  let name = query.name || path.basename(src);
+  if (isBadName(name)) return sendError(res, 400, 'Invalid name');
+  const isDir = fs.statSync(src).isDirectory();
+  if (isDir && (dir === src || dir.startsWith(src + path.sep))) return sendError(res, 400, 'Can\'t put a folder inside itself');
+  let target = path.join(dir, name);
+  if (target === src && op === 'move') return send(res, 200, { ok: true, path: target + (isDir ? '/' : '') });
+  if (exists(target)) {
+    if (unique !== '1') return sendError(res, 409, `"${name}" already exists`);
+    name = freeName(dir, name);
+    target = path.join(dir, name);
+  }
+  try {
+    if (op === 'copy') fs.cpSync(src, target, { recursive: true, errorOnExist: true, force: false });
+    else {
+      try { fs.renameSync(src, target); }
+      catch (err) {
+        if (err.code !== 'EXDEV') throw err;
+        fs.cpSync(src, target, { recursive: true, errorOnExist: true, force: false });
+        fs.rmSync(src, { recursive: true, force: true });
+      }
+    }
+  } catch (err) {
+    return sendError(res, 500, `${op === 'copy' ? 'Copy' : 'Move'} failed: ${err.message}`);
+  }
+  send(res, 200, { ok: true, path: target + (isDir ? '/' : ''), type: isDir ? 'dir' : 'file' });
+}
+
+export function handleWorkspaceMove(req, res, query) { return transfer(res, query, 'move'); }
+export function handleWorkspaceCopy(req, res, query) { return transfer(res, query, 'copy'); }

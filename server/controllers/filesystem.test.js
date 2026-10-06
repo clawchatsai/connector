@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { handleWorkspaceFileRead, handleWorkspaceCreate, resolveReadPath } from './filesystem.js';
+import { handleWorkspaceFileRead, handleWorkspaceCreate, handleWorkspaceMove, handleWorkspaceCopy, resolveReadPath } from './filesystem.js';
 
 function read(filePath, workspaceDir) {
   const out = { status: 0, body: '' };
@@ -158,6 +158,67 @@ test('create: makes an empty file or folder inside home, rejects bad names and e
     assert.equal(create({ path: path.join(dir, 'missing'), name: 'x', type: 'dir' }).status, 404);
     assert.equal(create({ path: '/tmp', name: 'cc-x', type: 'dir' }).status, 403);
     assert.equal(create({ path: os.homedir() + '-sibling', name: 'x', type: 'dir' }).status, 403);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function call(handler, query) {
+  const out = { status: 0, body: null };
+  const res = {
+    writeHead(status) { out.status = status; },
+    setHeader() {},
+    end(body) { out.body = JSON.parse(String(body ?? 'null')); },
+  };
+  handler({}, res, query);
+  return out;
+}
+
+test('move: renames in place, moves into another folder, refuses clashes unless unique', () => {
+  const dir = fs.mkdtempSync(path.join(os.homedir(), '.cc-move-test-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'a.md'), 'A');
+    fs.writeFileSync(path.join(dir, 'b.md'), 'B');
+    fs.mkdirSync(path.join(dir, 'sub'));
+    const renamed = call(handleWorkspaceMove, { path: path.join(dir, 'a.md'), dir, name: 'c.md' });
+    assert.equal(renamed.status, 200);
+    assert.equal(renamed.body.path, path.join(dir, 'c.md'));
+    assert.equal(fs.readFileSync(path.join(dir, 'c.md'), 'utf8'), 'A');
+    assert.ok(!fs.existsSync(path.join(dir, 'a.md')));
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'c.md'), dir, name: 'b.md' }).status, 409);
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'c.md'), dir, name: 'x/y' }).status, 400);
+    // Moving onto itself is a no-op, not a clash.
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'c.md'), dir }).status, 200);
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'c.md'), dir: path.join(dir, 'sub') }).status, 200);
+    assert.equal(fs.readFileSync(path.join(dir, 'sub', 'c.md'), 'utf8'), 'A');
+    fs.writeFileSync(path.join(dir, 'c.md'), 'A2');
+    const clash = call(handleWorkspaceMove, { path: path.join(dir, 'c.md'), dir: path.join(dir, 'sub'), unique: '1' });
+    assert.equal(clash.body.path, path.join(dir, 'sub', 'c (2).md'));
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'sub'), dir: path.join(dir, 'sub') }).status, 400);
+    assert.equal(call(handleWorkspaceMove, { path: dir, dir: path.join(dir, 'sub') }).status, 400);
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'missing'), dir }).status, 404);
+    assert.equal(call(handleWorkspaceMove, { path: path.join(dir, 'b.md'), dir: '/tmp' }).status, 403);
+    assert.equal(call(handleWorkspaceMove, { path: os.homedir(), dir }).status, 403);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('copy: copies files and folders, numbering clashes with unique', () => {
+  const dir = fs.mkdtempSync(path.join(os.homedir(), '.cc-copy-test-'));
+  try {
+    fs.mkdirSync(path.join(dir, 'src', 'deep'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'deep', 'f.txt'), 'F');
+    fs.writeFileSync(path.join(dir, 'a.md'), 'A');
+    const dup = call(handleWorkspaceCopy, { path: path.join(dir, 'a.md'), dir, name: 'a copy.md', unique: '1' });
+    assert.equal(dup.body.path, path.join(dir, 'a copy.md'));
+    assert.equal(call(handleWorkspaceCopy, { path: path.join(dir, 'a.md'), dir, name: 'a copy.md', unique: '1' }).body.path, path.join(dir, 'a copy (2).md'));
+    assert.equal(call(handleWorkspaceCopy, { path: path.join(dir, 'a.md'), dir }).status, 409);
+    assert.equal(fs.readFileSync(path.join(dir, 'a.md'), 'utf8'), 'A');
+    const folder = call(handleWorkspaceCopy, { path: path.join(dir, 'src'), dir, unique: '1' });
+    assert.equal(folder.body.path, path.join(dir, 'src (2)') + '/');
+    assert.equal(fs.readFileSync(path.join(dir, 'src (2)', 'deep', 'f.txt'), 'utf8'), 'F');
+    assert.equal(call(handleWorkspaceCopy, { path: path.join(dir, 'src'), dir: path.join(dir, 'src', 'deep') }).status, 400);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
