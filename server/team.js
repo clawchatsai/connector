@@ -148,15 +148,21 @@ export class TeamCoordinator {
   }
 
   _remoteAgents() {
-    try { return (this.remote?.remoteAgents() || []).map(a => ({ agentId: a.agentId, name: a.name, remote: true, ownerName: a.ownerName })); }
-    catch { return []; }
+    let list = [];
+    try { list = (this.remote?.remoteAgents() || []).map(a => ({ agentId: a.agentId, name: a.name, remote: true, ownerName: a.ownerName })); }
+    catch { /* sharing unavailable */ }
+    // Names outlive the share: a room keeps showing "Jarvis · Kamil" after the owner stops sharing.
+    for (const a of list) (this._remoteNames ??= new Map()).set(a.agentId, { name: a.name, ownerName: a.ownerName });
+    return list;
   }
+
+  _remoteName(agentId) { return this._remoteNames?.get(agentId) || null; }
 
   static isRemote(agentId) { return String(agentId || '').startsWith('peer:'); }
 
   async _named(agentIds) {
     const all = await this.agents();
-    return agentIds.map(id => all.find(a => a.agentId === id) || { agentId: id, name: id });
+    return agentIds.map(id => all.find(a => a.agentId === id) || { agentId: id, name: this._remoteName(id)?.name || id });
   }
 
   // ── Rooms ──────────────────────────────────────────────────────────
@@ -181,7 +187,8 @@ export class TeamCoordinator {
         if (!TeamCoordinator.isRemote(m.agentId)) return { agentId: m.agentId, workKey: m.workKey };
         const a = this._remoteAgents().find(x => x.agentId === m.agentId);
         // A share that ended keeps its member, shown as unavailable.
-        return { agentId: m.agentId, workKey: null, remote: true, name: a?.name || null, ownerName: a?.ownerName || null, available: !!a };
+        const known = a || this._remoteName(m.agentId);
+        return { agentId: m.agentId, workKey: null, remote: true, name: known?.name || null, ownerName: known?.ownerName || null, available: !!a };
       }),
       running: live ? [...live.running.keys()] : [],
       queued: live?.queued || 0,

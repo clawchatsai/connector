@@ -342,6 +342,12 @@ test('shared (remote) agents: in the roster, turns over the peer link, streamed,
   // A share that ended: member stays, marked unavailable; unknown remote ids are refused.
   remote.remoteAgents = () => [];
   assert.equal(h.team.room(roomKey).agents[1].available, false);
+  assert.equal(h.team.room(roomKey).agents[1].name, 'Jarvis · Kamil'); // the name outlives the share
+  mode = 'offline';
+  await h.team.send(roomKey, { text: '@all after', userLabel: 'H' });
+  await h.settle();
+  const note = h.room(roomKey).at(-1);
+  assert.ok(note.startsWith('[Jarvis · Kamil]\n\n') && note.includes('⚠️'), note); // labelled by name, not by peer id
   await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'peer:sh9:ghost'] }), /unknown agent/);
 });
 
