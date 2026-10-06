@@ -53,11 +53,15 @@ export function splitLabel(text) {
 export function parseMentions(text, agents) {
   const ids = new Set();
   const re = /(^|[^\w@])@([\w.-]+)/g;
+  // Someone else's agent is "Jarvis · Kamil": @Jarvis-Kamil, or @Jarvis when that's unambiguous.
+  const exact = a => [a.agentId, a.name, a.name && a.name.replace(/\s*·\s*/g, '-')].filter(Boolean).map(norm);
+  const short = a => (a.name && a.name.includes('·') ? [norm(a.name.split('·')[0])] : []);
   let m;
   while ((m = re.exec(text || ''))) {
     const word = norm(m[2]).replace(/[.-]+$/, '');
     if (ALL_WORDS.has(word)) return { all: true };
-    for (const a of agents) if (word === norm(a.agentId) || (a.name && word === norm(a.name))) ids.add(a.agentId);
+    const hits = agents.filter(a => exact(a).includes(word));
+    for (const a of hits.length ? hits : agents.filter(a => short(a).includes(word))) ids.add(a.agentId);
   }
   return { agentIds: [...ids] };
 }

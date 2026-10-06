@@ -344,3 +344,11 @@ test('shared (remote) agents: in the roster, turns over the peer link, streamed,
   assert.equal(h.team.room(roomKey).agents[1].available, false);
   await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'peer:sh9:ghost'] }), /unknown agent/);
 });
+
+test('mentions of someone else\'s agent: @Jarvis-Kamil, or @Jarvis when unambiguous; exact names win', () => {
+  const agents = [{ agentId: 'dev', name: 'dev' }, { agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil' }, { agentId: 'peer:sh2:dev', name: 'dev · Owner' }];
+  assert.deepEqual(parseMentions('@Jarvis-Kamil hi', agents), { agentIds: ['peer:sh1:jarvis'] });
+  assert.deepEqual(parseMentions('@jarvis hi', agents), { agentIds: ['peer:sh1:jarvis'] });
+  assert.deepEqual(parseMentions('@dev hi', agents), { agentIds: ['dev'] }); // the local one, exactly named
+  assert.deepEqual(parseMentions('@dev-Owner hi', agents), { agentIds: ['peer:sh2:dev'] });
+});
