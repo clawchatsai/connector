@@ -403,3 +403,67 @@ test('stop: recovery that finds nothing leaves the marker only when asked for', 
   await new Promise(r => setTimeout(r, 20));
   assert.deepEqual(h.room(roomKey), ['[Dev]\n\n*[stopped before replying]*']);
 });
+
+test("authority comes from who asked: an agent answering someone else's agent runs as the version shared with them", async () => {
+  const forCalls = [];
+  let shared = true;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async () => ({ state: 'final', text: 'good question, @dev how did you fix it?' }),
+    abort: async () => {},
+    actingForName: () => (shared ? 'Kamil' : null),
+    localTurnFor: async (localId, remoteId, args, { onDelta }) => {
+      forCalls.push({ localId, remoteId, args });
+      if (!shared) return null;
+      onDelta('lim');
+      return { state: 'final', text: 'restarted the gateway' };
+    },
+  };
+  const h = harness(agent => `${agent} full answer`, { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  h.team.setDiscuss(roomKey, true);
+  const devSends = () => h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:dev:')).length;
+
+  // The owner asks dev directly: dev runs as itself.
+  await h.team.send(roomKey, { text: '@dev status?', userLabel: 'H' });
+  await h.settle();
+  assert.equal(devSends(), 1);
+
+  // Kamil's agent asks dev: dev runs for Kamil (sharing's localTurnFor), never as itself.
+  await h.team.send(roomKey, { text: '@Jarvis-Kamil seen this crash?', userLabel: 'H' });
+  await h.settle();
+  assert.equal(devSends(), 1, 'no full-strength run for a request from someone else\'s agent');
+  assert.equal(forCalls.length, 1);
+  assert.deepEqual([forCalls[0].localId, forCalls[0].remoteId, forCalls[0].args.roomId], ['dev', 'peer:sh1:jarvis', roomKey]);
+  assert.ok(h.room(roomKey).includes('[Dev]\n\nrestarted the gateway'));
+  const authors = h.team.room(roomKey).authors;
+  const entry = Object.values(authors).find(a => a.agentId === 'dev' && a.actingFor);
+  assert.equal(entry?.actingFor, 'Kamil');
+  assert.ok(h.events.some(e => e.event === 'team-remote-delta' && e.agentId === 'dev' && e.text === 'lim'));
+
+  // Not shared with Kamil: dev stays out, and says so because Jarvis asked it by name.
+  shared = false;
+  await h.team.send(roomKey, { text: '@Jarvis-Kamil again?', userLabel: 'H' });
+  await h.settle();
+  assert.equal(devSends(), 1);
+  assert.match(h.room(roomKey).at(-1), /^\[Dev\]\n\n\*Dev isn't shared with Kamil, so it doesn't answer Kamil's agents\.\*$/);
+});
+
+test('rounds: a per-room host setting, validated', async () => {
+  let n = 0;
+  const h = harness(agent => `@${agent === 'dev' ? 'Atlas' : 'Dev'} reply ${++n}`);
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  h.team.setDiscuss(roomKey, true);
+  assert.equal(h.team.room(roomKey).rounds, 3);
+  assert.throws(() => h.team.setRounds(roomKey, 0), /rounds must be/);
+  assert.throws(() => h.team.setRounds(roomKey, 11), /rounds must be/);
+  h.team.setRounds(roomKey, 1);
+  assert.equal(h.team.room(roomKey).rounds, 1);
+  await h.team.send(roomKey, { text: '@all go', userLabel: 'H' });
+  await h.settle();
+  assert.equal(h.calls.filter(c => c.method === 'chat.send').length, 2, 'one round: each agent once');
+  h.team.setRounds(roomKey, 5);
+  await h.team.send(roomKey, { text: '@all again', userLabel: 'H' });
+  await h.settle();
+  assert.ok(h.calls.filter(c => c.method === 'chat.send').length > 4, 'more rounds when allowed');
+});
