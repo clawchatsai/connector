@@ -8,7 +8,7 @@ import { SessionLens } from './session-lens.js';
 const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'Dev' } }, { id: 'atlas', identity: { name: 'Atlas' } }];
 
 /** Fake gateway. `reply(agentId, prompt)` returns the agent's reply text, null (abort) or a promise. */
-function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null } = {}) {
+function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS } = {}) {
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
   let clock = 1_000, seq = 0;
@@ -17,7 +17,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
   const request = async (method, params) => {
     calls.push({ method, params });
     switch (method) {
-      case 'agents.list': return { agents: AGENTS };
+      case 'agents.list': return { agents };
       case 'sessions.create': sessions.set(params.key, []); return { ok: true, key: params.key };
       case 'sessions.describe': return { session: { key: params.key } };
       case 'sessions.title.prepare': return { title: preparedTitle };
@@ -466,4 +466,141 @@ test('rounds: a per-room host setting, validated', async () => {
   await h.team.send(roomKey, { text: '@all again', userLabel: 'H' });
   await h.settle();
   assert.ok(h.calls.filter(c => c.method === 'chat.send').length > 4, 'more rounds when allowed');
+});
+
+/**
+ * Two gateways: Houman hosts (gwH), Kamil is a member (gwK). Kamil shares Jarvis (guest) with Houman
+ * as share sh1; Houman shares dev with Kamil. Each side's `remote` is a fake sharing manager whose
+ * personRequest calls the other coordinator's onRoom, as the peer link would.
+ */
+function twoGateways({ devShared = true } = {}) {
+  const forCalls = [];
+  const sides = {};
+  const mk = (self, other, name) => ({
+    gatewayId: () => self,
+    selfName: () => name,
+    contact: gw => (gw === other ? { personId: other, name: other === 'gwK' ? 'Kamil' : 'Houman', email: null } : null),
+    personRequest: async (gw, method, params) => {
+      if (gw !== other) throw Object.assign(new Error('not connected'), { code: 'not_connected' });
+      return sides[other].team.onRoom(method, JSON.parse(JSON.stringify(params)), self);
+    },
+    ownerOf: id => (String(id).startsWith('peer:sh1:') && self === 'gwH' ? 'gwK' : null),
+    ownsShare: shareId => shareId === 'sh1' && self === 'gwK',
+    remoteAgents: () => (self === 'gwH' ? [{ agentId: 'peer:sh1:jarvis-guest', name: 'Jarvis · Kamil', ownerName: 'Kamil' }] : []),
+    turn: async () => ({ state: 'final', text: 'guest jarvis here' }),
+    abort: async () => {},
+    actingForName: () => 'Kamil',
+    localTurnFor: async (localId, who, args) => {
+      forCalls.push({ localId, who, args });
+      return devShared ? { state: 'final', text: `${localId} for kamil` } : null;
+    },
+  });
+  sides.gwH = harness(agent => `${agent} full`, { remote: mk('gwH', 'gwK', 'Houman Satarian') });
+  sides.gwK = harness(agent => `${agent} full on kamil`, {
+    remote: mk('gwK', 'gwH', 'Kamil Gronowski'),
+    agents: [{ id: 'main', identity: {} }, { id: 'jarvis', name: 'Jarvis' }, { id: 'jarvis-guest', name: 'Jarvis (guest)' }],
+  });
+  const settle = async () => {
+    for (let i = 0; i < 6; i++) {
+      await new Promise(r => setTimeout(r, 350)); // pushes are batched (300 ms)
+      await sides.gwH.settle(); await sides.gwK.settle();
+      for (const c of sides.gwK.team._syncChains?.values() || []) await c.catch(() => {});
+    }
+  };
+  return { H: sides.gwH, K: sides.gwK, settle, forCalls };
+}
+
+test('people: a person gets a live copy, posts back, their own agent runs on their gateway, removal ends it', async () => {
+  const { H, K, settle, forCalls } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await H.team.send(roomKey, { text: 'before kamil joins', userLabel: 'Houman' });
+  await settle();
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await settle();
+
+  // Kamil's copy: a local room session, hosted by Houman, with the history (Houman chose "all").
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.ok(copy, 'a live copy exists on Kamil\'s gateway');
+  assert.equal(copy.replica.hostName, 'Houman Satarian');
+  assert.ok(K.room(copy.roomKey).some(t => t.endsWith('before kamil joins')));
+  assert.deepEqual(copy.people.map(p => [p.name, !!p.host, !!p.me]), [['Houman Satarian', true, false], ['Kamil', false, true]]);
+  assert.ok(copy.agents.find(a => a.agentId === 'peer:sh1:jarvis-guest').mine, 'Kamil sees Jarvis as his own agent');
+  assert.ok(K.events.some(e => e.event === 'team-invited'));
+
+  // Kamil asks his own Jarvis: it runs at full strength on Kamil's gateway; Houman's never runs it.
+  const kSends = () => K.calls.filter(c => c.method === 'chat.send').map(c => c.params.sessionKey);
+  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil check yours' });
+  await settle();
+  assert.ok(kSends().some(k => k.startsWith('agent:jarvis:')), 'the real Jarvis ran on Kamil\'s gateway');
+  assert.ok(!kSends().some(k => k.startsWith('agent:jarvis-guest:')));
+  const hostRoom = H.room(roomKey);
+  assert.ok(hostRoom.includes('[Kamil]\n\n@Jarvis-Kamil check yours'), 'Kamil\'s message is in the host room under his name');
+  assert.ok(hostRoom.includes('[Jarvis · Kamil]\n\njarvis full on kamil'), 'Jarvis\'s reply reached the host room');
+  const hAuthors = H.team.room(roomKey).authors;
+  assert.ok(Object.values(hAuthors).some(a => a.type === 'person' && a.personId === 'gwK' && a.name === 'Kamil'));
+  // ...and came back to Kamil's copy, where his own message shows as his.
+  const kAuthors = K.team.room(copy.roomKey).authors;
+  assert.ok(Object.values(kAuthors).some(a => a.type === 'user'));
+  assert.ok(K.room(copy.roomKey).some(t => t.endsWith('jarvis full on kamil')));
+
+  // Kamil asks Houman's dev: dev answers him as the version shared with him, never at full strength.
+  const devFull = () => H.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:dev:')).length;
+  const before = devFull();
+  await K.team.send(copy.roomKey, { text: '@dev what version are you on?' });
+  await settle();
+  assert.equal(devFull(), before);
+  assert.deepEqual(forCalls.map(c => [c.localId, c.who]), [['dev', 'person:gwK']]);
+  assert.ok(H.room(roomKey).includes('[Dev]\n\ndev for kamil'));
+  assert.ok(Object.values(H.team.room(roomKey).authors).some(a => a.agentId === 'dev' && a.actingFor === 'Kamil'));
+
+  // Houman removes Kamil: Jarvis leaves with him, the copy ends, sending fails.
+  H.team.removePerson(roomKey, 'gwK');
+  await settle();
+  assert.ok(!H.team.room(roomKey).agents.some(a => a.agentId === 'peer:sh1:jarvis-guest'));
+  assert.equal(K.team.room(copy.roomKey).replica.ended, 'removed');
+  await assert.rejects(K.team.send(copy.roomKey, { text: 'still here?' }), /removed you/);
+});
+
+test("people: adding someone's agent brings them in; 'now' hides the earlier chat; only the host changes the room", async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await H.team.send(roomKey, { text: 'secret plan', userLabel: 'Houman' });
+  await settle();
+  await H.team.addAgent(roomKey, 'peer:sh1:jarvis-guest', { history: 'now' });
+  await settle();
+  assert.deepEqual(H.team.room(roomKey).people.map(p => p.personId), ['gwK']);
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.ok(!K.room(copy.roomKey).some(t => t.includes('secret plan')), "'from now on': nothing earlier");
+  await assert.rejects(K.team.addAgent(copy.roomKey, 'main'), /host/);
+  await assert.rejects(K.team.onRoom('room.post', { roomId: 'agent:dev:dashboard:nope', text: 'x' }, 'gwK'), /not in this team chat/);
+  // A stranger can't post into the room.
+  await assert.rejects(H.team.onRoom('room.post', { roomId: roomKey, text: 'hi' }, 'gwX'), /not in this team chat/);
+  // Kamil leaves: he's out, and so is Jarvis.
+  await K.team.leave(copy.roomKey);
+  await settle();
+  assert.equal(H.team.room(roomKey).people.length, 0);
+  assert.equal(K.team.room(copy.roomKey).replica.ended, 'left');
+});
+
+test('a chat turned into a team chat: agents added later get its earlier history on their first turn, unless "now"', async () => {
+  const h = harness((agent, prompt) => `${agent}: ${/Earlier in this chat/.test(prompt) ? 'saw history' : 'no history'}`);
+  // the original chat with its history
+  h.sessions.set('agent:main:dashboard:orig', [
+    { role: 'user', content: 'how do I fix the gateway crash?', timestamp: 1, __m: { id: 'o1' } },
+    { role: 'assistant', content: [{ type: 'text', text: 'restart with --safe' }], timestamp: 2, __m: { id: 'o2' } },
+  ]);
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev'], sourceKey: 'agent:main:dashboard:orig' });
+  await h.team.addAgent(roomKey, 'atlas', { history: 'now' });
+  await h.team.send(roomKey, { text: '@dev thoughts?', userLabel: 'H' });
+  await h.settle();
+  const devPrompt = h.calls.find(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:dev:')).params.message;
+  assert.match(devPrompt, /Earlier in this chat[\s\S]*how do I fix the gateway crash\?[\s\S]*restart with --safe/);
+  assert.ok(h.room(roomKey).includes('[Dev]\n\ndev: saw history'));
+  // "From now on": no earlier history, and it starts at the newest entry.
+  const atlas = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'atlas');
+  assert.equal(atlas.history, 'now');
+  assert.equal(await h.team._earlier(h.team.store.getRoom(roomKey), atlas).then(t => !!t), true, 'history exists, the turn skips it for "now"');
+  // The chat's own agent already has it in its session.
+  const main = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'main');
+  assert.equal(await h.team._earlier(h.team.store.getRoom(roomKey), main), '');
 });

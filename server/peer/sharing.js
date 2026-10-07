@@ -34,7 +34,7 @@ export const defangLocalPaths = text => text
   .replace(/(^|[\s"'`(])(?=(?:\.\.?\/|[~/]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
 const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team chat on behalf of your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 // The same agent in its owner's own team chat, answering another person's agent (localTurnFor).
-const ACTING_FOR_NOTE = name => `(Shared session: in your owner's team chat, you are answering ${name}'s agent, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
+const ACTING_FOR_NOTE = (name, byPerson) => `(Shared session: in your owner's team chat, you are answering ${byPerson ? name : `${name}'s agent`}, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 
 const today = () => new Date().toISOString().slice(0, 10);
 /** A name that came from the other side, safe to show and to use as a chat label (no brackets, newlines, controls). */
@@ -94,12 +94,14 @@ export class SharingManager {
 
   /** `share-list` from the signal server. Ends links/grants for shares that are gone. */
   setShares(shares) {
+    const first = !this.serverEnabled;
     this.serverEnabled = true;
     this._shares = Array.isArray(shares) ? shares : [];
     const live = new Set(this._shares.filter(s => s.status === 'active').map(s => s.id));
     for (const [shareId, link] of this._links) if (!live.has(shareId)) { link.close(); this._links.delete(shareId); }
     for (const s of this._localGrants()) if (!live.has(s.share_id) && !this._shares.some(x => x.id === s.share_id && x.status === 'pending')) this._revokeLocal(s.share_id);
     this._changed();
+    if (first) setImmediate(() => { try { this.onFirstShares?.(); } catch (e) { this.log.warn?.(`[sharing] ${e.message}`); } });
   }
 
   /** The signal server says a share ended (revoke/decline): stop at once. */
@@ -260,9 +262,95 @@ export class SharingManager {
     this._served.add(link);
     link.on('closed', () => this._served.delete(link));
     link.handle('agents', async () => ({ agents: this._grant(shareId)?.grant.agents || [] }));
-    link.handle('turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false }, emit)); // only localTurnFor sets it
+    link.handle('turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false, byPerson: false }, emit)); // only localTurnFor sets these
     link.handle('abort', async p => this._guestAbort(shareId, p?.turnId));
+    this._wireRooms(link, requesterGatewayId);
     return link;
+  }
+
+  /**
+   * Team chats with people (specs/sharing-people.md) travel over whichever link the two gateways
+   * have, in either direction: the room host pushes its room to members (room.sync), members post,
+   * leave and ask for a fresh copy (room.post / room.leave / room.fetch). `onRoom` (TeamCoordinator)
+   * decides; it gets the other side's gateway id, which the link authenticated.
+   */
+  _wireRooms(link, otherGatewayId) {
+    for (const method of ['room.sync', 'room.post', 'room.leave', 'room.fetch']) {
+      link.handle(method, async p => {
+        if (!this.onRoom) throw Object.assign(new Error('team chats are not available'), { code: 'unavailable' });
+        return this.onRoom(method, p || {}, otherGatewayId);
+      });
+    }
+    const ready = () => { try { this.onPeerReady?.(otherGatewayId); } catch (e) { this.log.warn?.(`[sharing] peer ready: ${e.message}`); } };
+    if (link.ready) setImmediate(ready); else link.once('ready', ready);
+  }
+
+  // ── People (contacts) ──────────────────────────────────────────────
+
+  /** The other person of a share, as this side sees them: { gatewayId, name, email }. */
+  _other(s) {
+    const p = s.as === 'owner' ? s.requester : s.owner;
+    return { gatewayId: p?.gatewayId || null, name: cleanName(p?.name || p?.email, 60) || 'Someone', email: p?.email || null };
+  }
+
+  /**
+   * People this gateway is connected with (an active share either way), by their gateway id:
+   * [{ personId, name, email, shareIds }]. A team chat here can include any of them.
+   */
+  contacts() {
+    const out = new Map();
+    for (const s of this._shares) {
+      if (s.status !== 'active') continue;
+      if (s.as === 'requester' && !this._verifiedGrant(s)) continue;
+      if (s.as === 'owner' && !this._grant(s.id)) continue;
+      const o = this._other(s);
+      if (!o.gatewayId) continue;
+      const c = out.get(o.gatewayId) || { personId: o.gatewayId, name: o.name, email: o.email, shareIds: [] };
+      c.shareIds.push(s.id);
+      out.set(o.gatewayId, c);
+    }
+    return [...out.values()];
+  }
+
+  contact(personId) { return this.contacts().find(c => c.personId === personId) || null; }
+
+  /** The gateway id of whoever owns a shared agent ('peer:<share>:<agent>'), or null. */
+  ownerOf(remoteAgentId) {
+    const id = SharingManager.parseRemoteId(remoteAgentId);
+    return (id && this._shares.find(s => s.id === id.shareId && s.as === 'requester')?.owner?.gatewayId) || null;
+  }
+
+  /** Whether this gateway owns (granted) that share. */
+  ownsShare(shareId) { return !!this._grant(shareId); }
+
+  /** This gateway's person, as the others see them (from any share). */
+  selfName() {
+    for (const s of this._shares) {
+      const me = s.as === 'owner' ? s.owner : s.requester;
+      if (me?.name || me?.email) return cleanName(me.name || me.email, 60);
+    }
+    return null;
+  }
+
+  /** An open link with that person's gateway (either direction), else dial one this side may open. */
+  async _personLink(personId) {
+    for (const [shareId, link] of this._links) {
+      const s = this._shares.find(x => x.id === shareId);
+      if (link.ready && !link.closed && s && this._other(s).gatewayId === personId) return link;
+    }
+    for (const link of this._served) {
+      if (link.ready && !link.closed && this._grant(link.shareId)?.grant.requesterGatewayId === personId) return link;
+    }
+    const dial = this._shares.find(s => s.as === 'requester' && s.status === 'active' && s.owner?.gatewayId === personId && this._verifiedGrant(s));
+    if (!dial) throw Object.assign(new Error(`Can't reach them until they're online`), { code: 'unreachable' });
+    return this._link(dial.id);
+  }
+
+  /** Call a room method on a person's gateway. */
+  async personRequest(personId, method, params, { timeoutMs = 60_000 } = {}) {
+    if (!this.contact(personId)) throw Object.assign(new Error('Not connected with them'), { code: 'not_connected' });
+    const link = await this._personLink(personId);
+    return link.request(method, params, { timeoutMs });
   }
 
   /** Run one guest turn in this gateway's session for (share, room, agent); stream text back. */
@@ -322,7 +410,7 @@ export class SharingManager {
     try {
       if (!this._grant(shareId)) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' }); // revoked while setting up
       await this.request('chat.send', {
-        sessionKey, message: defangLocalPaths(`${(p.inOwnerRoom ? ACTING_FOR_NOTE : GUEST_NOTE)(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
+        sessionKey, message: defangLocalPaths(`${p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
         timeoutMs: TURN_TIMEOUT_MS, suppressCommandInterpretation: true,
         expectedPermissionMode: permissionMode, expectedToolOverrides: toolOverrides,
       }, 30_000);
@@ -444,6 +532,7 @@ export class SharingManager {
       await new Promise((resolve, reject) => { link.once('ready', resolve); link.once('closed', () => reject(new Error(`Couldn't reach ${firstName(s.owner)}'s gateway`))); });
       this._links.set(shareId, link);
       link.on('closed', () => { if (this._links.get(shareId) === link) this._links.delete(shareId); });
+      this._wireRooms(link, s.owner?.gatewayId);
       return link;
     })().finally(() => this._linking.delete(shareId));
     this._linking.set(shareId, p);
@@ -468,11 +557,18 @@ export class SharingManager {
    * active share where they asked for this gateway's agents, matched by their gateway (else email).
    * Returns { shareId, grant } or null when this gateway shares nothing with them.
    */
-  _grantToOwnerOf(remoteAgentId) {
-    const id = SharingManager.parseRemoteId(remoteAgentId);
-    const theirs = id && this._shares.find(s => s.id === id.shareId && s.as === 'requester');
-    if (!theirs) return null;
-    const gw = theirs.owner?.gatewayId, email = String(theirs.owner?.email || '').toLowerCase();
+  _grantToOwnerOf(who) {
+    // `who`: another person's agent ('peer:<share>:<agent>') or a person ('person:<gateway id>').
+    let gw, email;
+    if (String(who || '').startsWith('person:')) {
+      gw = who.slice('person:'.length);
+      email = String(this.contact(gw)?.email || '').toLowerCase();
+    } else {
+      const id = SharingManager.parseRemoteId(who);
+      const theirs = id && this._shares.find(s => s.id === id.shareId && s.as === 'requester');
+      if (!theirs) return null;
+      gw = theirs.owner?.gatewayId; email = String(theirs.owner?.email || '').toLowerCase();
+    }
     const candidates = this._shares.filter(s => s.as === 'owner' && s.status === 'active');
     const mine = candidates.find(s => gw && s.requester?.gatewayId === gw)
       || candidates.find(s => email && String(s.requester?.email || '').toLowerCase() === email);
@@ -499,7 +595,7 @@ export class SharingManager {
     const guestId = findGuestAgent(agents, localAgentId)?.id;
     const shared = g.grant.agents.find(a => a.id === guestId) || g.grant.agents.find(a => a.id === localAgentId);
     if (!shared) return null;
-    return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true },
+    return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true, byPerson: String(remoteAgentId).startsWith('person:') },
       (event, data) => { if (event === 'delta' && typeof data === 'string') onDelta?.(data); });
   }
 
