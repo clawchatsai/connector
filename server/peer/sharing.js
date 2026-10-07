@@ -16,7 +16,7 @@
 import crypto from 'node:crypto';
 import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
-import { hasGuestRestrictions, ensureGuestRestrictions } from './guest-agent.js';
+import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent } from './guest-agent.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_DAILY_CAP = 50;
@@ -33,6 +33,8 @@ export const defangLocalPaths = text => text
   .replace(/file:\/\//gi, 'file:\u200b//')
   .replace(/(^|[\s"'`(])(?=(?:\.\.?\/|[~/]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
 const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team chat on behalf of your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
+// The same agent in its owner's own team chat, answering another person's agent (localTurnFor).
+const ACTING_FOR_NOTE = name => `(Shared session: in your owner's team chat, you are answering ${name}'s agent, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 
 const today = () => new Date().toISOString().slice(0, 10);
 /** A name that came from the other side, safe to show and to use as a chat label (no brackets, newlines, controls). */
@@ -258,7 +260,7 @@ export class SharingManager {
     this._served.add(link);
     link.on('closed', () => this._served.delete(link));
     link.handle('agents', async () => ({ agents: this._grant(shareId)?.grant.agents || [] }));
-    link.handle('turn', (p, emit) => this._guestTurn(shareId, p, emit));
+    link.handle('turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false }, emit)); // only localTurnFor sets it
     link.handle('abort', async p => this._guestAbort(shareId, p?.turnId));
     return link;
   }
@@ -320,7 +322,7 @@ export class SharingManager {
     try {
       if (!this._grant(shareId)) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' }); // revoked while setting up
       await this.request('chat.send', {
-        sessionKey, message: defangLocalPaths(`${GUEST_NOTE(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
+        sessionKey, message: defangLocalPaths(`${(p.inOwnerRoom ? ACTING_FOR_NOTE : GUEST_NOTE)(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
         timeoutMs: TURN_TIMEOUT_MS, suppressCommandInterpretation: true,
         expectedPermissionMode: permissionMode, expectedToolOverrides: toolOverrides,
       }, 30_000);
@@ -457,6 +459,53 @@ export class SharingManager {
       onEvent: (event, data) => { if (event === 'delta' && typeof data === 'string') onDelta?.(data); },
       timeoutMs: TURN_TIMEOUT_MS + 60_000,
     });
+  }
+
+  // ── Acting for someone else (team chats on this gateway) ──────────
+
+  /**
+   * Who another person's agent belongs to, as this gateway's owner-side grant to that person: the
+   * active share where they asked for this gateway's agents, matched by their gateway (else email).
+   * Returns { shareId, grant } or null when this gateway shares nothing with them.
+   */
+  _grantToOwnerOf(remoteAgentId) {
+    const id = SharingManager.parseRemoteId(remoteAgentId);
+    const theirs = id && this._shares.find(s => s.id === id.shareId && s.as === 'requester');
+    if (!theirs) return null;
+    const gw = theirs.owner?.gatewayId, email = String(theirs.owner?.email || '').toLowerCase();
+    const candidates = this._shares.filter(s => s.as === 'owner' && s.status === 'active');
+    const mine = candidates.find(s => gw && s.requester?.gatewayId === gw)
+      || candidates.find(s => email && String(s.requester?.email || '').toLowerCase() === email);
+    const g = mine && this._grant(mine.id);
+    return g ? { shareId: mine.id, grant: g.grant } : null;
+  }
+
+  /** The name to show for whom a local agent acts ("Kamil"), or null. */
+  actingForName(remoteAgentId) {
+    const g = this._grantToOwnerOf(remoteAgentId);
+    return g ? (firstName({ name: g.grant.requesterName }) || 'Someone') : null;
+  }
+
+  /**
+   * Run one of this gateway's agents because another person's agent asked (a team chat here):
+   * authority comes from who asked (specs/sharing-people.md), so it runs as the version shared with
+   * that person (its guest copy, normally) under their grant: access level, daily cap, its own
+   * session in "Shared with <name>". Returns null when that agent isn't shared with them.
+   */
+  async localTurnFor(localAgentId, remoteAgentId, { turnId, roomId, roomTitle, message }, { onDelta } = {}) {
+    const g = this._grantToOwnerOf(remoteAgentId);
+    if (!g) return null;
+    const agents = (await this.request('agents.list', {}))?.agents || [];
+    const guestId = findGuestAgent(agents, localAgentId)?.id;
+    const shared = g.grant.agents.find(a => a.id === guestId) || g.grant.agents.find(a => a.id === localAgentId);
+    if (!shared) return null;
+    return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true },
+      (event, data) => { if (event === 'delta' && typeof data === 'string') onDelta?.(data); });
+  }
+
+  async abortLocalFor(localAgentId, remoteAgentId, turnId) {
+    const g = this._grantToOwnerOf(remoteAgentId);
+    if (g) await this._guestAbort(g.shareId, turnId);
   }
 
   async abort(agentId, turnId) {

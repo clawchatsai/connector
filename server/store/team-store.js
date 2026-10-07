@@ -7,14 +7,18 @@
 //                 seen_at = timestamp of the newest room entry the agent has been given;
 //                 removed = 1: agent taken out of the room; its session stays hidden and is reused
 //                 if the agent is added back
-//   team_entries  author of each injected room entry (the transcript only has a "[Label]" prefix)
+//   team_entries  author of each injected room entry (the transcript only has a "[Label]" prefix);
+//                 acting_for = whose request an agent answered when it wasn't its owner's ("Kamil")
+//   team_rooms.rounds  follow-up rounds per human message when agents discuss (host setting)
 
-const DISCUSS_ROUNDS = 3;
+const DISCUSS_ROUNDS = 3; // default; each room can set 1..MAX_ROUNDS
+const MAX_ROUNDS = 10;
 
 function roomRow(r, members) {
   return {
     roomKey: r.room_key,
     discuss: !!r.discuss,
+    rounds: r.rounds || DISCUSS_ROUNDS,
     sourceKey: r.source_key || null,
     createdAt: r.created_at,
     members: members.map(m => ({ agentId: m.agent_id, workKey: m.work_key || null, seenAt: m.seen_at || 0 })),
@@ -31,6 +35,8 @@ export function createTeamStore(getGlobalDb) {
       g.exec(`CREATE INDEX IF NOT EXISTS team_members_work ON team_members (work_key)`);
       if (!g.prepare('PRAGMA table_info(team_members)').all().some(c => c.name === 'removed')) g.exec('ALTER TABLE team_members ADD COLUMN removed INTEGER NOT NULL DEFAULT 0');
       g.exec(`CREATE TABLE IF NOT EXISTS team_entries (room_key TEXT NOT NULL, message_id TEXT NOT NULL, author_type TEXT NOT NULL, agent_id TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (room_key, message_id))`);
+      if (!g.prepare('PRAGMA table_info(team_entries)').all().some(c => c.name === 'acting_for')) g.exec('ALTER TABLE team_entries ADD COLUMN acting_for TEXT');
+      if (!g.prepare('PRAGMA table_info(team_rooms)').all().some(c => c.name === 'rounds')) g.exec('ALTER TABLE team_rooms ADD COLUMN rounds INTEGER');
       ready = true;
     }
     return g;
@@ -39,6 +45,7 @@ export function createTeamStore(getGlobalDb) {
 
   return {
     DISCUSS_ROUNDS,
+    MAX_ROUNDS,
 
     getRoom(roomKey) {
       const r = db().prepare('SELECT * FROM team_rooms WHERE room_key = ?').get(roomKey);
@@ -87,6 +94,10 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('UPDATE team_rooms SET discuss = ?, updated_at = ? WHERE room_key = ?').run(discuss ? 1 : 0, Date.now(), roomKey);
     },
 
+    setRounds(roomKey, rounds) {
+      db().prepare('UPDATE team_rooms SET rounds = ?, updated_at = ? WHERE room_key = ?').run(rounds, Date.now(), roomKey);
+    },
+
     /** Drops the room; returns the working session keys it had. */
     deleteRoom(roomKey) {
       const work = db().prepare('SELECT work_key FROM team_members WHERE room_key = ? AND work_key IS NOT NULL').all(roomKey).map(m => m.work_key);
@@ -108,16 +119,16 @@ export function createTeamStore(getGlobalDb) {
       return new Set(db().prepare('SELECT work_key FROM team_members WHERE work_key IS NOT NULL').all().map(r => r.work_key));
     },
 
-    recordEntry(roomKey, messageId, { type, agentId = null }) {
-      db().prepare('INSERT OR REPLACE INTO team_entries (room_key, message_id, author_type, agent_id, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(roomKey, messageId, type === 'user' ? 'user' : 'agent', agentId, Date.now());
+    recordEntry(roomKey, messageId, { type, agentId = null, actingFor = null }) {
+      db().prepare('INSERT OR REPLACE INTO team_entries (room_key, message_id, author_type, agent_id, created_at, acting_for) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(roomKey, messageId, type === 'user' ? 'user' : 'agent', agentId, Date.now(), actingFor);
     },
 
-    /** { [messageId]: { type: 'user'|'agent', agentId } } */
+    /** { [messageId]: { type: 'user'|'agent', agentId, actingFor? } } */
     authors(roomKey) {
       const out = {};
-      for (const r of db().prepare('SELECT message_id, author_type, agent_id FROM team_entries WHERE room_key = ?').all(roomKey)) {
-        out[r.message_id] = { type: r.author_type, agentId: r.agent_id };
+      for (const r of db().prepare('SELECT message_id, author_type, agent_id, acting_for FROM team_entries WHERE room_key = ?').all(roomKey)) {
+        out[r.message_id] = { type: r.author_type, agentId: r.agent_id, ...(r.acting_for ? { actingFor: r.acting_for } : {}) };
       }
       return out;
     },

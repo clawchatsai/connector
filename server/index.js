@@ -284,7 +284,12 @@ export function createApp(config = {}) {
         return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
       }
       if ((p = matchRoute(method, urlPath, 'PATCH /api/team/:room'))) {
-        const room = team.setDiscuss(p.room, (await parseBody(req)).discuss);
+        const body = await parseBody(req);
+        let room = team.room(p.room);
+        if (room && body.discuss !== undefined) room = team.setDiscuss(p.room, body.discuss);
+        if (room && body.rounds !== undefined) {
+          try { room = team.setRounds(p.room, body.rounds); } catch (e) { return sendError(res, 400, e.message); }
+        }
         return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/agents'))) {

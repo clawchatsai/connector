@@ -183,6 +183,7 @@ export class TeamCoordinator {
     return {
       roomKey: r.roomKey,
       discuss: r.discuss,
+      rounds: r.rounds,
       sourceKey: r.sourceKey,
       createdAt: r.createdAt,
       agents: r.members.map(m => {
@@ -287,6 +288,16 @@ export class TeamCoordinator {
     return this.room(roomKey);
   }
 
+  /** Host setting: follow-up rounds per human message when agents discuss (1..MAX_ROUNDS). */
+  setRounds(roomKey, rounds) {
+    if (!this.store.getRoom(roomKey)) return null;
+    const n = Math.floor(Number(rounds));
+    if (!(n >= 1 && n <= this.store.MAX_ROUNDS)) throw new Error(`rounds must be 1..${this.store.MAX_ROUNDS}`);
+    this.store.setRounds(roomKey, n);
+    this._changed();
+    return this.room(roomKey);
+  }
+
   // ── Messages ───────────────────────────────────────────────────────
 
   /** Post a user message; agents run in the background. Resolves once the message is in the room. */
@@ -321,9 +332,11 @@ export class TeamCoordinator {
     const live = this._rooms.get(roomKey);
     if (!live) return;
     live.gen++;
-    await Promise.all([...live.running.entries()].map(([agentId, r]) => r.remote
-      ? this.remote?.abort(agentId, r.runId).catch(e => this.log.warn?.(`[team] remote abort: ${e.message}`))
-      : this.request('chat.abort', { sessionKey: r.workKey, runId: r.runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`))));
+    await Promise.all([...live.running.entries()].map(([agentId, r]) => (r.actingFor
+      ? this.remote?.abortLocalFor(agentId, r.actingFor, r.runId).catch(e => this.log.warn?.(`[team] abort: ${e.message}`))
+      : r.remote
+        ? this.remote?.abort(agentId, r.runId).catch(e => this.log.warn?.(`[team] remote abort: ${e.message}`))
+        : this.request('chat.abort', { sessionKey: r.workKey, runId: r.runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`)))));
     this._status(roomKey);
   }
 
@@ -337,15 +350,20 @@ export class TeamCoordinator {
     else if (mention.agentIds.length) { targets = mention.agentIds; mode = 'addressed'; }
     else { targets = agents.map(a => a.agentId); mode = 'open'; }
 
-    const maxRounds = room.discuss ? this.store.DISCUSS_ROUNDS : 1;
-    const maxTurns = room.discuss ? agents.length * 2 : agents.length;
+    const maxRounds = room.discuss ? room.rounds : 1;
+    const maxTurns = room.discuss ? agents.length * Math.max(2, room.rounds - 1) : agents.length;
     let turns = 0;
+    // Authority comes from who asked (specs/sharing-people.md): the first round answers the owner,
+    // so this gateway's agents run as themselves. A follow-up answers the previous round's replies:
+    // if one came from another person's agent (or from an agent acting for them), this gateway's
+    // agents act for that person, as the version shared with them; never as themselves.
+    let actingFor = new Map(); // agentId -> remote agent id whose owner it answers this round
     for (let round = 1; round <= maxRounds && targets.length && turns < maxTurns && !stopped(); round++) {
       targets = targets.slice(0, maxTurns - turns);
       turns += targets.length;
       const history = await this._roomEntries(roomKey);
       const results = await Promise.all(targets.map(agentId =>
-        this._turn(roomKey, agentId, agents, history, round === 1 ? mode : 'followup', stopped)
+        this._turn(roomKey, agentId, agents, history, round === 1 ? mode : 'followup', stopped, actingFor.get(agentId) || null)
           .catch(async e => {
             // Shown in the room, like a failed turn in a normal chat, not only as a passing toast.
             this.log.warn?.(`[team] ${agentId} in ${roomKey}: ${e.message}`);
@@ -360,11 +378,17 @@ export class TeamCoordinator {
       const eligible = new Set(replied.map(r => r.agentId));
       for (const r of replied) for (const id of namedIn(r.text, agents)) if (id !== r.agentId) eligible.add(id);
       targets = agents.map(a => a.agentId).filter(id => eligible.has(id) && replied.some(r => r.agentId !== id));
+      actingFor = new Map();
+      for (const id of targets) {
+        if (TeamCoordinator.isRemote(id)) continue; // their own gateway decides how its agents run
+        const by = replied.find(r => r.agentId !== id && r.authority);
+        if (by) actingFor.set(id, by.authority);
+      }
     }
   }
 
   /** One agent turn. Returns { agentId, text } (text null when silent/aborted). */
-  async _turn(roomKey, agentId, agents, history, mode, stopped = () => false) {
+  async _turn(roomKey, agentId, agents, history, mode, stopped = () => false, actingFor = null) {
     const room = this.store.getRoom(roomKey);
     const member = room?.members.find(m => m.agentId === agentId);
     if (!member) return null;
@@ -375,6 +399,7 @@ export class TeamCoordinator {
     if (!fresh.length) return null;
 
     if (TeamCoordinator.isRemote(agentId)) return this._remoteTurn(roomKey, self, fresh, agents, mode, stopped);
+    if (actingFor) return this._turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history);
     const workKey = member.workKey || await this._createWorkSession(roomKey, self);
     const message = this._prompt(self, agents, fresh, mode);
     const runId = `team-${crypto.randomUUID()}`;
@@ -447,7 +472,50 @@ export class TeamCoordinator {
     }
     if (!text || SILENT.test(text)) return { agentId, text: null };
     await this._post(roomKey, self, text);
-    return { agentId, text: stopped() ? null : text };
+    return { agentId, text: stopped() ? null : text, authority: agentId }; // what it says carries its owner's authority
+  }
+
+  /**
+   * One of this gateway's agents answering another person's agent: runs as the version shared with
+   * that person, under their grant (peer/sharing.js localTurnFor), streamed like a remote agent.
+   * Not shared with them: it stays out, saying so when their agent asked it by name.
+   */
+  async _turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history) {
+    const agentId = self.agentId;
+    const asker = agents.find(a => a.agentId === actingFor);
+    const forName = this.remote?.actingForName?.(actingFor) || asker?.ownerName || 'someone else';
+    const runId = `team-${crypto.randomUUID()}`;
+    const live = this._live(roomKey);
+    const delta = (text, done = false) => this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-remote-delta', roomKey, agentId, runId, text, ...(done ? { done: true } : {}) }));
+    live.running.set(agentId, { actingFor, runId });
+    this._status(roomKey);
+    let result, partial = '';
+    try {
+      this.store.setSeenAt(roomKey, agentId, Math.max(...fresh.map(e => e.ts)));
+      result = await this.remote?.localTurnFor(agentId, actingFor, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode) },
+        { onDelta: text => { partial = text; delta(text); } });
+    } catch (e) {
+      throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
+    } finally {
+      live.running.delete(agentId);
+      delta('', true);
+      this._status(roomKey);
+    }
+    if (!result) {
+      const authors = this.store.authors(roomKey);
+      const askedByName = history.some(e => authors[e.id]?.agentId === actingFor && e.ts >= Math.min(...fresh.map(f => f.ts))
+        && parseMentions(splitLabel(e.text).body, agents).agentIds?.includes(agentId));
+      if (askedByName) await this._post(roomKey, self, `*${self.name} isn't shared with ${forName}, so it doesn't answer ${forName}'s agents.*`);
+      return { agentId, text: null };
+    }
+    const text = String(result.text || '').trim();
+    if (result.state === 'aborted') {
+      if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`, { actingFor: forName });
+      return { agentId, text: null };
+    }
+    if (!text || SILENT.test(text)) return { agentId, text: null };
+    await this._post(roomKey, self, text, { actingFor: forName });
+    return { agentId, text: stopped() ? null : text, authority: actingFor };
   }
 
   async _roomTitle(roomKey) {
@@ -476,10 +544,10 @@ export class TeamCoordinator {
     setTimeout(check, intervalMs).unref?.();
   }
 
-  /** Post an agent's message into the room. */
-  async _post(roomKey, self, text) {
+  /** Post an agent's message into the room (actingFor: whose request it answered, if not its owner's). */
+  async _post(roomKey, self, text, { actingFor = null } = {}) {
     const res = await this.request('chat.inject', { sessionKey: roomKey, message: text, label: self.name.slice(0, 100) });
-    if (res?.messageId) this.store.recordEntry(roomKey, res.messageId, { type: 'agent', agentId: self.agentId });
+    if (res?.messageId) this.store.recordEntry(roomKey, res.messageId, { type: 'agent', agentId: self.agentId, actingFor });
   }
 
   _prompt(self, agents, fresh, mode) {

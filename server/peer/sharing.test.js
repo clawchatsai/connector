@@ -380,3 +380,45 @@ test('a reply that fails without text is not counted against the daily cap; one 
   await assert.rejects(p);
   assert.equal(s.owner.list()[0].usedToday, 1);
 });
+
+test("acting for someone: this gateway's agent answers their agent as the version shared with them, under their grant", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'restricted', dailyCap: 5 });
+  const active = s.activate();
+  // Kamil (this gateway, gwK) also uses Houman's main: share sh2, Kamil as requester, Houman's gateway gwH.
+  const theirs = { id: 'sh2', as: 'requester', status: 'active', requester: s.people.owner, owner: s.people.requester, agents: [{ id: 'main-guest', name: 'main' }] };
+  s.owner.setShares([{ ...active, as: 'owner' }, theirs]);
+  const orig = s.owner.request;
+  s.owner.request = async (m, p) => (m === 'agents.list'
+    ? { agents: [{ id: 'jarvis', name: 'Jarvis' }, { id: 'jarvis-guest', name: 'Jarvis (guest)' }, { id: 'dev', name: 'Dev' }] }
+    : orig(m, p));
+
+  assert.equal(s.owner.actingForName('peer:sh2:main-guest'), 'Houman');
+  const deltas = [];
+  const r = await s.owner.localTurnFor('jarvis', 'peer:sh2:main-guest', { turnId: 'x1', roomId: 'kamils-room', roomTitle: 'Crash', message: 'how did you fix it?' }, { onDelta: d => deltas.push(d) });
+  assert.equal(r.state, 'final');
+  assert.deepEqual(deltas, ['jar']);
+  const create = s.ownerCalls.find(c => c.method === 'sessions.create').params;
+  assert.equal(create.agentId, 'jarvis-guest', 'the guest copy, never the real agent');
+  assert.equal(create.permissionMode, 'read-only');
+  assert.equal(create.category, 'Shared with Houman S');
+  const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
+  assert.match(send.message, /in your owner's team chat, you are answering Houman S's agent/);
+  assert.equal(s.owner.list().find(x => x.id === 'sh1').usedToday, 1, "counts toward Houman's daily cap");
+
+  // An agent not shared with them, an unknown asker, or a share that ended: no run at all.
+  assert.equal(await s.owner.localTurnFor('dev', 'peer:sh2:main-guest', { turnId: 'x2', roomId: 'kamils-room', message: 'hi' }), null);
+  assert.equal(await s.owner.localTurnFor('jarvis', 'peer:sh9:main-guest', { turnId: 'x3', roomId: 'kamils-room', message: 'hi' }), null);
+  s.owner.setShares([theirs]);
+  assert.equal(await s.owner.localTurnFor('jarvis', 'peer:sh2:main-guest', { turnId: 'x4', roomId: 'kamils-room', message: 'hi' }), null);
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+});
+
+test('a peer request cannot pick the owner-room note', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  s.activate();
+  const link = await s.req._link('sh1'); // a crafted request straight over the link, not through turn()
+  await link.request('turn', { turnId: 't1', agentId: 'jarvis-guest', roomId: 'r', message: 'hi', inOwnerRoom: true }, { timeoutMs: 5000 });
+  assert.match(s.ownerCalls.find(c => c.method === 'chat.send').params.message, /you are answering Houman S's team chat/);
+});
