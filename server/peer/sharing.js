@@ -501,12 +501,16 @@ export class SharingManager {
   async _guestSession(shareId, roomId, agentId, { name, roomTitle, permissionMode, toolOverrides }) {
     const db = this._db();
     const row = db.prepare('SELECT session_key FROM peer_sessions WHERE share_id = ? AND room_id = ? AND agent_id = ?').get(shareId, roomId, agentId);
-    if (row) {
+    // The owner may have deleted it from their chat list: then it's made again (same key, so the
+    // room keeps pointing at it), in "Shared with <name>" with its label, instead of the gateway
+    // bringing it back as an untitled chat that ClawChats hides.
+    const exists = row && await this.request('sessions.describe', { key: row.session_key }, 5000).then(r => !(r && 'session' in r && !r.session), () => true);
+    if (exists) {
       // Re-apply the policy each turn: the owner may have changed the access level since.
       await this.request('sessions.patch', { key: row.session_key, permissionMode, toolOverrides }).catch(() => {});
       return row.session_key;
     }
-    const key = `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
+    const key = row?.session_key || `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
     // Labels are unique per gateway, and untitled rooms all fall back to "team chat": tag each room.
     const tag = crypto.createHash('sha256').update(`${shareId}|${roomId}`).digest('hex').slice(0, 6);
     const create = label => this.request('sessions.create', {
@@ -648,6 +652,12 @@ export class SharingManager {
   actingForName(remoteAgentId) {
     const g = this._grantToOwnerOf(remoteAgentId);
     return g ? (firstName({ name: g.grant.requesterName }) || 'Someone') : null;
+  }
+
+  /** The guest session that answers `who` in a team chat here (TeamCoordinator lanes): one per share, like _guestSession. */
+  laneFor(who) {
+    const g = this._grantToOwnerOf(who);
+    return g ? `guest:${g.shareId}` : null;
   }
 
   /**

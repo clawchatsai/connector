@@ -89,7 +89,7 @@ test('create, open message: everyone asked, silent agents stay out of the room',
   await h.settle();
   assert.deepEqual(h.room(roomKey), ['[Houman]\n\nwhat is 2+2?', '[Dev]\n\ndev answer']);
   const r = h.team.room(roomKey);
-  assert.deepEqual(Object.values(r.authors), [{ type: 'user', agentId: null }, { type: 'agent', agentId: 'dev' }]);
+  assert.deepEqual(Object.values(r.authors), [{ type: 'user', agentId: null }, { type: 'agent', agentId: 'dev', via: 'owner' }]);
   assert.equal(r.agents.every(a => a.workKey), true);
   assert.equal(h.calls.filter(c => c.method === 'chat.send').length, 2);
   assert.equal(h.team.isWorkKey(r.agents[0].workKey), true);
@@ -477,6 +477,51 @@ test("authority comes from who asked: an agent answering someone else's agent ru
   assert.match(h.room(roomKey).at(-1), /^\[Dev\]\n\n\*Dev isn't shared with Kamil, so it doesn't answer Kamil's agents\.\*$/);
 });
 
+test("one agent, two sessions (its own, and the guest one for someone else's agent): each gets what the other saw and said", async () => {
+  const forPrompts = [];
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async () => ({ state: 'final', text: '@dev walk me through your deploy loop' }),
+    abort: async () => {},
+    actingForName: () => 'Kamil',
+    laneFor: who => (who === 'peer:sh1:jarvis' ? 'guest:sh1' : null),
+    localTurnFor: async (localId, remoteId, args) => {
+      forPrompts.push(args.message);
+      return { state: 'final', text: forPrompts.length === 1 ? 'Not without Houman saying so.' : 'Here is the loop: deploy, test, screenshot.' };
+    },
+  };
+  const ownPrompts = [];
+  const h = harness((agent, prompt) => { if (agent === 'dev') ownPrompts.push(prompt); return agent === 'dev' ? (ownPrompts.length === 1 ? 'hi' : 'Go ahead and walk Jarvis through it.') : 'NO_REPLY'; }, { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  h.team.setDiscuss(roomKey, true);
+
+  await h.team.send(roomKey, { text: '@dev hi', userLabel: 'Houman' });
+  await h.settle();
+  // Jarvis asks dev: dev answers in its guest session, acting for Kamil.
+  await h.team.send(roomKey, { text: '@Jarvis-Kamil ask dev about the deploy loop', userLabel: 'Houman' });
+  await h.settle();
+  assert.equal(forPrompts.length, 1);
+  assert.match(forPrompts[0], /\[Jarvis · Kamil\][^\n]*\n> @dev walk me through your deploy loop/);
+  assert.match(forPrompts[0], /\[Houman\]: @dev hi/, 'the guest session starts with what came before it');
+
+  // The owner says "proceed": its own session gets the request it never saw and what it said in the other one.
+  await h.team.send(roomKey, { text: '@dev proceed', userLabel: 'Houman' });
+  await h.settle();
+  const own = ownPrompts.at(-1);
+  assert.match(own, /> @dev walk me through your deploy loop/);
+  assert.match(own, /\[Dev \(you, answering for Kamil\)\]: Not without Houman saying so\./);
+  assert.match(own, /\[Houman\]: @dev proceed/);
+  assert.ok(!/\[Dev \(you[^\]]*\)\]: hi/.test(own), 'what it said in the same session is not repeated');
+
+  // Jarvis asks again: the guest session now gets the owner's go-ahead, marked as its own words.
+  await h.team.send(roomKey, { text: '@Jarvis-Kamil ask dev again', userLabel: 'Houman' });
+  await h.settle();
+  const guest = forPrompts.at(-1);
+  assert.match(guest, /\[Houman\]: @dev proceed/);
+  assert.match(guest, /\[Dev \(you, for your owner\)\]: Go ahead and walk Jarvis through it\./);
+  assert.ok(!/Not without Houman saying so/.test(guest), 'its own earlier guest reply is not repeated');
+});
+
 test('rounds: a per-room host setting, validated', async () => {
   let n = 0;
   const h = harness(agent => `@${agent === 'dev' ? 'Atlas' : 'Dev'} reply ${++n}`);
@@ -695,6 +740,50 @@ test('adding the first person from the popover turns "agents reply only when @me
   const plain = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
   await H.team.addPerson(plain.roomKey, 'gwK', { history: 'all' });
   assert.equal(H.team.room(plain.roomKey).mentionOnly, false, 'create-time adds decide for themselves');
+});
+
+test("someone's agent answering on its owner's copy and through the host: each session gets what it said in the other", async () => {
+  const { H, K, settle } = twoGateways();
+  const hostAsks = [];
+  H.team.remote.turn = async (agentId, args) => { hostAsks.push(args.message); return { state: 'final', text: 'guest jarvis here' }; };
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+
+  // Kamil asks his own Jarvis on his copy: it answers in Kamil's own session.
+  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil here are four questions' });
+  await settle();
+  assert.ok(H.room(roomKey).includes('[Jarvis · Kamil]\n\njarvis full on kamil'));
+
+  // Houman asks Jarvis: the session Kamil's gateway runs for Houman is told what Jarvis said in the other.
+  await H.team.send(roomKey, { text: '@Jarvis-Kamil did you send those questions?', userLabel: 'Houman' });
+  await settle();
+  const asked = hostAsks.at(-1);
+  assert.match(asked, /\[Kamil\]: @Jarvis-Kamil here are four questions/, 'it sees Kamil\'s ask too');
+  assert.match(asked, /\[Jarvis · Kamil \(you, for your owner\)\]: jarvis full on kamil/);
+
+  // Back on Kamil's copy, his Jarvis is told what it said through the host, marked as its own.
+  const kPrompts = () => K.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:jarvis:')).map(c => c.params.message);
+  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil and now?' });
+  await settle();
+  const own = kPrompts().at(-1);
+  assert.match(own, /\(you, in another session\)\]: guest jarvis here/);
+  assert.ok(!/jarvis full on kamil/.test(own), 'what it said in this session is not repeated');
+});
+
+test("people can ask the host's agent by the name their copy shows: @dev-HoumanSatarian, @dev-Houman, @dev", async () => {
+  const { H, K, settle, forCalls } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  for (const name of ['dev-HoumanSatarian', 'dev-Houman', 'dev']) {
+    const before = forCalls.length;
+    await K.team.send(copy.roomKey, { text: `@${name} ping` });
+    await settle();
+    assert.deepEqual(forCalls.slice(before).map(c => c.localId), ['dev'], `@${name} reaches dev, and only dev`);
+  }
 });
 
 test('the timeline says who joined and left, the same on both sides; agents never see those lines', async () => {

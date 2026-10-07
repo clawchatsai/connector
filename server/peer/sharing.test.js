@@ -66,6 +66,28 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, c
   return { owner, req, ownerCalls, ownerSignals, reqSignals, activate, kOwner, kReq, people };
 }
 
+test('a guest session the owner deleted is made again on the next turn, with its label in "Shared with <name>"', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'restricted', dailyCap: 10 });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi' });
+  const first = s.ownerCalls.find(c => c.method === 'sessions.create').params;
+
+  // Deleted from the owner's chat list: the gateway no longer has it.
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => (method === 'sessions.describe' && params.key === first.key ? { session: null } : request(method, params));
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room1', roomTitle: 'Rivers', message: 'still there?' });
+  const creates = s.ownerCalls.filter(c => c.method === 'sessions.create').map(c => c.params);
+  assert.equal(creates.length, 2);
+  assert.deepEqual([creates[1].key, creates[1].label, creates[1].category, creates[1].permissionMode], [first.key, first.label, 'Shared with Houman S', 'read-only']);
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.sessionKey, first.key);
+
+  // Still there: reused, no new session.
+  s.owner.request = request;
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't3', roomId: 'room1', message: 'and again' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.create').length, 2);
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);
