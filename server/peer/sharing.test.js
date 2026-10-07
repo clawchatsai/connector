@@ -88,6 +88,24 @@ test('a guest session the owner deleted is made again on the next turn, with its
   assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.create').length, 2);
 });
 
+test('a shared agent renamed by its owner: the grant is re-issued with the new name, same access and cap', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted', dailyCap: 7 });
+  s.activate();
+  let agents = [{ id: 'jarvis', identity: { name: 'Jarvis' } }, { id: 'jarvis-guest', identity: { name: 'Jarvis (guest)' } }];
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => (method === 'agents.list' ? { agents } : request(method, params));
+  assert.deepEqual(await s.owner.syncAgentNames(), [], 'nothing renamed: no new grant');
+
+  agents = [{ id: 'jarvis', identity: { name: 'Jarvy' } }, { id: 'jarvis-guest', identity: { name: 'Jarvis (guest)' } }];
+  assert.deepEqual(await s.owner.syncAgentNames(), ['sh1']);
+  const g = s.ownerSignals.filter(m => m.type === 'share-grant').at(-1).grant;
+  assert.deepEqual([g.agents, g.access, g.dailyCap], [[{ id: 'jarvis-guest', name: 'Jarvy' }], 'trusted', 7]);
+  s.activate();
+  assert.equal(s.req.remoteAgents()[0].name, 'Jarvy · Kamil', 'the requester sees the new name');
+  assert.deepEqual(await s.owner.syncAgentNames(), [], 'once');
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);

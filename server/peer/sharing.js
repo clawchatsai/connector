@@ -654,6 +654,36 @@ export class SharingManager {
     return g ? (firstName({ name: g.grant.requesterName }) || 'Someone') : null;
   }
 
+  /**
+   * Shared agents renamed since they were approved ("main" -> "homiabot"): re-issue those grants with
+   * the new names, same agents, access and cap, so the people they're shared with see the new name.
+   * A guest version is shown under its original's name, as when it was approved. Runs on a timer (index.js).
+   */
+  async syncAgentNames() {
+    const grants = this._localGrants();
+    if (!grants.length) return [];
+    const agents = (await this.request('agents.list', {}))?.agents || [];
+    const label = a => a?.identity?.name || a?.name || a?.id;
+    const shown = id => {
+      const a = agents.find(x => x.id === id);
+      if (!a) return null;
+      if (!/\(guest\)$/.test(label(a))) return label(a);
+      const src = agents.find(o => o.id !== id && findGuestAgent(agents, o.id)?.id === id);
+      return src ? label(src) : null;
+    };
+    const reissued = [];
+    for (const r of grants) {
+      const grant = JSON.parse(r.grant_json);
+      const live = this._shares.find(x => x.id === r.share_id && x.as === 'owner' && x.status === 'active');
+      if (!live || !Array.isArray(grant.agents)) continue;
+      const next = grant.agents.map(a => ({ id: a.id, name: String(shown(a.id) || a.name).slice(0, 80) }));
+      if (next.every((a, i) => a.name === grant.agents[i].name)) continue;
+      try { this.approve(r.share_id, { agents: next, access: grant.access, dailyCap: grant.dailyCap }); reissued.push(r.share_id); }
+      catch (e) { this.log?.warn?.(`[sharing] rename ${r.share_id}: ${e.message}`); }
+    }
+    return reissued;
+  }
+
   /** The guest session that answers `who` in a team chat here (TeamCoordinator lanes): one per share, like _guestSession. */
   laneFor(who) {
     const g = this._grantToOwnerOf(who);

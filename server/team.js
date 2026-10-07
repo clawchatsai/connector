@@ -215,6 +215,25 @@ export class TeamCoordinator {
     return list;
   }
 
+  /**
+   * Renamed agents (here, or someone else's whose share was re-issued with the new name): the copies
+   * of rooms this gateway hosts get the new names now, not on the next message. Runs on a timer (index.js).
+   */
+  async refreshNames() {
+    this._agents = null;
+    const names = new Map((await this.agents()).map(a => [a.agentId, a.name]));
+    const prev = this._lastNames;
+    this._lastNames = names;
+    if (!prev) return [];
+    const changed = [...names].filter(([id, name]) => prev.has(id) && prev.get(id) !== name).map(([id]) => id);
+    if (!changed.length) return [];
+    for (const r of this.store.listRooms()) {
+      if (!r.host && r.members.some(m => changed.includes(m.agentId))) this._pushSoon(r.roomKey);
+    }
+    this._changed();
+    return changed;
+  }
+
   _remoteName(agentId) { return this._remoteNames?.get(agentId) || null; }
 
   static isRemote(agentId) { return String(agentId || '').startsWith('peer:'); }
@@ -1137,6 +1156,8 @@ export class TeamCoordinator {
     const hostName = clean(p.hostName) || contact.name;
     const title = clean(p.title, 120); // '' until the host's chat has one: the copy is named after who's in it
     const prevTitle = this.store.getRoom(key || '')?.host?.title ?? null;
+    // Their chats go in the same project as this gateway's agents' guest sessions for them (peer/sharing.js _guestSession).
+    const category = `Shared with ${contact.name || hostName}`.slice(0, 100);
     let created = false;
     if (!key) {
       const list = (await this.request('agents.list', {}))?.agents || [];
@@ -1144,7 +1165,7 @@ export class TeamCoordinator {
       key = `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
       this.store.createReplica(key, { hostGatewayId: fromGw, hostRoom: roomId, hostName });
       this._workKeysChanged();
-      const create = label => this.request('sessions.create', { key, agentId, ...(label ? { label: label.slice(0, 200) } : {}) });
+      const create = label => this.request('sessions.create', { key, agentId, category, ...(label ? { label: label.slice(0, 200) } : {}) });
       try { await create(title ? `${title} · ${hostName}` : ''); }
       catch (e) {
         if (!/label already in use/i.test(e.message)) { this.store.deleteRoom(key); throw e; }
@@ -1162,6 +1183,12 @@ export class TeamCoordinator {
     };
     await this._replicaOwnMembers(key, view);
     this.store.setReplica(key, { hostName, view, ended: null });
+    // Copies made before they had a project (they landed in Default): filed there once. One the owner moved stays put.
+    if (!created && !(this._copiesFiled ??= new Set()).has(key)) {
+      this._copiesFiled.add(key);
+      const s = (await this.request('sessions.describe', { key }, 5000).catch(() => null))?.session;
+      if (s && !s.category) await this.request('sessions.patch', { key, category }).catch(e => this.log.warn?.(`[team] file copy: ${e.message}`));
+    }
     // The host titled its chat (or renamed it): the copy follows.
     if (!created && title && title !== prevTitle) {
       const patch = label => this.request('sessions.patch', { key, label: label.slice(0, 200) });

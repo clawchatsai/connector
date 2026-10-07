@@ -48,7 +48,8 @@ export function createApp(config = {}) {
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  function closeAll() { sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
+  let namesTimer = null;
+  function closeAll() { clearInterval(namesTimer); sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -90,6 +91,13 @@ export function createApp(config = {}) {
   gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
   gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); };
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
+  // Renamed agents: shares re-issued with the new names, copies of rooms here told (peer/sharing.js, team.js).
+  const quiet = what => e => { if (!/not connected|closed/i.test(e.message)) console.warn(`[${what}] names: ${e.message}`); };
+  namesTimer = setInterval(() => {
+    sharing?.syncAgentNames().catch(quiet('sharing'));
+    team.refreshNames().catch(quiet('team'));
+  }, 60_000);
+  namesTimer.unref?.();
 
   // A session's working root, for relative file links (gateway resolveSessionWorkspaceRoots:
   // spawnedCwd before sessionRoot). Cached briefly; null when the gateway can't say.

@@ -786,6 +786,33 @@ test("people can ask the host's agent by the name their copy shows: @dev-HoumanS
   }
 });
 
+test("their chats are filed under 'Shared with <host>'; a renamed agent reaches the copies without a new message", async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  const made = K.calls.find(c => c.method === 'sessions.create' && c.params.key === copy.roomKey).params;
+  assert.equal(made.category, 'Shared with Houman');
+
+  // A copy made before copies had a project is filed once, on the next sync.
+  const fresh = K.calls.length;
+  K.team._copiesFiled = new Set();
+  await H.team.send(roomKey, { text: 'hello', userLabel: 'Houman' });
+  await settle();
+  assert.ok(K.calls.slice(fresh).some(c => c.method === 'sessions.describe' && c.params.key === copy.roomKey));
+
+  await H.team.refreshNames(); // remembers the current names
+  const dev = AGENTS.find(a => a.id === 'dev');
+  dev.identity.name = 'Devon';
+  try {
+    assert.deepEqual(await H.team.refreshNames(), ['dev']);
+    await settle();
+    const names = K.team.room(copy.roomKey).agents.map(a => a.name);
+    assert.ok(names.some(n => n.startsWith('Devon · ')), `copy shows the new name: ${names}`);
+  } finally { dev.identity.name = 'Dev'; }
+});
+
 test('the timeline says who joined and left, the same on both sides; agents never see those lines', async () => {
   const { H, K, settle } = twoGateways();
   const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
