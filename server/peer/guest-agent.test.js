@@ -79,3 +79,17 @@ test('hasGuestRestrictions: only a policy at least as narrow as the guest one pa
   // A guest made before view_image/pdf were removed (still in alsoAllow) no longer passes.
   assert.equal(hasGuestRestrictions({ ...GUEST_TOOLS, alsoAllow: ['group:fs', 'group:runtime', 'view_image', 'pdf'] }), false);
 });
+
+test('findGuestAgent: the guest made as "main (guest)" is still found after the original is renamed', async () => {
+  const { findGuestAgent } = await import('./guest-agent.js');
+  const agents = [
+    { id: 'main', identity: { name: 'homiabot' } },
+    { id: 'main-guest', identity: { name: 'main (guest)' } },
+    { id: 'dev', name: 'dev' },
+    { id: 'dev-guest', name: 'dev (guest)' },
+  ];
+  assert.equal(findGuestAgent(agents, 'main')?.id, 'main-guest');
+  assert.equal(findGuestAgent(agents, 'dev')?.id, 'dev-guest');
+  // An agent that merely has the id shape isn't taken for a guest.
+  assert.equal(findGuestAgent([{ id: 'x', name: 'x' }, { id: 'x-guest', name: 'something else' }], 'x'), null);
+});

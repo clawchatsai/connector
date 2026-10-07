@@ -78,7 +78,11 @@ async function waitForAgent(request, agentId, { tries = 40, ms = 250 } = {}) {
 /** The guest version of `agentId` if it already exists (by name). */
 export function findGuestAgent(agents, agentId) {
   const src = agents.find(a => a.id === agentId);
-  return src ? agents.find(a => agentName(a) === guestName(agentName(src))) || null : null;
+  if (!src) return null;
+  // By name ("Jarvis (guest)"), or by the id it was made with ("main-guest"): renaming the original
+  // ("main" -> "homiabot") changes the name it looks for, not the guest that already exists.
+  return agents.find(a => agentName(a) === guestName(agentName(src)))
+    || agents.find(a => a.id === `${agentId}-guest` && /\(guest\)$/.test(agentName(a))) || null;
 }
 
 /**

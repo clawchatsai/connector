@@ -19,6 +19,12 @@
 //   team_entries.host_ts/owner_id/ref  a mirrored entry's original time, its agent's owner and room-wide agent ref
 //   team_entries author_type 'system': a line like "Kamil joined" (same on every screen)
 //   team_rooms.mention_only  agents answer only when @mentioned (human chats with silent agents)
+//   team_entries.via  which of its sessions an agent wrote from: 'owner' (its owner's own session,
+//                 here or in its owner's copy) or 'guest:<who>' (a session it ran in for someone else).
+//                 NULL on older rows: treated as the session asking, as before.
+//   team_lanes    seen_at for an agent's other sessions in a room ('guest:<who>'); its owner session
+//                 keeps team_members.seen_at. One agent can answer in several sessions, and each
+//                 must be given what it hasn't seen itself.
 
 const DISCUSS_ROUNDS = 3; // default; each room can set 1..MAX_ROUNDS
 const MAX_ROUNDS = 10;
@@ -59,6 +65,8 @@ export function createTeamStore(getGlobalDb) {
       if (!ec.has('owner_id')) g.exec('ALTER TABLE team_entries ADD COLUMN owner_id TEXT');
       if (!ec.has('ref')) g.exec('ALTER TABLE team_entries ADD COLUMN ref TEXT');
       g.exec(`CREATE TABLE IF NOT EXISTS team_people (room_key TEXT NOT NULL, person_id TEXT NOT NULL, name TEXT NOT NULL, email TEXT, history_from INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (room_key, person_id))`);
+      if (!ec.has('via')) g.exec('ALTER TABLE team_entries ADD COLUMN via TEXT');
+      g.exec(`CREATE TABLE IF NOT EXISTS team_lanes (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, lane TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY (room_key, agent_id, lane))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_mirror (room_key TEXT NOT NULL, host_entry_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY (room_key, host_entry_id))`);
       ready = true;
     }
@@ -163,6 +171,15 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('UPDATE team_members SET seen_at = MAX(seen_at, ?) WHERE room_key = ? AND agent_id = ?').run(seenAt, roomKey, agentId);
     },
 
+    /** An agent's other session in the room (lane 'guest:<who>'): the newest entry it was given, or null before its first turn. */
+    laneSeenAt(roomKey, agentId, lane) {
+      return db().prepare('SELECT seen_at FROM team_lanes WHERE room_key = ? AND agent_id = ? AND lane = ?').get(roomKey, agentId, lane)?.seen_at ?? null;
+    },
+
+    setLaneSeenAt(roomKey, agentId, lane, seenAt) {
+      db().prepare('INSERT INTO team_lanes (room_key, agent_id, lane, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(room_key, agent_id, lane) DO UPDATE SET seen_at = MAX(seen_at, excluded.seen_at)').run(roomKey, agentId, lane, seenAt);
+    },
+
     setDiscuss(roomKey, discuss) {
       db().prepare('UPDATE team_rooms SET discuss = ?, updated_at = ? WHERE room_key = ?').run(discuss ? 1 : 0, Date.now(), roomKey);
     },
@@ -183,6 +200,7 @@ export function createTeamStore(getGlobalDb) {
       g.prepare('DELETE FROM team_entries WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_people WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_mirror WHERE room_key = ?').run(roomKey);
+      g.prepare('DELETE FROM team_lanes WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_rooms WHERE room_key = ?').run(roomKey);
       return work;
     },
@@ -202,19 +220,19 @@ export function createTeamStore(getGlobalDb) {
      * type 'user' (this gateway's own person), 'person' (someone else; agentId holds their person id
      * and actingFor their name), or 'agent' (actingFor: whose request it answered, if not its owner's).
      */
-    recordEntry(roomKey, messageId, { type, agentId = null, actingFor = null, ts = null, ownerId = null, ref = null }) {
-      db().prepare('INSERT OR REPLACE INTO team_entries (room_key, message_id, author_type, agent_id, created_at, acting_for, host_ts, owner_id, ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(roomKey, messageId, ['user', 'person', 'system'].includes(type) ? type : 'agent', agentId, Date.now(), actingFor, ts || null, ownerId, ref);
+    recordEntry(roomKey, messageId, { type, agentId = null, actingFor = null, ts = null, ownerId = null, ref = null, via = null }) {
+      db().prepare('INSERT OR REPLACE INTO team_entries (room_key, message_id, author_type, agent_id, created_at, acting_for, host_ts, owner_id, ref, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(roomKey, messageId, ['user', 'person', 'system'].includes(type) ? type : 'agent', agentId, Date.now(), actingFor, ts || null, ownerId, ref, via);
     },
 
     /**
-     * { [messageId]: { type: 'user'|'agent'|'system', agentId, actingFor?, ts?, ownerId?, ref? } | { type: 'person', personId, name } }
+     * { [messageId]: { type: 'user'|'agent'|'system', agentId, actingFor?, ts?, ownerId?, ref?, via? } | { type: 'person', personId, name } }
      * ts: the entry's original time when this is a copy of someone else's room.
      */
     authors(roomKey) {
       const out = {};
-      for (const r of db().prepare('SELECT message_id, author_type, agent_id, acting_for, host_ts, owner_id, ref FROM team_entries WHERE room_key = ?').all(roomKey)) {
-        const extra = { ...(r.host_ts ? { ts: r.host_ts } : {}), ...(r.owner_id ? { ownerId: r.owner_id } : {}), ...(r.ref ? { ref: r.ref } : {}) };
+      for (const r of db().prepare('SELECT message_id, author_type, agent_id, acting_for, host_ts, owner_id, ref, via FROM team_entries WHERE room_key = ?').all(roomKey)) {
+        const extra = { ...(r.host_ts ? { ts: r.host_ts } : {}), ...(r.owner_id ? { ownerId: r.owner_id } : {}), ...(r.ref ? { ref: r.ref } : {}), ...(r.via ? { via: r.via } : {}) };
         out[r.message_id] = r.author_type === 'person'
           ? { type: 'person', personId: r.agent_id, name: r.acting_for, ...extra }
           : { type: r.author_type, agentId: r.agent_id, ...(r.acting_for ? { actingFor: r.acting_for } : {}), ...extra };

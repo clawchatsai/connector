@@ -48,7 +48,8 @@ export function createApp(config = {}) {
 
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
-  function closeAll() { sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
+  let namesTimer = null;
+  function closeAll() { clearInterval(namesTimer); sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -90,6 +91,13 @@ export function createApp(config = {}) {
   gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
   gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); };
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
+  // Renamed agents: shares re-issued with the new names, copies of rooms here told (peer/sharing.js, team.js).
+  const quiet = what => e => { if (!/not connected|closed/i.test(e.message)) console.warn(`[${what}] names: ${e.message}`); };
+  namesTimer = setInterval(() => {
+    sharing?.syncAgentNames().catch(quiet('sharing'));
+    team.refreshNames().catch(quiet('team'));
+  }, 60_000);
+  namesTimer.unref?.();
 
   // A session's working root, for relative file links (gateway resolveSessionWorkspaceRoots:
   // spawnedCwd before sessionRoot). Cached briefly; null when the gateway can't say.
@@ -248,6 +256,18 @@ export function createApp(config = {}) {
         // Enabled once the signal server has sharing on for this account (it then sends share lists).
         if (!sharing?.serverEnabled) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
         return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null });
+      }
+      // The project a person's chats go to (peer/sharing.js funnel). Keyed by email.
+      if (method === 'GET' && urlPath === '/api/sharing/funnel') return send(res, 200, { funnel: sharing?.funnels() || {} });
+      if (method === 'PUT' && urlPath === '/api/sharing/funnel') {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        const { email, project } = await parseBody(req);
+        try { return send(res, 200, await sharing.setFunnel(email, project)); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      if (method === 'POST' && urlPath === '/api/sharing/funnel/rename') {
+        const { from, to } = await parseBody(req);
+        return send(res, 200, { changed: sharing?.renameFunnel(from, to) || 0 });
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
