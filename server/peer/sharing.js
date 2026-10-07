@@ -722,11 +722,23 @@ export class SharingManager {
     return this._db().prepare('UPDATE peer_funnel SET project = ?, updated_at = ? WHERE project = ?').run(String(to).slice(0, 100), Date.now(), from).changes;
   }
 
+  /** Every gateway this person has been on, across shares of any age (old ones were ended and replaced). */
+  gatewayIdsOf(email) {
+    const ids = new Set();
+    for (const s of this._shares) {
+      const o = s.as === 'owner' ? s.requester : s.owner;
+      if (String(o?.email || '').toLowerCase() === email && o.gatewayId) ids.add(o.gatewayId);
+    }
+    return ids;
+  }
+
+  /** Our agents' guest sessions for this person, including ones from shares since ended. */
   _guestSessionKeysOf(email) {
+    const ids = this.gatewayIdsOf(email);
     const keys = [];
-    for (const r of this._db().prepare('SELECT share_id, session_key FROM peer_sessions').all()) {
-      const sh = this._shares.find(x => x.id === r.share_id && x.as === 'owner');
-      if (String(sh?.requester?.email || '').toLowerCase() === email) keys.push(r.session_key);
+    for (const r of this._db().prepare('SELECT p.session_key, g.grant_json FROM peer_sessions p JOIN peer_grants g ON g.share_id = p.share_id').all()) {
+      let gw; try { gw = JSON.parse(r.grant_json).requesterGatewayId; } catch { continue; }
+      if (ids.has(gw)) keys.push(r.session_key);
     }
     return keys;
   }

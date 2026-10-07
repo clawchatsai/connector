@@ -557,6 +557,7 @@ function twoGateways({ devShared = true } = {}) {
     labelOf: (id, full) => String(full || '').split(/\s+/)[0],
     guestSessionOf: () => null,
     funnelOf: (email, name) => `Shared with ${name}`,
+    gatewayIdsOf: () => new Set(['gwH', 'gwK']),
     contact: gw => (net.connected && gw === other ? { personId: other, name: other === 'gwK' ? 'Kamil' : 'Houman', email: null } : null),
     personRequest: async (gw, method, params) => {
       if (gw !== other) throw Object.assign(new Error('not connected'), { code: 'not_connected' });
