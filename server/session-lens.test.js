@@ -20,7 +20,7 @@ test('key shapes', () => {
     assert.equal(isCandidateKey(k), false, k);
 });
 
-test('child sessions stay hidden once a row revealed them, even for partial events', () => {
+test('a child of an unresolved parent stays hidden, even for partial events', () => {
   const { l } = lens();
   assert.equal(l.sessionsChanged({ sessionKey: CHILD, reason: 'create', parentSessionKey: CHAT, label: 'x' }), null);
   assert.equal(l.sessionsChanged({ sessionKey: CHILD, phase: 'message', ts: 1 }), null);
@@ -47,7 +47,7 @@ test('run events: visible chats and utility sessions only', () => {
 test('browser sessions.list gets defaults and a filtered, trimmed response', () => {
   const { l } = lens();
   const out = JSON.parse(l.outbound(JSON.stringify({ type: 'req', id: 'r1', method: 'sessions.list', params: { limit: 50 } })));
-  assert.deepEqual(out.params, { excludeSubagents: true, excludeCron: true, excludeSystem: true, limit: 50 });
+  assert.deepEqual(out.params, { excludeSubagents: false, excludeCron: true, excludeSystem: true, limit: 50 });
   assert.ok(l.ownsResponse('r1'));
   const res = l.response({ type: 'res', id: 'r1', ok: true, payload: {
     ts: 1, count: 4, totalCount: 4, hasMore: false, nextOffset: null, owners: [{}],
@@ -140,8 +140,8 @@ test('forks of chats are chats (edit/regen branches)', () => {
   assert.ok(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:f1', reason: 'create', kind: 'direct', forkSource: { sessionKey: LEGACY, sessionId: 's' } }));
   // fork of a dashboard chat: inherits the main link
   assert.ok(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:f2', reason: 'create', kind: 'direct', createdVia: 'operator', parentSessionKey: 'agent:main:main', spawnDepth: 0, forkSource: { sessionKey: CHAT, sessionId: 's' } }));
-  // a fork nested under another chat is still a child
-  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:f3', reason: 'create', kind: 'direct', parentSessionKey: CHAT, forkSource: { sessionKey: LEGACY, sessionId: 's' } }), null); // parent is not the fork source
+  // a fork nested under another chat is still a child: shown nested under that chat
+  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:f3', reason: 'create', kind: 'direct', parentSessionKey: CHAT, forkSource: { sessionKey: LEGACY, sessionId: 's' } }).payload.ccParentKey, CHAT); // parent is not the fork source
 });
 
 test('sessions.fork branches (parent = source chat) are top-level chats', () => {
@@ -150,7 +150,8 @@ test('sessions.fork branches (parent = source chat) are top-level chats', () => 
   assert.ok(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:br', reason: 'create', kind: 'direct', createdVia: 'operator', parentSessionKey: SRC, forkedFromParent: true, forkSource: { sessionKey: SRC, sessionId: 's', entryId: 'e' } }));
   assert.ok(l.forwardsRunEvent('agent:main:dashboard:br'));
   // a child whose parent is a chat but that is not a fork of it stays nested
-  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:kid', reason: 'create', kind: 'direct', parentSessionKey: SRC }), null);
+  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:kid', reason: 'create', kind: 'direct', parentSessionKey: SRC }).payload.ccParentKey, SRC);
+  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:br', reason: 'patch', label: 'x' }).payload.ccParentKey, undefined); // the branch itself is top level
   // fork of a channel session is not a chat
   assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:dashboard:br2', reason: 'create', kind: 'direct', parentSessionKey: DISCORD, forkSource: { sessionKey: DISCORD } }), null);
 });
@@ -176,4 +177,52 @@ test('listed rows without createdAt get the legacy creation time; gateway values
     { key: CHAT, label: 'new', kind: 'direct', createdAt: 999 },
   ] } });
   assert.deepEqual(res.payload.sessions.map(s => s.createdAt), [111, 999]);
+});
+
+const RUN = 'agent:main:subagent:run1';
+
+test('spawned children of a visible chat are visible, nested via ccParentKey', () => {
+  const { l } = lens();
+  l.observe(CHAT, { key: CHAT, kind: 'direct', createdVia: 'operator', parentSessionKey: 'agent:main:main', spawnDepth: 0 });
+  // hidden run (subagent key)
+  const f = l.sessionsChanged({ sessionKey: RUN, reason: 'create', session: { key: RUN, kind: 'direct', spawnedBy: CHAT, parentSessionKey: CHAT, spawnDepth: 1, label: 'Review', owner: {} } });
+  assert.deepEqual(f.payload.session, { key: RUN, kind: 'direct', label: 'Review', ccParentKey: CHAT });
+  // later partial events keep the link
+  assert.equal(l.sessionsChanged({ sessionKey: RUN, phase: 'message', ts: 2 }).payload.ccParentKey, CHAT);
+  assert.ok(l.forwardsRunEvent(RUN));
+  // visible spawn (dashboard key)
+  const V = 'agent:main:dashboard:vis';
+  assert.ok(l.sessionsChanged({ sessionKey: V, reason: 'create', kind: 'direct', createdVia: 'spawn', spawnedBy: CHAT, parentSessionKey: CHAT, spawnDepth: 1 }));
+  assert.equal(l.parentOf(V), CHAT);
+  // grandchild through a run
+  const G = 'agent:main:subagent:run2';
+  assert.equal(l.sessionsChanged({ sessionKey: G, reason: 'create', kind: 'direct', spawnedBy: RUN, spawnDepth: 2 }).payload.ccParentKey, RUN);
+});
+
+test('children outside ClawChats chats stay hidden', () => {
+  const { l } = lens();
+  assert.equal(l.sessionsChanged({ sessionKey: RUN, reason: 'create', kind: 'direct', spawnedBy: 'agent:main:main', parentSessionKey: 'agent:main:main', spawnDepth: 1 }), null);
+  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:subagent:d', reason: 'create', kind: 'direct', spawnedBy: DISCORD, spawnDepth: 1 }), null);
+  assert.equal(l.forwardsRunEvent(RUN), false);
+  // parent chat hidden (e.g. group kind) -> its children too
+  l.observe(CHAT, { key: CHAT, kind: 'group' });
+  assert.equal(l.sessionsChanged({ sessionKey: 'agent:main:subagent:e', reason: 'create', kind: 'direct', spawnedBy: CHAT, spawnDepth: 1 }), null);
+  // a cycle never resolves
+  l.observe('agent:main:subagent:x', { kind: 'direct', spawnedBy: 'agent:main:subagent:y' });
+  l.observe('agent:main:subagent:y', { kind: 'direct', spawnedBy: 'agent:main:subagent:x' });
+  assert.equal(l.parentOf('agent:main:subagent:x'), null);
+});
+
+test('list responses keep children whose parent is listed later on the page', () => {
+  const { l } = lens();
+  l.outbound(JSON.stringify({ type: 'req', id: 'c1', method: 'sessions.list', params: {} }));
+  const res = l.response({ type: 'res', id: 'c1', ok: true, payload: { sessions: [
+    { key: RUN, kind: 'direct', spawnedBy: CHAT, parentSessionKey: CHAT, spawnDepth: 1, label: 'r', runtimeMs: 5, startedAt: 1 },
+    { key: CHAT, kind: 'direct', createdVia: 'operator', parentSessionKey: 'agent:main:main', spawnDepth: 0, label: 'c' },
+    { key: 'agent:main:subagent:other', kind: 'direct', spawnedBy: 'agent:main:main', spawnDepth: 1 },
+  ] } });
+  assert.deepEqual(res.payload.sessions, [
+    { key: RUN, kind: 'direct', label: 'r', runtimeMs: 5, startedAt: 1, ccParentKey: CHAT },
+    { key: CHAT, kind: 'direct', label: 'c' },
+  ]);
 });
