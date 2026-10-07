@@ -75,6 +75,7 @@ export class SharingManager {
     const g = this.getDb();
     if (!this._ready) {
       g.exec(`CREATE TABLE IF NOT EXISTS peer_grants (share_id TEXT PRIMARY KEY, grant_json TEXT NOT NULL, sig TEXT NOT NULL, created_at INTEGER NOT NULL, revoked_at INTEGER)`);
+      g.exec(`CREATE TABLE IF NOT EXISTS peer_funnel (email TEXT PRIMARY KEY, project TEXT NOT NULL, updated_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS peer_pins (share_id TEXT PRIMARY KEY, owner_pubkey TEXT NOT NULL, created_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS peer_sessions (share_id TEXT NOT NULL, room_id TEXT NOT NULL, agent_id TEXT NOT NULL, session_key TEXT NOT NULL, PRIMARY KEY (share_id, room_id, agent_id))`);
       g.exec(`CREATE TABLE IF NOT EXISTS peer_usage (share_id TEXT NOT NULL, day TEXT NOT NULL, turns INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (share_id, day))`);
@@ -511,10 +512,11 @@ export class SharingManager {
       return row.session_key;
     }
     const key = row?.session_key || `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
+    const category = this.funnelOf(this._shares.find(x => x.id === shareId && x.as === 'owner')?.requester?.email, name);
     // Labels are unique per gateway, and untitled rooms all fall back to "team chat": tag each room.
     const tag = crypto.createHash('sha256').update(`${shareId}|${roomId}`).digest('hex').slice(0, 6);
     const create = label => this.request('sessions.create', {
-      key, agentId, permissionMode, toolOverrides, label: label.slice(0, 200), category: `Shared with ${name}`.slice(0, 100),
+      key, agentId, permissionMode, toolOverrides, label: label.slice(0, 200), category,
     });
     try { await create(`${name} · ${roomTitle} · ${tag}`); }
     catch (e) {
@@ -682,6 +684,51 @@ export class SharingManager {
       catch (e) { this.log?.warn?.(`[sharing] rename ${r.share_id}: ${e.message}`); }
     }
     return reissued;
+  }
+
+  // ── Funnel: the project one person's chats go to ───────────────────
+  // Set when the person is added (invite or accept) and changeable in Settings → People. It covers
+  // both what they host (our copies of their chats) and our agents' guest sessions for them. Stored by
+  // name; ClawChats renames follow it (renameFunnel), a deleted project is made again by the next chat.
+  // Keyed by the person's email: known from the invite on, before any gateway id.
+
+  funnelOf(email, name) {
+    const row = email && this._db().prepare('SELECT project FROM peer_funnel WHERE email = ?').get(String(email).toLowerCase());
+    return row?.project || `Shared with ${cleanName(name, 60) || 'someone'}`.slice(0, 100);
+  }
+
+  funnels() {
+    return Object.fromEntries(this._db().prepare('SELECT email, project FROM peer_funnel').all().map(r => [r.email, r.project]));
+  }
+
+  /** Where this person's chats go from now on, and move the ones already here. Returns how many moved. */
+  async setFunnel(email, project) {
+    const e = String(email || '').toLowerCase().trim();
+    const name = cleanName(project, 100);
+    if (!e || !name) throw new Error('email and project are required');
+    this._db().prepare('INSERT INTO peer_funnel (email, project, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET project = excluded.project, updated_at = excluded.updated_at').run(e, name, Date.now());
+    let moved = 0;
+    for (const key of this._guestSessionKeysOf(e)) {
+      if (await this.request('sessions.patch', { key, category: name }).then(() => true, () => false)) moved++;
+    }
+    moved += (await this.onFunnelChanged?.(e, name)) || 0; // copies of their chats (team.js)
+    this._changed();
+    return { moved };
+  }
+
+  /** A project was renamed in ClawChats: whoever is funnelled there follows. */
+  renameFunnel(from, to) {
+    if (!from || !to || from === to) return 0;
+    return this._db().prepare('UPDATE peer_funnel SET project = ?, updated_at = ? WHERE project = ?').run(String(to).slice(0, 100), Date.now(), from).changes;
+  }
+
+  _guestSessionKeysOf(email) {
+    const keys = [];
+    for (const r of this._db().prepare('SELECT share_id, session_key FROM peer_sessions').all()) {
+      const sh = this._shares.find(x => x.id === r.share_id && x.as === 'owner');
+      if (String(sh?.requester?.email || '').toLowerCase() === email) keys.push(r.session_key);
+    }
+    return keys;
   }
 
   /** The guest session that answers `who` in a team chat here (TeamCoordinator lanes): one per share, like _guestSession. */

@@ -556,6 +556,7 @@ function twoGateways({ devShared = true } = {}) {
     hasShareWith: gw => net.connected && gw === other,
     labelOf: (id, full) => String(full || '').split(/\s+/)[0],
     guestSessionOf: () => null,
+    funnelOf: (email, name) => `Shared with ${name}`,
     contact: gw => (net.connected && gw === other ? { personId: other, name: other === 'gwK' ? 'Kamil' : 'Houman', email: null } : null),
     personRequest: async (gw, method, params) => {
       if (gw !== other) throw Object.assign(new Error('not connected'), { code: 'not_connected' });
@@ -811,6 +812,28 @@ test("their chats are filed under 'Shared with <host>'; a renamed agent reaches 
     const names = K.team.room(copy.roomKey).agents.map(a => a.name);
     assert.ok(names.some(n => n.startsWith('Devon · ')), `copy shows the new name: ${names}`);
   } finally { dev.identity.name = 'Dev'; }
+});
+
+test("someone else's messages raise a badge on the room or its copy (chat.inject doesn't); your own don't", async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  const unreadOf = (G, key) => G.calls.filter(c => c.method === 'sessions.patch' && c.params.key === key && c.params.unread === true).length;
+  await H.team.send(roomKey, { text: 'before kamil', userLabel: 'Houman' });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.ok(unreadOf(K, copy.roomKey) >= 1, "a new chat's copy arrives unread");
+
+  const hostBefore = unreadOf(H, roomKey), copyBefore = unreadOf(K, copy.roomKey);
+  await H.team.send(roomKey, { text: 'host speaks', userLabel: 'Houman' });
+  await settle();
+  assert.ok(unreadOf(K, copy.roomKey) > copyBefore, 'what the host and its agents say is new on the copy');
+
+  const hostMid = unreadOf(H, roomKey);
+  await K.team.send(copy.roomKey, { text: '@dev from kamil' });
+  await settle();
+  assert.ok(unreadOf(H, roomKey) > hostMid, "a person's message raises a badge on the room they're in");
+  assert.ok(hostMid >= hostBefore);
 });
 
 test('the timeline says who joined and left, the same on both sides; agents never see those lines', async () => {

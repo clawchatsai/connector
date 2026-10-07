@@ -257,6 +257,18 @@ export function createApp(config = {}) {
         if (!sharing?.serverEnabled) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
         return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null });
       }
+      // The project a person's chats go to (peer/sharing.js funnel). Keyed by email.
+      if (method === 'GET' && urlPath === '/api/sharing/funnel') return send(res, 200, { funnel: sharing?.funnels() || {} });
+      if (method === 'PUT' && urlPath === '/api/sharing/funnel') {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        const { email, project } = await parseBody(req);
+        try { return send(res, 200, await sharing.setFunnel(email, project)); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      if (method === 'POST' && urlPath === '/api/sharing/funnel/rename') {
+        const { from, to } = await parseBody(req);
+        return send(res, 200, { changed: sharing?.renameFunnel(from, to) || 0 });
+      }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
         try { return send(res, 200, { grant: sharing.approve(p.id, await parseBody(req)) }); }

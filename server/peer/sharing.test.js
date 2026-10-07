@@ -106,6 +106,31 @@ test('a shared agent renamed by its owner: the grant is re-issued with the new n
   assert.deepEqual(await s.owner.syncAgentNames(), [], 'once');
 });
 
+test("funnel: a person's chats go to the project chosen for them; renames follow, moving existing chats, default until chosen", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'restricted', dailyCap: 10 });
+  s.activate();
+  assert.equal(s.owner.funnelOf('h@x.dev', 'Houman S'), 'Shared with Houman S', 'nothing chosen: named after them');
+
+  // Chosen at invite/accept time (before any chat): the first guest session is made there.
+  await s.owner.setFunnel('H@x.dev', 'Friends');
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi' });
+  const create = s.ownerCalls.find(c => c.method === 'sessions.create').params;
+  assert.equal(create.category, 'Friends');
+
+  // Changed later: chats already there move.
+  const moved = await s.owner.setFunnel('h@x.dev', 'Work friends');
+  assert.equal(moved.moved, 1);
+  assert.deepEqual(s.ownerCalls.filter(c => c.method === 'sessions.patch' && c.params.category).map(c => [c.params.key, c.params.category]), [[create.key, 'Work friends']]);
+
+  // The project is renamed in ClawChats: they follow. Deleted: the next chat makes it again (sessions.create names it).
+  assert.equal(s.owner.renameFunnel('Work friends', 'Team'), 1);
+  assert.equal(s.owner.funnelOf('h@x.dev', 'Houman S'), 'Team');
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room2', roomTitle: 'Lakes', message: 'again' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.create').at(-1).params.category, 'Team');
+  assert.deepEqual(s.owner.funnels(), { 'h@x.dev': 'Team' });
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);

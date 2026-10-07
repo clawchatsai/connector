@@ -123,6 +123,7 @@ export class TeamCoordinator {
       remote.onPeerReady = gw => this.onPeerReady(gw);
       remote.onFirstShares = () => this.resyncCopies();
       remote.onSharesChanged = () => this.reconcileConnections();
+      remote.onFunnelChanged = (email, project) => this.refileCopies(email, project);
     }
   }
 
@@ -213,6 +214,21 @@ export class TeamCoordinator {
     // Names outlive the share: a room keeps showing "Jarvis · Kamil" after the owner stops sharing.
     for (const a of list) (this._remoteNames ??= new Map()).set(a.agentId, { name: a.name, ownerName: a.ownerName });
     return list;
+  }
+
+  /** The project for this person's chats changed: our copies of the chats they host move there. Returns how many. */
+  async refileCopies(email, project) {
+    let moved = 0;
+    for (const r of this.store.listRooms()) {
+      if (!r.host || String(this.remote?.contact?.(r.host.gatewayId)?.email || '').toLowerCase() !== email) continue;
+      if (await this.request('sessions.patch', { key: r.roomKey, category: project }).then(() => true, () => false)) moved++;
+    }
+    return moved;
+  }
+
+  /** The room has something new for the owner: a badge until it's read (chat.inject doesn't raise one). */
+  _markUnread(roomKey) {
+    this.request('sessions.patch', { key: roomKey, unread: true }).catch(() => {});
   }
 
   /**
@@ -780,6 +796,7 @@ export class TeamCoordinator {
     if (room?.host) return this._replicaPostAgent(room, self, text); // a live copy: the host's room gets it (its owner's session)
     const res = await this.request('chat.inject', { sessionKey: roomKey, message: text, label: self.name.slice(0, 100) });
     if (res?.messageId) this.store.recordEntry(roomKey, res.messageId, { type: 'agent', agentId: self.agentId, actingFor, via });
+    this._markUnread(roomKey);
     this._pushSoon(roomKey);
   }
 
@@ -1083,6 +1100,7 @@ export class TeamCoordinator {
       // Written in its owner's own session (their copy), not the one this gateway asks it in: that
       // session still gets it, marked as its own words, next time it's asked here.
       if (res?.messageId) this.store.recordEntry(room.roomKey, res.messageId, { type: 'agent', agentId: member.agentId, via: OWNER_LANE });
+      this._markUnread(room.roomKey);
       this._pushSoon(room.roomKey);
       // Follow-up rounds start from it, acting for its owner.
       this._enqueue(room.roomKey, text, { replied: [{ agentId: member.agentId, text, authority: `person:${person.personId}` }] });
@@ -1091,6 +1109,7 @@ export class TeamCoordinator {
     const label = person.name.replace(/[[\]\n]/g, ' ').trim().slice(0, 100) || 'Someone';
     const res = await this.request('chat.inject', { sessionKey: room.roomKey, message: text, label });
     if (res?.messageId) this.store.recordEntry(room.roomKey, res.messageId, { type: 'person', agentId: person.personId, actingFor: person.name });
+    this._markUnread(room.roomKey);
     this._maybeTitle(room.roomKey, text);
     this._pushSoon(room.roomKey);
     this._enqueue(room.roomKey, text, { fromPerson: person.personId });
@@ -1156,8 +1175,8 @@ export class TeamCoordinator {
     const hostName = clean(p.hostName) || contact.name;
     const title = clean(p.title, 120); // '' until the host's chat has one: the copy is named after who's in it
     const prevTitle = this.store.getRoom(key || '')?.host?.title ?? null;
-    // Their chats go in the same project as this gateway's agents' guest sessions for them (peer/sharing.js _guestSession).
-    const category = `Shared with ${contact.name || hostName}`.slice(0, 100);
+    // Their chats go to the project chosen for this person (peer/sharing.js funnelOf), like our agents' guest sessions for them.
+    const category = this.remote.funnelOf(contact.email, contact.name || hostName);
     let created = false;
     if (!key) {
       const list = (await this.request('agents.list', {}))?.agents || [];
@@ -1196,12 +1215,14 @@ export class TeamCoordinator {
     }
     const me = this._selfId();
     const entries = (Array.isArray(p.entries) ? p.entries : []).slice(-300).sort((a, b) => (Number(a?.ts) || 0) - (Number(b?.ts) || 0));
+    let fromOthers = false;
     for (const e of entries) {
       const id = String(e?.id || '').slice(0, 200);
       const text = String(e?.text || '').slice(0, 64_000);
       if (!id || !text || this.store.mirrored(key, id)) continue;
       const a = e.author || {};
       const mine = a.type === 'person' && a.personId === me;
+      if (!mine && a.type !== 'system') fromOthers = true;
       const label = a.type === 'system' ? 'System' : clean(a.name) || (a.type === 'agent' ? 'Agent' : 'Someone');
       const res = await this.request('chat.inject', { sessionKey: key, message: text, label });
       if (!res?.messageId) continue;
@@ -1212,6 +1233,7 @@ export class TeamCoordinator {
         : a.type === 'person' ? { type: 'person', agentId: clean(a.personId, 100), actingFor: label, ts }
         : { type: 'agent', agentId: clean(a.ref || a.agentId, 240) || null, ref: a.ref ? clean(a.ref, 240) : null, ownerId: a.ownerId ? clean(a.ownerId, 100) : null, actingFor: a.actingFor ? clean(a.actingFor, 60) : null, ts, via: copyVia(a.via) });
     }
+    if (fromOthers) this._markUnread(key); // someone else's words (or their agents'): a badge on the copy
     this._changed();
     if (created) this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-invited', roomKey: key, hostName, title }));
     return { ok: true };
