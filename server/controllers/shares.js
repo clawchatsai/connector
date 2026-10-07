@@ -5,7 +5,7 @@
 // ClawChats server is involved. Spec: clawchats repo, specs/sharing-and-artifacts.md.
 //
 // <dataDir>/share-storage.json  derived S3 credentials + public URL (0600; never sent to the browser)
-// <dataDir>/shares.json         [{id, url, title, type, mode, createdAt, expiresAt}]  (no keys)
+// <dataDir>/shares.json         [{id, url, title, type, mode, createdAt, expiresAt, source?}]  (no keys)
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -20,6 +20,16 @@ const MAX_PAGE_BYTES = 5 * 1024 * 1024;
 const TYPES = new Set(['html', 'svg', 'markdown', 'mermaid', 'csv', 'code', 'chat']);
 const SWEEP_MS = 60 * 60 * 1000;
 const objectKey = id => `shares/${id}.html`;
+
+// Where a share came from, so ClawChats can list a chat's or a file's links next to it:
+// {kind: 'chat'|'artifact'|'file', chatId?, name?, path?}. Unknown kinds and fields are dropped.
+const SOURCE_KINDS = new Set(['chat', 'artifact', 'file']);
+export function cleanSource(src) {
+  if (!src || typeof src !== 'object' || !SOURCE_KINDS.has(src.kind)) return undefined;
+  const out = { kind: src.kind };
+  for (const k of ['chatId', 'name', 'path']) if (typeof src[k] === 'string' && src[k]) out[k] = src[k].slice(0, 500);
+  return out;
+}
 
 export function validEnvelope(e) {
   const b64u = s => typeof s === 'string' && /^[A-Za-z0-9_-]+$/.test(s);
@@ -94,11 +104,11 @@ export function createShareHandlers({ dataDir, fetchImpl = globalThis.fetch, set
     return send(res, 200, { ok: true });
   }
 
-  // POST /api/extras/shares {envelope, expiresAt?, title, type} → {share}
+  // POST /api/extras/shares {envelope, expiresAt?, title, type, source?} → {share}
   async function handleCreate(req, res) {
     const cfg = readStorage();
     if (!cfg) return sendError(res, 409, 'Connect your Cloudflare storage first');
-    const { envelope, expiresAt, title, type } = await parseBody(req);
+    const { envelope, expiresAt, title, type, source } = await parseBody(req);
     if (!validEnvelope(envelope)) return sendError(res, 400, 'Missing or malformed encrypted envelope');
     if (!TYPES.has(type)) return sendError(res, 400, 'Unsupported artifact type');
     let expires = null;
@@ -122,6 +132,7 @@ export function createShareHandlers({ dataDir, fetchImpl = globalThis.fetch, set
       mode: envelope.kdf ? 'password' : 'link',
       createdAt: new Date().toISOString(),
       expiresAt: expires,
+      ...(cleanSource(source) ? { source: cleanSource(source) } : {}),
     };
     writePrivate(indexFile, [share, ...readIndex()]);
     sweep().catch(() => {});

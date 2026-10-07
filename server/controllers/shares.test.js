@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { createShareHandlers, validEnvelope } from './shares.js';
+import { createShareHandlers, validEnvelope, cleanSource } from './shares.js';
 import { buildSharePage } from '../share/viewer-page.js';
 import { decryptShare, needsPassword } from '../share/viewer-decrypt.js';
 
@@ -150,4 +150,15 @@ test('whole-chat shares are accepted and uploaded like artifacts', async () => {
   assert.equal(r.status, 201);
   assert.equal(r.body.share.type, 'chat');
   assert.ok(ops[0].body.includes('function chatPage'), 'the share page can render chats');
+});
+
+test('create records where the share came from, keeping only known fields', async () => {
+  const { h } = setup();
+  const r = await call(h.handleCreate, { envelope: ENV, title: 'A chat', type: 'chat', source: { kind: 'chat', chatId: 'agent:main:x', extra: 'dropped' } });
+  assert.deepEqual(r.body.share.source, { kind: 'chat', chatId: 'agent:main:x' });
+  assert.deepEqual((await call(h.handleList)).body.shares[0].source, { kind: 'chat', chatId: 'agent:main:x' });
+  const plain = await call(h.handleCreate, { envelope: ENV, type: 'html', source: { kind: 'nope' } });
+  assert.equal('source' in plain.body.share, false);
+  assert.equal(cleanSource({ kind: 'file', path: 'a'.repeat(900), name: 5 }).path.length, 500);
+  assert.equal(cleanSource({ kind: 'file', name: 5 }).name, undefined);
 });
