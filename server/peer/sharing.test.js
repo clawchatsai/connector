@@ -422,3 +422,29 @@ test('a peer request cannot pick the owner-room note', async () => {
   await link.request('turn', { turnId: 't1', agentId: 'jarvis-guest', roomId: 'r', message: 'hi', inOwnerRoom: true }, { timeoutMs: 5000 });
   assert.match(s.ownerCalls.find(c => c.method === 'chat.send').params.message, /you are answering Houman S's team chat/);
 });
+
+test('presence: the side that asked keeps a link open, so the side that granted can reach it (room copies)', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  for (let i = 0; i < 20 && !s.req._links.get('sh1')?.ready; i++) await new Promise(r => setTimeout(r, 25));
+  assert.ok(s.req._links.get('sh1')?.ready, 'requester dialled without anyone using an agent');
+  // The owner can now call the requester over that link (what room.sync does).
+  let got = null;
+  s.req._links.get('sh1').handle('room.sync', async p => { got = p; return { ok: true }; });
+  const res = await s.owner.personRequest('gwH', 'room.sync', { roomId: 'r1' });
+  assert.deepEqual(res, { ok: true });
+  assert.equal(got.roomId, 'r1');
+  s.req.close(); s.owner.close();
+});
+
+test('names next to agents: first name, full name when two people here share it', () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  assert.equal(s.req.labelOf('gwK', 'Kamil Gronowski'), 'Kamil');
+  // This gateway's own person is "Houman S": another Houman next to their agents shows in full, and so does ours.
+  assert.equal(s.req.labelOf('gwX', 'Houman Test'), 'Houman Test');
+  assert.equal(s.req.labelOf('gwH', 'Houman S'), 'Houman', 'a person never clashes with themselves');
+  s.req.close(); s.owner.close();
+});

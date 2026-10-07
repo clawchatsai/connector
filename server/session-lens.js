@@ -229,6 +229,9 @@ export class SessionLens {
     if (payload.reason === 'delete' && this.team) {
       try { this.team.onSessionDeleted(key); } catch (e) { this.log.warn?.(`[lens] team delete: ${e.message}`); }
     }
+    if (payload.reason === 'patch' && this.team?.onSessionPatched) {
+      this.team.onSessionPatched(key).catch(e => this.log.warn?.(`[lens] team patch: ${e.message}`));
+    }
     if (!this.observe(key, payload.session || payload)) return null;
     if (payload.reason === 'delete' && this.extras) this.extras.deleteThreadExtras?.(key);
     const out = trimEvent(payload);

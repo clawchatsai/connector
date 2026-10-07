@@ -289,6 +289,9 @@ export function createApp(config = {}) {
         if (room && body.discuss !== undefined) {
           try { room = team.setDiscuss(p.room, body.discuss); } catch (e) { return sendError(res, 400, e.message); }
         }
+        if (room && body.mentionOnly !== undefined) {
+          try { room = team.setMentionOnly(p.room, body.mentionOnly); } catch (e) { return sendError(res, 400, e.message); }
+        }
         if (room && body.rounds !== undefined) {
           try { room = team.setRounds(p.room, body.rounds); } catch (e) { return sendError(res, 400, e.message); }
         }
@@ -298,16 +301,16 @@ export function createApp(config = {}) {
         const { personId, history } = await parseBody(req);
         if (typeof personId !== 'string' || !personId) return sendError(res, 400, 'personId is required');
         try {
-          const room = await team.addPerson(p.room, personId, { history });
+          const room = await team.addPerson(p.room, personId, { history, quietAgents: true });
           return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
         } catch (e) { return sendError(res, 400, e.message); }
       }
       if ((p = matchRoute(method, urlPath, 'DELETE /api/team/:room/people/:personId'))) {
-        const room = team.removePerson(p.room, p.personId);
+        const room = await team.removePerson(p.room, p.personId);
         return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat you host');
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/leave'))) {
-        try { return send(res, 200, { room: await team.leave(p.room) }); }
+        try { return send(res, 200, { room: await team.leave(p.room, await parseBody(req).catch(() => ({}))) }); }
         catch (e) { return sendError(res, 400, e.message); }
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/agents'))) {
@@ -320,7 +323,7 @@ export function createApp(config = {}) {
       }
       if ((p = matchRoute(method, urlPath, 'DELETE /api/team/:room/agents/:agentId'))) {
         try {
-          const room = team.removeAgent(p.room, p.agentId);
+          const room = await team.removeAgent(p.room, p.agentId);
           return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
         } catch (e) { return sendError(res, 400, e.message); }
       }

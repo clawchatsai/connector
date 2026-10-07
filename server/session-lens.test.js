@@ -226,3 +226,11 @@ test('list responses keep children whose parent is listed later on the page', ()
     { key: CHAT, kind: 'direct', label: 'c' },
   ]);
 });
+
+test('a patched session tells the team coordinator (a renamed room reaches its copies)', async () => {
+  const patched = [];
+  const { l } = lens({});
+  l.team = { isWorkKey: () => false, onSessionPatched: async key => { patched.push(key); } };
+  l.sessionsChanged({ sessionKey: CHAT, reason: 'patch', label: 'New name' });
+  assert.deepEqual(patched, [CHAT]);
+});
