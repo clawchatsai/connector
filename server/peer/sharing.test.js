@@ -118,10 +118,14 @@ test("funnel: a person's chats go to the project chosen for them; renames follow
   const create = s.ownerCalls.find(c => c.method === 'sessions.create').params;
   assert.equal(create.category, 'Friends');
 
-  // Changed later: chats already there move.
+  // Changed later: chats already there move, including ones from a share since ended (a new share replaced it).
+  const db = s.owner._db();
+  db.prepare('INSERT INTO peer_grants (share_id, grant_json, sig, created_at, revoked_at) VALUES (?, ?, ?, ?, ?)').run('old1', JSON.stringify({ requesterGatewayId: 'gwH', agents: [] }), 'x', 1, 2);
+  db.prepare('INSERT INTO peer_sessions (share_id, room_id, agent_id, session_key) VALUES (?, ?, ?, ?)').run('old1', 'r0', 'jarvis-guest', 'agent:jarvis-guest:dashboard:old');
   const moved = await s.owner.setFunnel('h@x.dev', 'Work friends');
-  assert.equal(moved.moved, 1);
-  assert.deepEqual(s.ownerCalls.filter(c => c.method === 'sessions.patch' && c.params.category).map(c => [c.params.key, c.params.category]), [[create.key, 'Work friends']]);
+  assert.equal(moved.moved, 2);
+  assert.deepEqual(s.ownerCalls.filter(c => c.method === 'sessions.patch' && c.params.category).map(c => [c.params.key, c.params.category]).sort(),
+    [[create.key, 'Work friends'], ['agent:jarvis-guest:dashboard:old', 'Work friends']].sort());
 
   // The project is renamed in ClawChats: they follow. Deleted: the next chat makes it again (sessions.create names it).
   assert.equal(s.owner.renameFunnel('Work friends', 'Team'), 1);

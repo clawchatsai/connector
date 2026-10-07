@@ -219,8 +219,9 @@ export class TeamCoordinator {
   /** The project for this person's chats changed: our copies of the chats they host move there. Returns how many. */
   async refileCopies(email, project) {
     let moved = 0;
+    const gateways = this.remote?.gatewayIdsOf?.(email) || new Set(); // includes ones from ended connections: their archived copies move too
     for (const r of this.store.listRooms()) {
-      if (!r.host || String(this.remote?.contact?.(r.host.gatewayId)?.email || '').toLowerCase() !== email) continue;
+      if (!r.host || !gateways.has(r.host.gatewayId)) continue;
       if (await this.request('sessions.patch', { key: r.roomKey, category: project }).then(() => true, () => false)) moved++;
     }
     return moved;
