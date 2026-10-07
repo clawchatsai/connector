@@ -16,6 +16,9 @@
 //   team_rooms.host_*  a live copy of someone else's room (this gateway is a member, not the host):
 //                 host_gateway_id/host_room/host_name; replica_json = the host's members and people
 //   team_mirror   host entry id -> local message id in a live copy (each host entry injected once)
+//   team_entries.host_ts/owner_id/ref  a mirrored entry's original time, its agent's owner and room-wide agent ref
+//   team_entries author_type 'system': a line like "Kamil joined" (same on every screen)
+//   team_rooms.mention_only  agents answer only when @mentioned (human chats with silent agents)
 
 const DISCUSS_ROUNDS = 3; // default; each room can set 1..MAX_ROUNDS
 const MAX_ROUNDS = 10;
@@ -24,6 +27,7 @@ function roomRow(r, members, people = []) {
   return {
     roomKey: r.room_key,
     discuss: !!r.discuss,
+    mentionOnly: !!r.mention_only,
     rounds: r.rounds || DISCUSS_ROUNDS,
     sourceKey: r.source_key || null,
     createdAt: r.created_at,
@@ -49,6 +53,11 @@ export function createTeamStore(getGlobalDb) {
       if (!cols('team_members').has('history')) g.exec('ALTER TABLE team_members ADD COLUMN history TEXT');
       const rc = cols('team_rooms');
       for (const c of ['host_gateway_id', 'host_room', 'host_name', 'host_ended', 'replica_json']) if (!rc.has(c)) g.exec(`ALTER TABLE team_rooms ADD COLUMN ${c} TEXT`);
+      if (!rc.has('mention_only')) g.exec('ALTER TABLE team_rooms ADD COLUMN mention_only INTEGER NOT NULL DEFAULT 0');
+      const ec = cols('team_entries');
+      if (!ec.has('host_ts')) g.exec('ALTER TABLE team_entries ADD COLUMN host_ts INTEGER');
+      if (!ec.has('owner_id')) g.exec('ALTER TABLE team_entries ADD COLUMN owner_id TEXT');
+      if (!ec.has('ref')) g.exec('ALTER TABLE team_entries ADD COLUMN ref TEXT');
       g.exec(`CREATE TABLE IF NOT EXISTS team_people (room_key TEXT NOT NULL, person_id TEXT NOT NULL, name TEXT NOT NULL, email TEXT, history_from INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (room_key, person_id))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_mirror (room_key TEXT NOT NULL, host_entry_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY (room_key, host_entry_id))`);
       ready = true;
@@ -72,12 +81,12 @@ export function createTeamStore(getGlobalDb) {
     },
 
     /** members: [{ agentId, workKey?, seenAt? }] in display order; sourceKey: the chat it was converted from. */
-    createRoom(roomKey, memberList, { discuss = false, sourceKey = null } = {}) {
+    createRoom(roomKey, memberList, { discuss = false, sourceKey = null, mentionOnly = false } = {}) {
       const g = db();
       const now = Date.now();
       g.exec('BEGIN');
       try {
-        g.prepare('INSERT INTO team_rooms (room_key, discuss, source_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(roomKey, discuss ? 1 : 0, sourceKey, now, now);
+        g.prepare('INSERT INTO team_rooms (room_key, discuss, source_key, created_at, updated_at, mention_only) VALUES (?, ?, ?, ?, ?, ?)').run(roomKey, discuss ? 1 : 0, sourceKey, now, now, mentionOnly ? 1 : 0);
         memberList.forEach((m, i) => g.prepare('INSERT INTO team_members (room_key, agent_id, work_key, seen_at, position) VALUES (?, ?, ?, ?, ?)').run(roomKey, m.agentId, m.workKey || null, m.seenAt || 0, i));
         g.exec('COMMIT');
       } catch (e) { g.exec('ROLLBACK'); throw e; }
@@ -158,6 +167,10 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('UPDATE team_rooms SET discuss = ?, updated_at = ? WHERE room_key = ?').run(discuss ? 1 : 0, Date.now(), roomKey);
     },
 
+    setMentionOnly(roomKey, on) {
+      db().prepare('UPDATE team_rooms SET mention_only = ?, updated_at = ? WHERE room_key = ?').run(on ? 1 : 0, Date.now(), roomKey);
+    },
+
     setRounds(roomKey, rounds) {
       db().prepare('UPDATE team_rooms SET rounds = ?, updated_at = ? WHERE room_key = ?').run(rounds, Date.now(), roomKey);
     },
@@ -189,18 +202,22 @@ export function createTeamStore(getGlobalDb) {
      * type 'user' (this gateway's own person), 'person' (someone else; agentId holds their person id
      * and actingFor their name), or 'agent' (actingFor: whose request it answered, if not its owner's).
      */
-    recordEntry(roomKey, messageId, { type, agentId = null, actingFor = null }) {
-      db().prepare('INSERT OR REPLACE INTO team_entries (room_key, message_id, author_type, agent_id, created_at, acting_for) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(roomKey, messageId, ['user', 'person'].includes(type) ? type : 'agent', agentId, Date.now(), actingFor);
+    recordEntry(roomKey, messageId, { type, agentId = null, actingFor = null, ts = null, ownerId = null, ref = null }) {
+      db().prepare('INSERT OR REPLACE INTO team_entries (room_key, message_id, author_type, agent_id, created_at, acting_for, host_ts, owner_id, ref) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(roomKey, messageId, ['user', 'person', 'system'].includes(type) ? type : 'agent', agentId, Date.now(), actingFor, ts || null, ownerId, ref);
     },
 
-    /** { [messageId]: { type: 'user'|'agent', agentId, actingFor? } | { type: 'person', personId, name } } */
+    /**
+     * { [messageId]: { type: 'user'|'agent'|'system', agentId, actingFor?, ts?, ownerId?, ref? } | { type: 'person', personId, name } }
+     * ts: the entry's original time when this is a copy of someone else's room.
+     */
     authors(roomKey) {
       const out = {};
-      for (const r of db().prepare('SELECT message_id, author_type, agent_id, acting_for FROM team_entries WHERE room_key = ?').all(roomKey)) {
+      for (const r of db().prepare('SELECT message_id, author_type, agent_id, acting_for, host_ts, owner_id, ref FROM team_entries WHERE room_key = ?').all(roomKey)) {
+        const extra = { ...(r.host_ts ? { ts: r.host_ts } : {}), ...(r.owner_id ? { ownerId: r.owner_id } : {}), ...(r.ref ? { ref: r.ref } : {}) };
         out[r.message_id] = r.author_type === 'person'
-          ? { type: 'person', personId: r.agent_id, name: r.acting_for }
-          : { type: r.author_type, agentId: r.agent_id, ...(r.acting_for ? { actingFor: r.acting_for } : {}) };
+          ? { type: 'person', personId: r.agent_id, name: r.acting_for, ...extra }
+          : { type: r.author_type, agentId: r.agent_id, ...(r.acting_for ? { actingFor: r.acting_for } : {}), ...extra };
       }
       return out;
     },

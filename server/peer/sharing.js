@@ -94,6 +94,7 @@ export class SharingManager {
 
   /** `share-list` from the signal server. Ends links/grants for shares that are gone. */
   setShares(shares) {
+    this._nameCache = null;
     const first = !this.serverEnabled;
     this.serverEnabled = true;
     this._shares = Array.isArray(shares) ? shares : [];
@@ -102,7 +103,35 @@ export class SharingManager {
     for (const s of this._localGrants()) if (!live.has(s.share_id) && !this._shares.some(x => x.id === s.share_id && x.status === 'pending')) this._revokeLocal(s.share_id);
     this._changed();
     if (first) setImmediate(() => { try { this.onFirstShares?.(); } catch (e) { this.log.warn?.(`[sharing] ${e.message}`); } });
+    this._sharesChanged();
+    this._presenceTick();
   }
+
+  /**
+   * Presence: a gateway that asked for someone's agents is the one that can open the link to them, so
+   * it keeps one open (and re-opens it when it drops). Without that, a room host that only *granted*
+   * shares couldn't reach its people until they happened to use an agent: copies would sit unsent.
+   * Retries back off per share (15 s up to 10 min); a failed dial costs nothing.
+   */
+  _presenceTick() {
+    clearTimeout(this._presenceTimer);
+    if (!this.serverEnabled || this._closed) return;
+    for (const s of this._shares) {
+      if (s.as !== 'requester' || s.status !== 'active' || !this._verifiedGrant(s)) continue;
+      const cur = this._links.get(s.id);
+      const b = (this._backoff ??= new Map());
+      if ((cur?.ready && !cur.closed) || this._linking.has(s.id)) { b.delete(s.id); continue; }
+      const st = b.get(s.id) || { next: 0, wait: 15_000 };
+      if (Date.now() < st.next) continue;
+      b.set(s.id, { next: Date.now() + st.wait, wait: Math.min(st.wait * 2, 10 * 60_000) });
+      this._link(s.id).then(() => b.delete(s.id)).catch(e => this.log.info?.(`[sharing] presence ${s.id}: ${e.message}`));
+    }
+    this._presenceTimer = setTimeout(() => this._presenceTick(), 15_000);
+    this._presenceTimer.unref?.();
+  }
+
+  /** Team chats follow the connection: people and agents of an ended share leave their rooms. */
+  _sharesChanged() { try { this.onSharesChanged?.(); } catch (e) { this.log.warn?.(`[sharing] ${e.message}`); } }
 
   /** The signal server says a share ended (revoke/decline): stop at once. */
   onShareRevoked(shareId) {
@@ -110,6 +139,7 @@ export class SharingManager {
     this._links.get(shareId)?.close();
     this._links.delete(shareId);
     this._changed();
+    this._sharesChanged();
   }
 
   _changed() { this.broadcast(JSON.stringify({ type: 'clawchats', event: 'sharing-changed' })); }
@@ -207,7 +237,7 @@ export class SharingManager {
     if (!s) throw new Error('No such request');
     if (!s.requester?.pubKey || !s.requester?.gatewayId) throw new Error("The requester's gateway hasn't connected with sharing support yet");
     const list = (Array.isArray(agents) ? agents : []).filter(a => a && typeof a.id === 'string' && a.id).map(a => ({ id: a.id, name: String(a.name || a.id).slice(0, 80) }));
-    if (!list.length) throw new Error('Pick at least one agent');
+    // No agents is fine: a connection can be just for chatting (team chats with people).
     if (!ACCESS_MODES[access]) throw new Error('Unknown access level');
     // A changed grant keeps the requester key it was first approved for: the signal server can't swap it.
     const prev = this._db().prepare('SELECT grant_json FROM peer_grants WHERE share_id = ?').get(shareId);
@@ -313,6 +343,43 @@ export class SharingManager {
   }
 
   contact(personId) { return this.contacts().find(c => c.personId === personId) || null; }
+
+  /** Whether any share (either direction, verified or not) is active with that gateway. */
+  hasShareWith(gatewayId) {
+    return this._shares.some(s => s.status === 'active' && this._other(s).gatewayId === gatewayId);
+  }
+
+  /**
+   * How a person's name shows next to their agents ("Jarvis · Kamil"): the first name, or the full
+   * name when two people here (this gateway's person included) share a first name.
+   */
+  labelOf(gatewayId, fullName) {
+    const first = n => cleanName(String(n || '').trim().split(/[\s@]/)[0], 30) || 'Someone';
+    // Everyone known here by id (cached: remoteAgents() calls this per agent, and contacts() verifies grants).
+    if (!this._nameCache || Date.now() - this._nameCache.at > 5000) {
+      const known = new Map();
+      for (const c of this.contacts()) known.set(c.personId, c.name);
+      if (this.gatewayId?.()) known.set(this.gatewayId(), this.selfName() || '');
+      this._nameCache = { at: Date.now(), known };
+    }
+    const people = new Map(this._nameCache.known);
+    if (gatewayId && fullName) people.set(gatewayId, fullName);
+    const mine = first(fullName);
+    const clash = [...people].some(([id, n]) => id !== gatewayId && first(n).toLowerCase() === mine.toLowerCase());
+    return clash ? cleanName(fullName, 60) || mine : mine;
+  }
+
+  /** The room (and who asked) behind a guest session of this gateway, or null. */
+  guestSessionOf(key) {
+    if (!this._guestKeys) {
+      this._guestKeys = new Map();
+      for (const r of this._db().prepare('SELECT share_id, room_id, session_key FROM peer_sessions').all()) {
+        const g = this._grant(r.share_id);
+        if (g?.grant.requesterGatewayId) this._guestKeys.set(r.session_key, { requesterGatewayId: g.grant.requesterGatewayId, roomId: r.room_id, shareId: r.share_id });
+      }
+    }
+    return this._guestKeys.get(key) || null;
+  }
 
   /** The gateway id of whoever owns a shared agent ('peer:<share>:<agent>'), or null. */
   ownerOf(remoteAgentId) {
@@ -451,6 +518,7 @@ export class SharingManager {
       await create(`${name} · ${roomTitle} · ${tag}-${crypto.randomBytes(2).toString('hex')}`);
     }
     db.prepare('INSERT OR REPLACE INTO peer_sessions (share_id, room_id, agent_id, session_key) VALUES (?, ?, ?, ?)').run(shareId, roomId, agentId, key);
+    this._guestKeys = null;
     return key;
   }
 
@@ -506,7 +574,7 @@ export class SharingManager {
     for (const s of this._shares) {
       const grant = this._verifiedGrant(s);
       if (!grant) continue;
-      const owner = firstName(s.owner);
+      const owner = this.labelOf(s.owner?.gatewayId, s.owner?.name || s.owner?.email) || firstName(s.owner);
       for (const a of grant.agents) {
         if (typeof a?.id !== 'string' || !a.id || a.id.length > 100) continue;
         out.push({ agentId: `peer:${s.id}:${a.id}`, name: `${cleanName(a.name || a.id) || 'Agent'} · ${owner}`, ownerName: owner, shareId: s.id, remoteId: a.id });
@@ -611,6 +679,8 @@ export class SharingManager {
   }
 
   close() {
+    this._closed = true;
+    clearTimeout(this._presenceTimer);
     for (const l of this._links.values()) l.close();
     for (const l of this._served) l.close();
     this._links.clear();

@@ -11,6 +11,7 @@ const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'De
 function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS } = {}) {
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
+  const labels = new Map(); // session key -> label
   let clock = 1_000, seq = 0;
   const events = [];
   let team;
@@ -18,10 +19,16 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
     calls.push({ method, params });
     switch (method) {
       case 'agents.list': return { agents };
-      case 'sessions.create': sessions.set(params.key, []); return { ok: true, key: params.key };
-      case 'sessions.describe': return { session: { key: params.key } };
+      case 'sessions.create': case 'sessions.patch': {
+        // Labels are unique per gateway, as on the real one.
+        if (params.label && [...labels].some(([k, l]) => l === params.label && k !== params.key)) throw new Error(`label already in use: ${params.label}`);
+        if (method === 'sessions.create') sessions.set(params.key, []);
+        if (params.label) labels.set(params.key, params.label);
+        return { ok: true, key: params.key };
+      }
+      case 'sessions.describe': return { session: { key: params.key, ...(labels.has(params.key) ? { label: labels.get(params.key) } : {}) } };
       case 'sessions.title.prepare': return { title: preparedTitle };
-      case 'sessions.patch': case 'sessions.delete': return { ok: true };
+      case 'sessions.delete': labels.delete(params.key); return { ok: true };
       case 'chat.inject': {
         const id = `m${++seq}`;
         sessions.get(params.sessionKey).push({ role: 'assistant', content: [{ type: 'text', text: `[${params.label}]\n\n${params.message}` }], timestamp: ++clock, __m: { id } });
@@ -55,7 +62,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
   team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, remote, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {} } });
   const room = key => (sessions.get(key) || []).map(m => m.content[0].text);
   const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r)); for (const c of team._chains.values()) await c; };
-  return { team, calls, room, settle, events, sessions };
+  return { team, calls, room, settle, events, sessions, labels };
 }
 
 test('parsing helpers', () => {
@@ -179,6 +186,27 @@ test('converting an existing chat keeps it as the agent working session; delete 
   assert.ok(h.calls.some(c => c.method === 'sessions.delete' && c.params.key === devWork));
 });
 
+test('converting a titled chat: the team chat takes the title; undoing or deleting gives it back', async () => {
+  const h = harness(agent => `${agent} ok`);
+  const source = 'agent:atlas:dashboard:titled-chat';
+  h.sessions.set(source, []);
+  h.labels.set(source, 'My chat');
+  const { roomKey } = await h.team.createRoom({ sourceKey: source, agentIds: ['dev'], label: 'My chat' });
+  assert.equal(h.labels.get(roomKey), 'My chat');
+  assert.match(h.labels.get(source), /^My chat · before team chat /);
+  assert.equal(await h.team.unconvert(roomKey), source);
+  assert.equal(h.labels.get(source), 'My chat');
+
+  // Deleting the team chat (the gateway already removed its session) also hands the title back.
+  const again = (await h.team.createRoom({ sourceKey: source, agentIds: ['dev'], label: 'My chat' })).roomKey;
+  assert.notEqual(h.labels.get(source), 'My chat');
+  h.labels.delete(again);
+  new SessionLens({ broadcast() {}, team: h.team }).sessionsChanged({ sessionKey: again, reason: 'delete' });
+  await new Promise(r => setTimeout(r, 0));
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(h.labels.get(source), 'My chat');
+});
+
 test('unconvert: back to the original chat; only converted rooms', async () => {
   const h = harness(agent => `${agent} ok`);
   const source = 'agent:atlas:dashboard:orig';
@@ -214,9 +242,9 @@ test('a team chat needs two agents; removing down to one is refused', async () =
   const h = harness(() => 'x');
   await assert.rejects(h.team.createRoom({ agentIds: ['dev'] }), /at least two/);
   const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
-  assert.throws(() => h.team.removeAgent(roomKey, 'dev'), /at least two/);
+  await assert.rejects(h.team.removeAgent(roomKey, 'dev'), /at least two/);
   await h.team.addAgent(roomKey, 'main');
-  assert.deepEqual(h.team.removeAgent(roomKey, 'dev').agents.map(a => a.agentId), ['atlas', 'main']);
+  assert.deepEqual((await h.team.removeAgent(roomKey, 'dev')).agents.map(a => a.agentId), ['atlas', 'main']);
 });
 
 test('stop: a partial reply is posted marked stopped; a reply that finished anyway is posted', async () => {
@@ -476,17 +504,21 @@ test('rounds: a per-room host setting, validated', async () => {
 function twoGateways({ devShared = true } = {}) {
   const forCalls = [];
   const sides = {};
+  const net = { connected: true, jarvisShared: true };
   const mk = (self, other, name) => ({
     gatewayId: () => self,
     selfName: () => name,
-    contact: gw => (gw === other ? { personId: other, name: other === 'gwK' ? 'Kamil' : 'Houman', email: null } : null),
+    hasShareWith: gw => net.connected && gw === other,
+    labelOf: (id, full) => String(full || '').split(/\s+/)[0],
+    guestSessionOf: () => null,
+    contact: gw => (net.connected && gw === other ? { personId: other, name: other === 'gwK' ? 'Kamil' : 'Houman', email: null } : null),
     personRequest: async (gw, method, params) => {
       if (gw !== other) throw Object.assign(new Error('not connected'), { code: 'not_connected' });
       return sides[other].team.onRoom(method, JSON.parse(JSON.stringify(params)), self);
     },
     ownerOf: id => (String(id).startsWith('peer:sh1:') && self === 'gwH' ? 'gwK' : null),
     ownsShare: shareId => shareId === 'sh1' && self === 'gwK',
-    remoteAgents: () => (self === 'gwH' ? [{ agentId: 'peer:sh1:jarvis-guest', name: 'Jarvis · Kamil', ownerName: 'Kamil' }] : []),
+    remoteAgents: () => (self === 'gwH' && net.jarvisShared ? [{ agentId: 'peer:sh1:jarvis-guest', name: 'Jarvis · Kamil', ownerName: 'Kamil' }] : []),
     turn: async () => ({ state: 'final', text: 'guest jarvis here' }),
     abort: async () => {},
     actingForName: () => 'Kamil',
@@ -507,7 +539,7 @@ function twoGateways({ devShared = true } = {}) {
       for (const c of sides.gwK.team._syncChains?.values() || []) await c.catch(() => {});
     }
   };
-  return { H: sides.gwH, K: sides.gwK, settle, forCalls };
+  return { H: sides.gwH, K: sides.gwK, settle, forCalls, net };
 }
 
 test('people: a person gets a live copy, posts back, their own agent runs on their gateway, removal ends it', async () => {
@@ -524,7 +556,7 @@ test('people: a person gets a live copy, posts back, their own agent runs on the
   assert.equal(copy.replica.hostName, 'Houman Satarian');
   assert.ok(K.room(copy.roomKey).some(t => t.endsWith('before kamil joins')));
   assert.deepEqual(copy.people.map(p => [p.name, !!p.host, !!p.me]), [['Houman Satarian', true, false], ['Kamil', false, true]]);
-  assert.ok(copy.agents.find(a => a.agentId === 'peer:sh1:jarvis-guest').mine, 'Kamil sees Jarvis as his own agent');
+  assert.ok(copy.agents.find(a => a.agentId === 'gwK:jarvis-guest').mine, 'Kamil sees Jarvis as his own agent');
   assert.ok(K.events.some(e => e.event === 'team-invited'));
 
   // Kamil asks his own Jarvis: it runs at full strength on Kamil's gateway; Houman's never runs it.
@@ -554,7 +586,7 @@ test('people: a person gets a live copy, posts back, their own agent runs on the
   assert.ok(Object.values(H.team.room(roomKey).authors).some(a => a.agentId === 'dev' && a.actingFor === 'Kamil'));
 
   // Houman removes Kamil: Jarvis leaves with him, the copy ends, sending fails.
-  H.team.removePerson(roomKey, 'gwK');
+  await H.team.removePerson(roomKey, 'gwK');
   await settle();
   assert.ok(!H.team.room(roomKey).agents.some(a => a.agentId === 'peer:sh1:jarvis-guest'));
   assert.equal(K.team.room(copy.roomKey).replica.ended, 'removed');
@@ -603,4 +635,232 @@ test('a chat turned into a team chat: agents added later get its earlier history
   // The chat's own agent already has it in its session.
   const main = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'main');
   assert.equal(await h.team._earlier(h.team.store.getRoom(roomKey), main), '');
+});
+
+// ── Rooms behave like Discord: one log, membership changes access, never the view ────────────────
+
+const lines = (h, key) => h.room(key).map(t => splitLabel(t)).map(m => `${m.label}: ${m.body}`);
+
+test('a chat created with someone\'s agent brings its owner in (create, convert, add: one rule)', async () => {
+  const { H, K, settle } = twoGateways();
+  const created = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  assert.deepEqual(created.people.map(p => p.personId), ['gwK']);
+  await settle();
+  assert.ok(K.team.rooms().find(r => r.replica), 'Kamil has a copy straight away, not only his agent\'s session');
+
+  const { H: H2, K: K2, settle: settle2 } = twoGateways();
+  H2.sessions.set('agent:main:dashboard:orig', []);
+  const converted = await H2.team.createRoom({ sourceKey: 'agent:main:dashboard:orig', agentIds: ['peer:sh1:jarvis-guest'] });
+  assert.deepEqual(converted.people.map(p => p.personId), ['gwK']);
+  await settle2();
+  assert.ok(K2.team.rooms().find(r => r.replica));
+});
+
+test('a chat with only people: the agent stays quiet unless @mentioned', async () => {
+  const { H, K, settle } = twoGateways();
+  const room = await H.team.createRoom({ personIds: ['gwK'], mentionOnly: true });
+  assert.equal(room.mentionOnly, true);
+  assert.deepEqual(room.people.map(p => p.personId), ['gwK']);
+  assert.equal(room.agents.length, 1, 'one agent of this gateway anchors the room');
+  await H.team.send(room.roomKey, { text: 'hey Kamil, just us', userLabel: 'Houman' });
+  await settle();
+  assert.equal(H.calls.filter(c => c.method === 'chat.send').length, 0, 'no agent ran');
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.ok(K.room(copy.roomKey).some(t => t.endsWith('hey Kamil, just us')));
+  // Kamil answers; still nobody else runs. Then an @mention wakes the agent.
+  await K.team.send(copy.roomKey, { text: 'hi Houman' });
+  await settle();
+  assert.equal(H.calls.filter(c => c.method === 'chat.send').length, 0);
+  await H.team.send(room.roomKey, { text: '@main what time is it', userLabel: 'Houman' });
+  await settle();
+  assert.equal(H.calls.filter(c => c.method === 'chat.send').length, 1);
+  // The setting is the host's, and it travels to the copy.
+  assert.equal(K.team.room(copy.roomKey).mentionOnly, true);
+  H.team.setMentionOnly(room.roomKey, false);
+  assert.equal(H.team.room(room.roomKey).mentionOnly, false);
+});
+
+test('adding the first person from the popover turns "agents reply only when @mentioned" on; later adds and create-time adds leave it', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  assert.equal(H.team.room(roomKey).mentionOnly, false);
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all', quietAgents: true });
+  await settle();
+  assert.equal(H.team.room(roomKey).mentionOnly, true, 'first other person: agents go quiet');
+  assert.equal(K.team.rooms().find(r => r.replica).mentionOnly, true, 'and the copy knows');
+  H.team.setMentionOnly(roomKey, false);
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all', quietAgents: true });
+  assert.equal(H.team.room(roomKey).mentionOnly, false, 'the host\'s later choice is kept');
+
+  const plain = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await H.team.addPerson(plain.roomKey, 'gwK', { history: 'all' });
+  assert.equal(H.team.room(plain.roomKey).mentionOnly, false, 'create-time adds decide for themselves');
+});
+
+test('the timeline says who joined and left, the same on both sides; agents never see those lines', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await H.team.send(roomKey, { text: '@dev hello', userLabel: 'Houman' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.ok(lines(H, roomKey).includes('System: Kamil joined'));
+  assert.ok(lines(K, copy.roomKey).includes('System: Kamil joined'), 'Kamil\'s copy has the same line');
+  assert.ok(Object.values(K.team.room(copy.roomKey).authors).some(a => a.type === 'system'));
+  const devPrompt = H.calls.find(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:dev:')).params.message;
+  assert.ok(!/joined/.test(devPrompt), 'system lines are not part of what agents are told');
+
+  await H.team.removePerson(roomKey, 'gwK');
+  await settle();
+  assert.ok(lines(H, roomKey).includes('System: Kamil was removed'));
+  // The removed person keeps the room as it was, plus how it ended: a read-only archive.
+  assert.ok(K.room(copy.roomKey).some(t => t.endsWith('hello')), 'history kept');
+  assert.ok(lines(K, copy.roomKey).includes('System: Kamil was removed'));
+  assert.equal(lines(K, copy.roomKey).filter(l => /removed/.test(l)).length, 1, 'one line for one event');
+  assert.equal(K.team.room(copy.roomKey).replica.ended, 'removed');
+  assert.ok(!K.calls.some(c => c.method === 'sessions.delete'), 'nothing deleted');
+  // Nothing about the copy changed for the people still in the room.
+  assert.equal(H.team.room(roomKey).people.length, 0);
+});
+
+test('a copy shows entries at the time they were sent, and host and guest agents named `main` never collide', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['main', 'peer:sh1:jarvis-guest'] });
+  await H.team.send(roomKey, { text: '@main say hi', userLabel: 'Houman' });
+  await settle();
+  const hostAuthors = H.team.room(roomKey).authors;
+  const copy = K.team.rooms().find(r => r.replica);
+  const copyAuthors = K.team.room(copy.roomKey).authors;
+  const hostTs = Object.values(await H.team._roomEntries(roomKey).then(es => es.map(e => e.ts)));
+  const copyTs = Object.values(copyAuthors).map(a => a.ts).filter(Boolean).sort();
+  assert.deepEqual(copyTs, [...hostTs].sort(), 'original times');
+  // Houman's `main` answered on Houman's gateway. Kamil's own `main` exists too (his default agent) and must not claim that line.
+  const hostMain = Object.entries(copyAuthors).find(([, a]) => a.type === 'agent' && a.ownerId === 'gwH');
+  assert.ok(hostMain, 'Houman\'s main is recorded under its owner');
+  assert.notEqual(hostMain[1].agentId, 'main');
+  // Kamil asks his Jarvis: it is told about Houman\'s main reply (not filtered out as its own).
+  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil what did main say?' });
+  await settle();
+  const prompt = K.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:jarvis:')).at(-1).params.message;
+  assert.match(prompt, /main/);
+  assert.ok(Object.keys(hostAuthors).length > 0);
+});
+
+test('a person takes only their own agent out of a room; the host does not need to be asked', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  await assert.rejects(K.team.leave(copy.roomKey, { agentId: copy.agents.find(a => !a.mine).agentId }), /Not your agent/);
+  const mine = copy.agents.find(a => a.mine);
+  await K.team.leave(copy.roomKey, { agentId: mine.agentId });
+  await settle();
+  const room = H.team.room(roomKey);
+  assert.ok(!room.agents.some(a => a.agentId === 'peer:sh1:jarvis-guest'));
+  assert.deepEqual(room.people.map(p => p.personId), ['gwK'], 'Kamil stays');
+  assert.ok(lines(H, roomKey).some(l => /^System: Jarvis · Kamil left$/.test(l)));
+  assert.equal(K.team.room(copy.roomKey).replica.ended, null, 'his copy is still live');
+});
+
+test('@mentions in an agent\'s reply get the mentioned agent one answer, with a hard stop', async () => {
+  // dev always answers by mentioning atlas, atlas always mentions dev back: it must stop.
+  const h = harness(agent => (agent === 'dev' ? 'over to @Atlas' : 'back to @Dev'));
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@dev start', userLabel: 'H' });
+  await h.settle();
+  const sends = h.calls.filter(c => c.method === 'chat.send').length;
+  assert.ok(sends >= 2, 'atlas answered the mention');
+  assert.ok(sends <= 4, `bounded, not endless (${sends})`);
+  // A reply that names nobody ends the chain.
+  const h2 = harness(agent => `${agent} done`);
+  const r2 = await h2.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h2.team.send(r2.roomKey, { text: '@dev go', userLabel: 'H' });
+  await h2.settle();
+  assert.equal(h2.calls.filter(c => c.method === 'chat.send').length, 1);
+});
+
+test('connections ending: people and agents leave the rooms, copies end as archives', async () => {
+  const { H, K, settle, net } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest', 'atlas'] });
+  await H.team.send(roomKey, { text: 'before', userLabel: 'Houman' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+
+  // Kamil stops sharing Jarvis only: the agent leaves, Kamil stays.
+  net.jarvisShared = false;
+  await H.team._reconcileNow();
+  await settle();
+  assert.ok(!H.team.room(roomKey).agents.some(a => a.agentId === 'peer:sh1:jarvis-guest'));
+  assert.deepEqual(H.team.room(roomKey).people.map(p => p.personId), ['gwK']);
+  assert.ok(lines(H, roomKey).includes('System: Jarvis · Kamil is no longer shared'));
+  assert.equal(K.team.room(copy.roomKey).replica.ended, null);
+
+  // The whole connection ends: Kamil leaves Houman's room; on Kamil's side the copy is kept, read-only.
+  net.connected = false;
+  await H.team._reconcileNow();
+  await K.team._reconcileNow();
+  assert.deepEqual(H.team.room(roomKey).people, []);
+  assert.ok(lines(H, roomKey).includes('System: Kamil is no longer connected'));
+  const kc = K.team.room(copy.roomKey);
+  assert.equal(kc.replica.ended, 'disconnected');
+  assert.ok(K.room(copy.roomKey).some(t => t.endsWith('before')), 'history kept');
+  assert.ok(lines(K, copy.roomKey).includes("System: You're no longer connected with Houman Satarian"));
+  await assert.rejects(K.team.send(copy.roomKey, { text: 'hello?' }), /no longer connected/);
+});
+
+test('ending or undoing a chat with people turns their copies into archives', async () => {
+  const { H, K, settle } = twoGateways();
+  H.sessions.set('agent:main:dashboard:orig2', []);
+  const { roomKey } = await H.team.createRoom({ sourceKey: 'agent:main:dashboard:orig2', agentIds: ['peer:sh1:jarvis-guest'] });
+  await H.team.send(roomKey, { text: 'before the end', userLabel: 'Houman' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  await H.team.unconvert(roomKey);
+  await settle();
+  const kc = K.team.room(copy.roomKey);
+  assert.equal(kc.replica.ended, 'deleted');
+  assert.ok(K.room(copy.roomKey).some(t => t.endsWith('before the end')));
+  assert.ok(lines(K, copy.roomKey).includes('System: Houman Satarian ended this chat'));
+});
+
+test('a copy has no label until the host\'s chat has a title, then follows it', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.equal(K.labels.get(copy.roomKey), undefined, 'untitled: the app names it after who is in it');
+  H.labels.set(roomKey, 'Trip plans');
+  await H.team.send(roomKey, { text: 'more', userLabel: 'Houman' });
+  await settle();
+  assert.equal(K.labels.get(copy.roomKey), 'Trip plans · Houman Satarian');
+  H.labels.set(roomKey, 'Trip plans v2');
+  await H.team.send(roomKey, { text: 'again', userLabel: 'Houman' });
+  await settle();
+  assert.equal(K.labels.get(copy.roomKey), 'Trip plans v2 · Houman Satarian');
+});
+
+test('names that clash: a converted chat\'s earlier answers carry the full host name, like the agents list does', async () => {
+  const { H, K, settle } = twoGateways();
+  H.team.remote.labelOf = () => 'Houman Satarian'; // another Houman is in the picture
+  H.sessions.set('agent:main:dashboard:orig', [
+    { role: 'user', content: [{ type: 'text', text: 'what is the code word?' }], timestamp: 1, __m: { id: 'o1' } },
+    { role: 'assistant', content: [{ type: 'text', text: 'marmot' }], timestamp: 2, __m: { id: 'o2' } },
+  ]);
+  await H.team.createRoom({ sourceKey: 'agent:main:dashboard:orig', agentIds: ['peer:sh1:jarvis-guest'] });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  assert.ok(lines(K, copy.roomKey).includes('main · Houman Satarian: marmot'), lines(K, copy.roomKey).join(' | '));
+});
+
+test('a host renaming the chat reaches the copies without anyone sending a message', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ personIds: ['gwK'], mentionOnly: true, label: 'First title' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  const label = () => K.labels.get(copy.roomKey);
+  assert.equal(label(), 'First title · Houman Satarian');
+  H.labels.set(roomKey, 'Second title');
+  await H.team.onSessionPatched(roomKey);
+  await settle();
+  assert.equal(label(), 'Second title · Houman Satarian');
 });
