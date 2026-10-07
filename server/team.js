@@ -42,6 +42,9 @@ export function entryId(message) {
   return null;
 }
 
+/** Appended to a converted chat's label while its team chat holds the title (labels are unique). */
+const SOURCE_LABEL_SUFFIX = ' · before team chat ';
+
 /** "[Label]\n\nbody" → { label, body }. */
 export function splitLabel(text) {
   const m = LABEL_PREFIX.exec(text || '');
@@ -233,6 +236,13 @@ export class TeamCoordinator {
     // Register first so the lens never shows a working session or forwards a half-made room.
     this.store.createRoom(roomKey, members, { sourceKey });
     this._workKeysChanged();
+    // Labels are unique per gateway and the source chat still holds this one: it steps aside (as the
+    // hidden working session) so the team chat can take it; it gets it back when the room goes.
+    const title = typeof label === 'string' ? label.trim().slice(0, 200) : '';
+    if (sourceKey && title) {
+      await this.request('sessions.patch', { key: sourceKey, label: `${title}${SOURCE_LABEL_SUFFIX}${sourceKey.slice(-8)}`.slice(0, 200) })
+        .catch(e => this.log.warn?.(`[team] free label of ${sourceKey}: ${e.message}`));
+    }
     try {
       await this.request('sessions.create', {
         key: roomKey, agentId: members[0].agentId,
@@ -242,6 +252,7 @@ export class TeamCoordinator {
     } catch (e) {
       this.store.deleteRoom(roomKey);
       this._workKeysChanged();
+      if (sourceKey && title) this._restoreSourceLabel(sourceKey);
       throw e;
     }
     this._changed();
@@ -257,8 +268,9 @@ export class TeamCoordinator {
     const room = this.store.getRoom(roomKey);
     if (!room) return null;
     if (!room.sourceKey) throw new Error('this team chat was not converted from a chat');
-    this._dissolve(roomKey);
+    this._dissolve(roomKey, { restoreLabel: false });
     await this.request('sessions.delete', { key: roomKey }).catch(e => this.log.warn?.(`[team] delete room ${roomKey}: ${e.message}`));
+    await this._restoreSourceLabel(room.sourceKey); // once the room no longer holds the title
     return room.sourceKey;
   }
 
@@ -266,7 +278,7 @@ export class TeamCoordinator {
    * Forget a room and delete its working sessions — except the chat it was converted from, which is
    * the user's own chat and becomes a normal thread again (deleting the room must never delete it).
    */
-  _dissolve(roomKey) {
+  _dissolve(roomKey, { restoreLabel = true } = {}) {
     const before = this.store.getRoom(roomKey);
     const source = before?.sourceKey;
     for (const p of before?.people || []) this._pushEnded(roomKey, p.personId, 'deleted');
@@ -275,8 +287,23 @@ export class TeamCoordinator {
     this.stop(roomKey);
     const work = this.store.deleteRoom(roomKey).filter(w => w !== source);
     this._workKeysChanged();
+    if (source && restoreLabel) this._restoreSourceLabel(source);
     for (const w of work) this.request('sessions.delete', { key: w }).catch(e => this.log.warn?.(`[team] delete ${w}: ${e.message}`));
     this._changed();
+  }
+
+  /** A converted chat that's a normal chat again takes back the label it gave its team chat. */
+  async _restoreSourceLabel(sourceKey) {
+    try {
+      const label = (await this.request('sessions.describe', { key: sourceKey }, 5000))?.session?.label || '';
+      const i = label.lastIndexOf(SOURCE_LABEL_SUFFIX);
+      if (i <= 0) return;
+      const original = label.slice(0, i);
+      await this.request('sessions.patch', { key: sourceKey, label: original }).catch(e => {
+        // The title was taken meanwhile (e.g. the deleted room still holds it): keep the stepped-aside one.
+        if (!/label already in use/i.test(e.message)) throw e;
+      });
+    } catch (e) { this.log.warn?.(`[team] restore label of ${sourceKey}: ${e.message}`); }
   }
 
   /**

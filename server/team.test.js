@@ -11,6 +11,7 @@ const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'De
 function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS } = {}) {
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
+  const labels = new Map(); // session key -> label
   let clock = 1_000, seq = 0;
   const events = [];
   let team;
@@ -18,10 +19,16 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
     calls.push({ method, params });
     switch (method) {
       case 'agents.list': return { agents };
-      case 'sessions.create': sessions.set(params.key, []); return { ok: true, key: params.key };
-      case 'sessions.describe': return { session: { key: params.key } };
+      case 'sessions.create': case 'sessions.patch': {
+        // Labels are unique per gateway, as on the real one.
+        if (params.label && [...labels].some(([k, l]) => l === params.label && k !== params.key)) throw new Error(`label already in use: ${params.label}`);
+        if (method === 'sessions.create') sessions.set(params.key, []);
+        if (params.label) labels.set(params.key, params.label);
+        return { ok: true, key: params.key };
+      }
+      case 'sessions.describe': return { session: { key: params.key, ...(labels.has(params.key) ? { label: labels.get(params.key) } : {}) } };
       case 'sessions.title.prepare': return { title: preparedTitle };
-      case 'sessions.patch': case 'sessions.delete': return { ok: true };
+      case 'sessions.delete': labels.delete(params.key); return { ok: true };
       case 'chat.inject': {
         const id = `m${++seq}`;
         sessions.get(params.sessionKey).push({ role: 'assistant', content: [{ type: 'text', text: `[${params.label}]\n\n${params.message}` }], timestamp: ++clock, __m: { id } });
@@ -55,7 +62,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
   team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, remote, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {} } });
   const room = key => (sessions.get(key) || []).map(m => m.content[0].text);
   const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r)); for (const c of team._chains.values()) await c; };
-  return { team, calls, room, settle, events, sessions };
+  return { team, calls, room, settle, events, sessions, labels };
 }
 
 test('parsing helpers', () => {
@@ -177,6 +184,27 @@ test('converting an existing chat keeps it as the agent working session; delete 
   assert.equal(lens.isVisible(source), true); // the user's own chat comes back
   assert.ok(!h.calls.some(c => c.method === 'sessions.delete' && c.params.key === source)); // never deleted
   assert.ok(h.calls.some(c => c.method === 'sessions.delete' && c.params.key === devWork));
+});
+
+test('converting a titled chat: the team chat takes the title; undoing or deleting gives it back', async () => {
+  const h = harness(agent => `${agent} ok`);
+  const source = 'agent:atlas:dashboard:titled-chat';
+  h.sessions.set(source, []);
+  h.labels.set(source, 'My chat');
+  const { roomKey } = await h.team.createRoom({ sourceKey: source, agentIds: ['dev'], label: 'My chat' });
+  assert.equal(h.labels.get(roomKey), 'My chat');
+  assert.match(h.labels.get(source), /^My chat · before team chat /);
+  assert.equal(await h.team.unconvert(roomKey), source);
+  assert.equal(h.labels.get(source), 'My chat');
+
+  // Deleting the team chat (the gateway already removed its session) also hands the title back.
+  const again = (await h.team.createRoom({ sourceKey: source, agentIds: ['dev'], label: 'My chat' })).roomKey;
+  assert.notEqual(h.labels.get(source), 'My chat');
+  h.labels.delete(again);
+  new SessionLens({ broadcast() {}, team: h.team }).sessionsChanged({ sessionKey: again, reason: 'delete' });
+  await new Promise(r => setTimeout(r, 0));
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(h.labels.get(source), 'My chat');
 });
 
 test('unconvert: back to the original chat; only converted rooms', async () => {
