@@ -16,11 +16,18 @@
 // `agent:<id>:<project>:chat:<id>` (legacy ClawChats). Everything else is hidden.
 // Team chat working sessions (server/team.js) are hidden too, but their run events are
 // forwarded: the room shows each agent's reply streaming.
+//
+// Spawned children (sessions_spawn: hidden `agent:<id>:subagent:<id>` runs and `visible: true`
+// dashboard sessions) are visible when their parent chain reaches a visible chat; the browser
+// nests them under it (Control UI session tree). Their rows carry `ccParentKey`, the parent the
+// lens resolved, so the browser never re-derives the placement rule.
 
 const DASHBOARD_KEY = /^agent:[^:]+:dashboard:[^:]+$/;
 const LEGACY_CHAT_KEY = /^agent:[^:]+:[^:]+:chat:[^:]+$/;
 const UTILITY_MARK = '__clawchats_';
 const MAIN_SESSION_KEY = /^agent:[^:]+:main$/;
+const SUBAGENT_KEY = /^agent:[^:]+:subagent:[^:]+$/;
+const MAX_CHILD_DEPTH = 8;
 
 // Session row fields the browser needs. Anything else stays on the connector side.
 export const ROW_FIELDS = new Set([
@@ -32,12 +39,14 @@ export const ROW_FIELDS = new Set([
   'status', 'hasActiveRun', 'activeRunIds', 'lastRunId', 'lastRunError', 'endedAt', 'agentStatus',
   'model', 'modelProvider', 'thinkingLevel', 'contextTokens', 'totalTokens', 'totalTokensFresh',
   'inputTokens', 'outputTokens', 'permissionMode', 'workspaceDir', 'contextBudgetStatus', 'fastMode', 'effectiveFastMode',
+  'startedAt', 'runtimeMs', 'ccParentKey',
 ]);
 
 // `sessions.changed` envelope fields (snapshot fields are spread next to these).
 const EVENT_ENVELOPE = new Set(['sessionKey', 'agentId', 'reason', 'phase', 'ts', 'messageId', 'catalogChanged']);
 
-const LIST_DEFAULTS = { excludeSubagents: true, excludeCron: true, excludeSystem: true };
+// Subagent runs are listed: the lens keeps the ones nested under a visible chat.
+const LIST_DEFAULTS = { excludeSubagents: false, excludeCron: true, excludeSystem: true };
 
 export function isUtilityKey(key) {
   return typeof key === 'string' && key.includes(UTILITY_MARK);
@@ -45,6 +54,18 @@ export function isUtilityKey(key) {
 
 export function isCandidateKey(key) {
   return typeof key === 'string' && !isUtilityKey(key) && (DASHBOARD_KEY.test(key) || LEGACY_CHAT_KEY.test(key));
+}
+
+/** Keys that can be a nested child: chat-shaped sessions and subagent runs. */
+function isChildCandidateKey(key) {
+  return isCandidateKey(key) || (typeof key === 'string' && SUBAGENT_KEY.test(key));
+}
+
+/** The parent a hidden row nests under (Control UI resolveUiSessionNavigationParentKey), if any. */
+function nestingParent(row) {
+  if (row.kind === 'global' || row.kind === 'unknown' || row.kind === 'group') return null;
+  const parent = row.parentSessionKey || row.spawnedBy;
+  return typeof parent === 'string' && parent && !MAIN_SESSION_KEY.test(parent) ? parent : null;
 }
 
 // ── Visibility: port of the Control UI sidebar rule ──────────────────
@@ -127,6 +148,7 @@ export class SessionLens {
     this.team = team;
     this.log = logger;
     this.hidden = new Set(); // candidate-shaped keys a row revealed as not a user chat
+    this.parents = new Map(); // child key -> parent key (nested children; visible when the chain reaches a chat)
     this.pending = new Map(); // browser req id -> { method, params }
     // Chats a browser opened with sessions.messages.subscribe (Control UI: one per selected
     // chat). session.message is forwarded only for these. subscriptionId -> session key.
@@ -137,15 +159,46 @@ export class SessionLens {
 
   /** Learn from a (possibly partial) row; returns whether the session is visible. */
   observe(key, row) {
-    if (!isCandidateKey(key)) return false;
-    const verdict = rowVerdict(row);
-    if (verdict === true) this.hidden.add(key);
-    else if (verdict === false) this.hidden.delete(key);
+    if (!isChildCandidateKey(key)) return false;
+    const verdict = SUBAGENT_KEY.test(key) ? true : rowVerdict(row);
+    if (verdict === true) {
+      this.hidden.add(key);
+      const parent = row && typeof row === 'object' && 'kind' in row ? nestingParent(row) : undefined;
+      if (parent) this.parents.set(key, parent);
+      else if (parent === null) this.parents.delete(key);
+    } else if (verdict === false) {
+      this.hidden.delete(key);
+      this.parents.delete(key);
+    }
     return this.isVisible(key);
   }
 
   isVisible(key) {
+    return this._isTopLevel(key) || !!this.parentOf(key);
+  }
+
+  _isTopLevel(key) {
     return isCandidateKey(key) && !this.hidden.has(key) && !this.team?.isWorkKey(key);
+  }
+
+  /** The parent a visible nested child shows under, or null (not a child, or its chain never reaches a chat). */
+  parentOf(key) {
+    const parent = this.parents.get(key);
+    if (!parent || this.team?.isWorkKey(key)) return null;
+    let cur = parent;
+    for (let depth = 0; depth < MAX_CHILD_DEPTH; depth++) {
+      if (this._isTopLevel(cur)) return parent;
+      cur = this.parents.get(cur);
+      if (!cur || cur === key) return null;
+    }
+    return null;
+  }
+
+  /** Row/event fields plus the resolved parent link of a nested child. */
+  _withParent(key, out) {
+    const parent = this.parentOf(key);
+    if (parent) out.ccParentKey = parent;
+    return out;
   }
 
   /** chat/agent run events: visible chats, team chat working sessions, utility sessions. */
@@ -178,7 +231,9 @@ export class SessionLens {
     }
     if (!this.observe(key, payload.session || payload)) return null;
     if (payload.reason === 'delete' && this.extras) this.extras.deleteThreadExtras?.(key);
-    return { type: 'event', event: 'sessions.changed', payload: trimEvent(payload) };
+    const out = trimEvent(payload);
+    if (payload.reason !== 'delete') this._withParent(key, out.session || out);
+    return { type: 'event', event: 'sessions.changed', payload: out };
   }
 
   /** `session.message` (live transcript entry). Forwarded only for watched visible chats. */
@@ -271,9 +326,11 @@ export class SessionLens {
     let legacy = null;
     try { legacy = this.extras?.getLegacyCreatedAt?.(); } catch (e) { this.log.warn?.(`[lens] legacy dates: ${e.message}`); }
     const out = [];
+    // Learn the whole page first: a child may be listed before its parent.
+    for (const row of rows || []) if (row) this.observe(row.key, row);
     for (const row of rows || []) {
-      if (!row || !this.observe(row.key, row)) continue;
-      const trimmed = trimRow(row);
+      if (!row || !this.isVisible(row.key)) continue;
+      const trimmed = this._withParent(row.key, trimRow(row));
       if (!trimmed.createdAt && legacy?.has(row.key)) trimmed.createdAt = legacy.get(row.key);
       out.push(trimmed);
     }
