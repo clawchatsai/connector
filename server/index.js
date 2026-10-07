@@ -247,7 +247,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/sharing') {
         // Enabled once the signal server has sharing on for this account (it then sends share lists).
         if (!sharing?.serverEnabled) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
-        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents() });
+        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null });
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
@@ -286,17 +286,35 @@ export function createApp(config = {}) {
       if ((p = matchRoute(method, urlPath, 'PATCH /api/team/:room'))) {
         const body = await parseBody(req);
         let room = team.room(p.room);
-        if (room && body.discuss !== undefined) room = team.setDiscuss(p.room, body.discuss);
+        if (room && body.discuss !== undefined) {
+          try { room = team.setDiscuss(p.room, body.discuss); } catch (e) { return sendError(res, 400, e.message); }
+        }
         if (room && body.rounds !== undefined) {
           try { room = team.setRounds(p.room, body.rounds); } catch (e) { return sendError(res, 400, e.message); }
         }
         return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
       }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/people'))) {
+        const { personId, history } = await parseBody(req);
+        if (typeof personId !== 'string' || !personId) return sendError(res, 400, 'personId is required');
+        try {
+          const room = await team.addPerson(p.room, personId, { history });
+          return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
+        } catch (e) { return sendError(res, 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'DELETE /api/team/:room/people/:personId'))) {
+        const room = team.removePerson(p.room, p.personId);
+        return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat you host');
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/leave'))) {
+        try { return send(res, 200, { room: await team.leave(p.room) }); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
       if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/agents'))) {
-        const { agentId } = await parseBody(req);
+        const { agentId, history } = await parseBody(req);
         if (typeof agentId !== 'string' || !agentId) return sendError(res, 400, 'agentId is required');
         try {
-          const room = await team.addAgent(p.room, agentId);
+          const room = await team.addAgent(p.room, agentId, { history });
           return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
         } catch (e) { return sendError(res, 400, e.message); }
       }
