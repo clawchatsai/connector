@@ -210,6 +210,21 @@ export class SharingManager {
   }
 
   /** Remember an agent created here as a guest version (ClawChats → Sharing). */
+  /**
+   * The signal server refused a grant (it never activated the share). The owner is told, and a grant that was only
+   * pending is dropped, so both sides agree the share isn't there. A grant for a share that was already active
+   * (an edit the server turned down) stays: the share still works as it did.
+   */
+  onGrantRejected(shareId) {
+    const live = this._shares.find(x => x.id === shareId && x.as === 'owner');
+    if (live?.status !== 'active') this._db().prepare('DELETE FROM peer_grants WHERE share_id = ?').run(shareId);
+    this.broadcast?.(JSON.stringify({
+      type: 'clawchats', event: 'sharing-error', shareId,
+      message: live?.status === 'active' ? "The server didn't accept that change. Your sharing is as it was; try again." : "The server didn't accept it. Try again.",
+    }));
+    this._changed();
+  }
+
   /** Ids of the guest agents this connector made (the gateway may show them under another name). */
   guestAgentIds() {
     return new Set(this._db().prepare('SELECT agent_id FROM peer_guest_agents').all().map(r => r.agent_id));
@@ -250,8 +265,11 @@ export class SharingManager {
     if (prev && JSON.parse(prev.grant_json).requesterPubKey !== s.requester.pubKey) {
       throw new Error("The requester's gateway key changed since you approved them. Stop sharing and ask them to request again.");
     }
+    // The signal server only activates a grant signed for this gateway's own id; without one it would say no, silently.
+    const ownerGatewayId = this.gatewayId();
+    if (!ownerGatewayId) throw new Error("This gateway isn't connected to the signal server yet. Try again in a moment.");
     const grant = {
-      v: 1, shareId, ownerGatewayId: this.gatewayId(), requesterGatewayId: s.requester.gatewayId, requesterPubKey: s.requester.pubKey,
+      v: 1, shareId, ownerGatewayId, requesterGatewayId: s.requester.gatewayId, requesterPubKey: s.requester.pubKey,
       requesterName: cleanName(s.requester.name || s.requester.email, 60) || null,
       agents: list, access, dailyCap: Math.max(1, Math.min(1000, Math.floor(Number(dailyCap) || DEFAULT_DAILY_CAP))), issuedAt: Date.now(),
     };

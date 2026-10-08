@@ -51,12 +51,17 @@ export class SignalingClient extends EventEmitter {
   private readonly serverUrl: string;
   private readonly userId: string;
   private readonly apiKey: string;
-  private readonly gatewayId?: string;
+  private gatewayId?: string;
   private readonly hostname?: string;
   /** This connector's Ed25519 public key for gateway sharing (base64 SPKI). */
   private readonly peerPubKey?: string;
 
   private ws: WebSocket | null = null;
+
+  /** The gateway id this connection logged in as (its config's, else the one the server assigned). */
+  get currentGatewayId(): string {
+    return this.gatewayId ?? '';
+  }
 
   /** True only after gateway-auth-ok has been received. */
   private _connected = false;
@@ -244,6 +249,13 @@ export class SignalingClient extends EventEmitter {
 
     switch (type) {
       case 'gateway-auth-ok': {
+        // A gateway that logs in the legacy way (userId only) is told which gateway row it is; keep it for this
+        // session and tell the host so it can save it (index.ts), or sharing would sign grants for owner "".
+        const assigned = msg['gatewayId'];
+        if (typeof assigned === 'string' && assigned) {
+          this.gatewayId ||= assigned;
+          this.emit('gateway-id', assigned);
+        }
         this._connected = true;
         this.reconnectAttempts = 0;
         this._resetPingWatchdog();
