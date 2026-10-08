@@ -291,6 +291,8 @@ export class TeamCoordinator {
         return { agentId: m.agentId, workKey: null, remote: true, name: known?.name || null, ownerName: known?.ownerName || null, available: !!a };
       }),
       running: live ? [...live.running.keys()] : [],
+      // Remote agents whose run waits for their owner to approve something: { agentId: { owner, what, expiresAtMs } }.
+      waiting: live?.waiting ? Object.fromEntries(live.waiting) : {},
       queued: live?.queued || 0,
       people: r.people.map(p => ({ personId: p.personId, name: p.name })),
       // In a copy: the sessions this gateway's agents answer the host's room in. Their approvals and questions belong to the room.
@@ -695,15 +697,26 @@ export class TeamCoordinator {
     const delta = (text, done = false) => this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-remote-delta', roomKey, agentId, runId, text, ...(done ? { done: true } : {}) }));
     live.running.set(agentId, { remote: true, runId });
     this._status(roomKey);
+    // Its owner's gateway says when the run waits for their approval: the room shows it, and who it's waiting for.
+    const owner = this._remoteAgents().find(a => a.agentId === agentId)?.ownerName || this._remoteName(agentId)?.ownerName || null;
+    const waiting = w => {
+      live.waiting ??= new Map();
+      if (w) live.waiting.set(agentId, w); else live.waiting.delete(agentId);
+      this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-remote-status', roomKey, agentId, runId, waiting: w || null }));
+    };
     let result, partial = '';
     try {
       this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
       result = await this.remote.turn(agentId, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier) },
-        { onDelta: text => { partial = text; delta(text); } });
+        {
+          onDelta: text => { partial = text; delta(text); },
+          onStatus: s => waiting(s?.waiting === 'approval' ? { owner, what: String(s.what || 'something').slice(0, 80), expiresAtMs: Number(s.expiresAtMs) || null } : null),
+        });
     } catch (e) {
       throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
     } finally {
       live.running.delete(agentId);
+      if (live.waiting?.has(agentId)) waiting(null);
       delta('', true);
       this._status(roomKey);
     }
