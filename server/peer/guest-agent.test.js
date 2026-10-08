@@ -93,3 +93,12 @@ test('findGuestAgent: the guest made as "main (guest)" is still found after the 
   // An agent that merely has the id shape isn't taken for a guest.
   assert.equal(findGuestAgent([{ id: 'x', name: 'x' }, { id: 'x-guest', name: 'something else' }], 'x'), null);
 });
+
+test('a guest the gateway shows under the original\'s name is still found (and hidden) when this connector made it', async () => {
+  const { findGuestAgent, isGuestAgent } = await import('./guest-agent.js');
+  const agents = [{ id: 'capy', identity: { name: 'Capy' } }, { id: 'capy-guest', identity: { name: 'Capy' } }, { id: 'capy-guest-2', identity: { name: 'Capy' } }];
+  assert.equal(findGuestAgent(agents, 'capy'), null, 'without the connector\'s record it can\'t tell');
+  assert.equal(findGuestAgent(agents, 'capy', new Set(['capy-guest']))?.id, 'capy-guest');
+  assert.equal(findGuestAgent([agents[0], agents[2]], 'capy', new Set(['capy-guest-2']))?.id, 'capy-guest-2');
+  assert.ok(isGuestAgent(agents[1], new Set(['capy-guest'])) && !isGuestAgent(agents[0], new Set(['capy-guest'])));
+});

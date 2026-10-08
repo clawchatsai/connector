@@ -67,7 +67,7 @@ export async function ensureGuestRestrictions(request, agentId) {
 }
 
 /** A new agent is only usable once the gateway's config reload picked it up. */
-async function waitForAgent(request, agentId, { tries = 40, ms = 250 } = {}) {
+async function waitForAgent(request, agentId, { tries = 120, ms = 250 } = {}) {
   for (let i = 0; i < tries; i++) {
     if (((await request('agents.list', {}))?.agents || []).some(a => a.id === agentId)) return true;
     await wait(ms);
@@ -75,29 +75,37 @@ async function waitForAgent(request, agentId, { tries = 40, ms = 250 } = {}) {
   return false;
 }
 
-/** The guest version of `agentId` if it already exists (by name). */
-export function findGuestAgent(agents, agentId) {
+/** Whether an agent is a guest version: called "<name> (guest)", or one this connector made (`known`: their ids). */
+export function isGuestAgent(a, known = new Set()) {
+  return /\(guest\)$/.test(agentName(a)) || known.has(a?.id);
+}
+
+/**
+ * The guest version of `agentId` if it already exists. By name ("Jarvis (guest)"), or by the id it was made with
+ * ("main-guest"): renaming the original ("main" -> "homiabot") changes the name it looks for, not the guest that
+ * already exists. A guest the gateway shows under another name is still found when this connector made it (`known`).
+ */
+export function findGuestAgent(agents, agentId, known = new Set()) {
   const src = agents.find(a => a.id === agentId);
   if (!src) return null;
-  // By name ("Jarvis (guest)"), or by the id it was made with ("main-guest"): renaming the original
-  // ("main" -> "homiabot") changes the name it looks for, not the guest that already exists.
   return agents.find(a => agentName(a) === guestName(agentName(src)))
-    || agents.find(a => a.id === `${agentId}-guest` && /\(guest\)$/.test(agentName(a))) || null;
+    || agents.find(a => a.id === `${agentId}-guest` && isGuestAgent(a, known))
+    || agents.find(a => a.id.startsWith(`${agentId}-guest-`) && known.has(a.id)) || null;
 }
 
 /**
  * Create (or reuse) the guest version of an agent. Returns { agentId, name, created }.
  * @param {(m: string, p: object, t?: number) => Promise<any>} request  gateway RPC (operator.admin)
  */
-export async function createGuestAgent(request, agentId) {
+export async function createGuestAgent(request, agentId, { known = new Set() } = {}) {
   const agents = (await request('agents.list', {}))?.agents || [];
   const src = agents.find(a => a.id === agentId);
   if (!src) throw new Error(`unknown agent: ${agentId}`);
-  if (/\(guest\)$/.test(agentName(src))) {
+  if (isGuestAgent(src, known)) {
     await ensureGuestRestrictions(request, src.id); // repairs a guest agent left without them
     return { agentId: src.id, name: agentName(src), created: false };
   }
-  const existing = findGuestAgent(agents, agentId);
+  const existing = findGuestAgent(agents, agentId, known);
   if (existing) {
     // Repair a guest half-made by an earlier run: restore its restrictions, then the personality a
     // crash between create and copy would have skipped (only missing files; never clobber edits).

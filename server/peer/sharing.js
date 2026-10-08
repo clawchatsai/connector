@@ -16,7 +16,7 @@
 import crypto from 'node:crypto';
 import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
-import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent } from './guest-agent.js';
+import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent, isGuestAgent } from './guest-agent.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 const DEFAULT_DAILY_CAP = 50;
@@ -210,6 +210,11 @@ export class SharingManager {
   }
 
   /** Remember an agent created here as a guest version (ClawChats → Sharing). */
+  /** Ids of the guest agents this connector made (the gateway may show them under another name). */
+  guestAgentIds() {
+    return new Set(this._db().prepare('SELECT agent_id FROM peer_guest_agents').all().map(r => r.agent_id));
+  }
+
   markGuestAgent(agentId) {
     this._db().prepare('INSERT OR IGNORE INTO peer_guest_agents (agent_id, created_at) VALUES (?, ?)').run(agentId, Date.now());
   }
@@ -669,8 +674,9 @@ export class SharingManager {
     const shown = id => {
       const a = agents.find(x => x.id === id);
       if (!a) return null;
-      if (!/\(guest\)$/.test(label(a))) return label(a);
-      const src = agents.find(o => o.id !== id && findGuestAgent(agents, o.id)?.id === id);
+      const known = this.guestAgentIds();
+      if (!isGuestAgent(a, known)) return label(a);
+      const src = agents.find(o => o.id !== id && findGuestAgent(agents, o.id, known)?.id === id);
       return src ? label(src) : null;
     };
     const reissued = [];
@@ -759,7 +765,7 @@ export class SharingManager {
     const g = this._grantToOwnerOf(remoteAgentId);
     if (!g) return null;
     const agents = (await this.request('agents.list', {}))?.agents || [];
-    const guestId = findGuestAgent(agents, localAgentId)?.id;
+    const guestId = findGuestAgent(agents, localAgentId, this.guestAgentIds())?.id;
     const shared = g.grant.agents.find(a => a.id === guestId) || g.grant.agents.find(a => a.id === localAgentId);
     if (!shared) return null;
     return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true, byPerson: String(remoteAgentId).startsWith('person:') },
