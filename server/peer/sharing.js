@@ -504,7 +504,7 @@ export class SharingManager {
     const done = new Promise(resolve => {
       const timer = setTimeout(() => { this._runs.delete(runId); resolve({ state: 'error', errorMessage: 'timed out' }); }, TURN_TIMEOUT_MS + 30_000);
       timer.unref?.();
-      this._runs.set(runId, { resolve, timer, text: '', emit });
+      this._runs.set(runId, { resolve, timer, text: '', emit, sessionKey });
     });
     this._turns.set(turnKey, { sessionKey, runId });
     try {
@@ -521,6 +521,7 @@ export class SharingManager {
     } finally {
       const run = this._runs.get(runId);
       if (run) { clearTimeout(run.timer); this._runs.delete(runId); }
+      for (const [id, r] of this._approvalRuns || []) if (r === runId) this._approvalRuns.delete(id);
     }
   }
 
@@ -557,6 +558,7 @@ export class SharingManager {
     }
     db.prepare('INSERT OR REPLACE INTO peer_sessions (share_id, room_id, agent_id, session_key) VALUES (?, ?, ?, ?)').run(shareId, roomId, agentId, key);
     this._guestKeys = null;
+    this._changed(); // the room's list of answering sessions grew: the app needs it before the agent asks for an approval
     return key;
   }
 
@@ -568,6 +570,37 @@ export class SharingManager {
       if (msgs[i].role === 'assistant') { const t = messageText(msgs[i]); if (t.trim()) return t; }
     }
     return '';
+  }
+
+  /**
+   * Approval events (owner side, from the approval connection): while a guest run waits for this gateway's owner to
+   * approve something, the room's host is told, so its room says what it's waiting for instead of only "responding".
+   * Only the kind of thing is sent ("a command", or the action's title), never the command itself or its paths.
+   */
+  onApprovalEvent(msg) {
+    const ev = msg?.event || '';
+    const m = /^(exec|plugin|openclaw)\.approval\.(requested|resolved)$/.exec(ev);
+    if (!m) return;
+    const p = msg.payload || {};
+    this._approvalRuns ??= new Map(); // approval id -> run id
+    if (m[2] === 'requested') {
+      const sessionKey = p.request?.sessionKey;
+      const entry = sessionKey && [...this._runs.entries()].find(([, r]) => r.sessionKey === sessionKey);
+      if (!entry || !p.id) return;
+      const [runId, run] = entry;
+      this._approvalRuns.set(p.id, runId);
+      const what = m[1] === 'exec' ? 'a command' : String(p.request?.title || 'an action').replace(/[\n\r]/g, ' ').slice(0, 80);
+      run.waiting = { what, expiresAtMs: Number(p.expiresAtMs) || null };
+      run.emit?.('status', { waiting: 'approval', what, expiresAtMs: run.waiting.expiresAtMs });
+      return;
+    }
+    const runId = p.id && this._approvalRuns.get(p.id);
+    if (!runId) return;
+    this._approvalRuns.delete(p.id);
+    const run = this._runs.get(runId);
+    if (!run || [...this._approvalRuns.values()].includes(runId)) return; // another approval of this run is still open
+    run.waiting = null;
+    run.emit?.('status', { waiting: null });
   }
 
   /** Every gateway event (owner side): finish guest runs, stream their text. */
@@ -646,12 +679,15 @@ export class SharingManager {
   }
 
   /** Run a turn on a shared agent. Returns { state, text }; throws with `.partial` on failure. */
-  async turn(agentId, { turnId, roomId, roomTitle, message }, { onDelta } = {}) {
+  async turn(agentId, { turnId, roomId, roomTitle, message }, { onDelta, onStatus } = {}) {
     const id = SharingManager.parseRemoteId(agentId);
     if (!id) throw new Error('not a shared agent');
     const link = await this._link(id.shareId);
     return link.request('turn', { turnId, agentId: id.remoteId, roomId, roomTitle, message }, {
-      onEvent: (event, data) => { if (event === 'delta' && typeof data === 'string') onDelta?.(data); },
+      onEvent: (event, data) => {
+        if (event === 'delta' && typeof data === 'string') onDelta?.(data);
+        else if (event === 'status' && data && typeof data === 'object') onStatus?.(data);
+      },
       timeoutMs: TURN_TIMEOUT_MS + 60_000,
     });
   }

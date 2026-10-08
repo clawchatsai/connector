@@ -172,6 +172,41 @@ test("the sessions answering a host's room are listed per host and room, so thei
   assert.deepEqual(s.owner.guestSessionKeysFor('gwOther', 'room1'), [], 'another host with the same room id is not this room');
 });
 
+test('a guest session being made tells the app, so the room knows it before the agent asks for anything', async () => {
+  const s = setup();
+  const frames = [];
+  s.owner.broadcast = f => frames.push(JSON.parse(f).event);
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted', dailyCap: 10 });
+  s.activate();
+  frames.length = 0;
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi' });
+  const created = s.ownerCalls.findIndex(c => c.method === 'sessions.create');
+  assert.ok(created >= 0);
+  assert.ok(frames.filter(e => e === 'sharing-changed').length >= 2, 'once for the usage count, once when the session exists');
+  assert.ok(s.owner.guestSessionKeysFor('gwH', 'room1').length === 1);
+});
+
+test("while a guest run waits for its owner's approval, the requester is told (without the command); decided -> cleared", async () => {
+  let hold;
+  const s = setup({ reply: () => null }); // the run stays open (nothing final yet)
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted', dailyCap: 10 });
+  s.activate();
+  const statuses = [];
+  const turn = s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'run: rm -rf /secret/path' }, { onStatus: st => statuses.push(st) });
+  for (let i = 0; i < 50 && !s.ownerCalls.some(c => c.method === 'chat.send'); i++) await new Promise(r => setTimeout(r, 10));
+  const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
+  s.owner.onApprovalEvent({ event: 'exec.approval.requested', payload: { id: 'ap1', request: { sessionKey: send.sessionKey, command: 'rm -rf /secret/path' }, expiresAtMs: 123 } });
+  s.owner.onApprovalEvent({ event: 'exec.approval.requested', payload: { id: 'ap-other', request: { sessionKey: 'agent:x:dashboard:unrelated', command: 'ls' }, expiresAtMs: 1 } });
+  await new Promise(r => setTimeout(r, 30));
+  assert.deepEqual(statuses, [{ waiting: 'approval', what: 'a command', expiresAtMs: 123 }], "only this run's approval, and not its command");
+  assert.ok(!JSON.stringify(statuses).includes('secret'));
+  s.owner.onApprovalEvent({ event: 'exec.approval.resolved', payload: { id: 'ap1' } });
+  await new Promise(r => setTimeout(r, 30));
+  assert.deepEqual(statuses.at(-1), { waiting: null });
+  s.owner.onGatewayEvent({ event: 'chat', payload: { runId: send.idempotencyKey, state: 'final', message: { content: [{ type: 'text', text: 'done' }] } } });
+  assert.equal((await turn).text, 'done');
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);

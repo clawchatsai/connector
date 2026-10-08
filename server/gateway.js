@@ -31,7 +31,11 @@ export class GatewayClient {
       gatewayWsUrl,
       debugLogger,
       connectParams: nonce => this._connectParams(nonce, ['approvals']),
-      onEvent: data => this.broadcastToBrowsers(data),
+      onEvent: data => {
+        this.broadcastToBrowsers(data);
+        // Sharing tells the room's host while a guest run waits on this gateway's owner (peer/sharing.js onApprovalEvent).
+        if (this.onApprovalEvent) { try { this.onApprovalEvent(JSON.parse(data)); } catch (e) { console.error('[gateway] approval observer:', e.message); } }
+      },
     });
   }
 

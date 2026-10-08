@@ -837,6 +837,33 @@ test("someone else's messages raise a badge on the room or its copy (chat.inject
   assert.ok(hostMid >= hostBefore);
 });
 
+test("a remote agent waiting for its owner's approval: the room says so (who, what) and clears it when the run ends", async () => {
+  let release, seen;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (agentId, args, { onStatus }) => {
+      onStatus({ waiting: 'approval', what: 'a command', expiresAtMs: 99 });
+      seen = h.team.room(roomKey).waiting;
+      await new Promise(r => (release = r));
+      onStatus({ waiting: null });
+      return { state: 'final', text: 'ran it' };
+    },
+    abort: async () => {},
+  };
+  const h = harness(() => 'ok', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  const sent = h.team.send(roomKey, { text: '@Jarvis-Kamil run the tests', userLabel: 'Houman' });
+  for (let i = 0; i < 100 && !release; i++) await new Promise(r => setTimeout(r, 10));
+  assert.deepEqual(seen, { 'peer:sh1:jarvis': { owner: 'Kamil', what: 'a command', expiresAtMs: 99 } });
+  const ev = h.events.filter(e => e.event === 'team-remote-status');
+  assert.deepEqual(ev.at(-1).waiting, { owner: 'Kamil', what: 'a command', expiresAtMs: 99 });
+  release();
+  await sent; await h.settle();
+  assert.deepEqual(h.team.room(roomKey).waiting, {}, 'cleared when the run ends');
+  assert.equal(h.events.filter(e => e.event === 'team-remote-status').at(-1).waiting, null);
+  assert.ok(h.room(roomKey).some(t => t.endsWith('ran it')));
+});
+
 test('the timeline says who joined and left, the same on both sides; agents never see those lines', async () => {
   const { H, K, settle } = twoGateways();
   const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });

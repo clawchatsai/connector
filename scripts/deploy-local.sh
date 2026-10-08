@@ -52,5 +52,9 @@ DIRTY=clean
 printf '%s\n%s\n%s\n%s\n' "$BRANCH" "$SHA" "$(date -Is) from $(pwd)" "$DIRTY" > "$MARKER"
 
 echo "✅ Deployed branch $BRANCH ($(git rev-parse --short HEAD)) to $D"
-echo "Next: reload the plugin while no ClawChats turn is in flight. From inside a chat turn:"
-echo "  systemd-run --user --collect $(command -v openclaw || echo openclaw) plugins reload connector --wait"
+read -r RUNS APPROVALS QUESTIONS <<< "$(scripts/reload-when-idle.sh --status)"
+if [ "$APPROVALS" != 0 ] || [ "$QUESTIONS" != 0 ]; then
+  echo "⚠️  Don't reload by hand now: $APPROVALS approval(s) and $QUESTIONS question(s) are waiting, and a reload strands them." >&2
+fi
+echo "Next: reload once the gateway is idle (no run in flight, nothing waiting for approval). From inside a chat turn:"
+echo "  systemd-run --user --collect $(pwd)/scripts/reload-when-idle.sh"
