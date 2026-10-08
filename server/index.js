@@ -255,7 +255,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/sharing') {
         // Enabled once the signal server has sharing on for this account (it then sends share lists).
         if (!sharing?.serverEnabled) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
-        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null });
+        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null, guestAgentIds: [...sharing.guestAgentIds()] });
       }
       // The project a person's chats go to (peer/sharing.js funnel). Keyed by email.
       if (method === 'GET' && urlPath === '/api/sharing/funnel') return send(res, 200, { funnel: sharing?.funnels() || {} });
@@ -278,7 +278,7 @@ export function createApp(config = {}) {
         // Owner asks for a guest version of one of its agents (peer/guest-agent.js); changes this gateway's config.
         const { agentId } = await parseBody(req);
         if (typeof agentId !== 'string' || !agentId) return sendError(res, 400, 'agentId is required');
-        try { const r = await createGuestAgent(gwRequest, agentId); sharing.markGuestAgent(r.agentId); return send(res, 200, r); }
+        try { const r = await createGuestAgent(gwRequest, agentId, { known: sharing.guestAgentIds() }); sharing.markGuestAgent(r.agentId); return send(res, 200, r); }
         catch (e) { return sendError(res, 400, e.message); }
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/verify-key'))) {
