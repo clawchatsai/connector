@@ -394,6 +394,15 @@ export class SharingManager {
   }
 
   /** The room (and who asked) behind a guest session of this gateway, or null. */
+  /** Sessions here answering `roomId` of the room hosted by `hostGatewayId` (hidden from the list while a copy exists). */
+  guestSessionKeysFor(hostGatewayId, roomId) {
+    const keys = [];
+    for (const r of this._db().prepare('SELECT p.session_key, g.grant_json FROM peer_sessions p JOIN peer_grants g ON g.share_id = p.share_id WHERE p.room_id = ?').all(roomId)) {
+      try { if (JSON.parse(r.grant_json).requesterGatewayId === hostGatewayId) keys.push(r.session_key); } catch { /* unreadable grant */ }
+    }
+    return keys;
+  }
+
   guestSessionOf(key) {
     if (!this._guestKeys) {
       this._guestKeys = new Map();

@@ -160,6 +160,18 @@ test('a gateway with no id can\'t sign a grant (the server would refuse it silen
   assert.ok(frames.at(-2).message.includes('as it was'));
 });
 
+test("the sessions answering a host's room are listed per host and room, so their approvals can show in the room", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted', dailyCap: 10 });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi' });
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room2', roomTitle: 'Lakes', message: 'hi' });
+  const key = s.ownerCalls.find(c => c.method === 'sessions.create').params.key;
+  assert.deepEqual(s.owner.guestSessionKeysFor('gwH', 'room1'), [key]);
+  assert.deepEqual(s.owner.guestSessionKeysFor('gwH', 'room3'), []);
+  assert.deepEqual(s.owner.guestSessionKeysFor('gwOther', 'room1'), [], 'another host with the same room id is not this room');
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);
