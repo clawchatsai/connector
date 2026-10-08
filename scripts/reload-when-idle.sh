@@ -6,12 +6,13 @@ OC="$(command -v openclaw || echo "$HOME/.npm-global/bin/openclaw")"
 
 # Prints "<active runs> <pending approvals> <pending questions>"; 99 when the gateway can't be asked.
 busy() {
-  local runs ex pl qs
+  local runs ap qs
   runs=$("$OC" gateway call sessions.list --params '{"limit":200}' --json 2>/dev/null | node -e 'try{const j=JSON.parse(require("fs").readFileSync(0));console.log((j.sessions||[]).filter(s=>s.hasActiveRun).length)}catch{console.log(99)}')
-  ex=$("$OC" gateway call exec.approval.list --params '{}' --json 2>/dev/null | node -e 'try{const j=JSON.parse(require("fs").readFileSync(0));console.log((Array.isArray(j)?j:j.approvals||[]).length)}catch{console.log(99)}')
-  pl=$("$OC" gateway call plugin.approval.list --params '{}' --json 2>/dev/null | node -e 'try{const j=JSON.parse(require("fs").readFileSync(0));console.log((Array.isArray(j)?j:j.approvals||[]).length)}catch{console.log(99)}')
+  # `approvals pending` lists every pending exec/plugin/system-agent approval; `gateway call exec.approval.list`
+  # only shows the ones this CLI device may review (often none).
+  ap=$("$OC" approvals pending --json 2>/dev/null | node -e 'try{const j=JSON.parse(require("fs").readFileSync(0));console.log((j.approvals||[]).length)}catch{console.log(99)}')
   qs=$("$OC" gateway call question.list --params '{}' --json 2>/dev/null | node -e 'try{const j=JSON.parse(require("fs").readFileSync(0));console.log((j.questions||[]).length)}catch{console.log(99)}')
-  echo "$runs $((ex + pl)) $qs"
+  echo "${runs:-99} ${ap:-99} ${qs:-99}"   # empty = couldn't ask = not idle
 }
 
 if [ "$1" = "--status" ]; then busy; exit 0; fi
