@@ -293,6 +293,8 @@ export class TeamCoordinator {
       running: live ? [...live.running.keys()] : [],
       queued: live?.queued || 0,
       people: r.people.map(p => ({ personId: p.personId, name: p.name })),
+      // In a copy: the sessions this gateway's agents answer the host's room in. Their approvals and questions belong to the room.
+      ...(r.host ? { answeringKeys: this.remote?.guestSessionKeysFor?.(r.host.gatewayId, r.host.roomId) || [] } : {}),
       ...(r.host ? this._replicaPublic(r) : {}),
     };
   }
