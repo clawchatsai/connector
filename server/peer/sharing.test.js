@@ -172,6 +172,20 @@ test("the sessions answering a host's room are listed per host and room, so thei
   assert.deepEqual(s.owner.guestSessionKeysFor('gwOther', 'room1'), [], 'another host with the same room id is not this room');
 });
 
+test('a guest session being made tells the app, so the room knows it before the agent asks for anything', async () => {
+  const s = setup();
+  const frames = [];
+  s.owner.broadcast = f => frames.push(JSON.parse(f).event);
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted', dailyCap: 10 });
+  s.activate();
+  frames.length = 0;
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi' });
+  const created = s.ownerCalls.findIndex(c => c.method === 'sessions.create');
+  assert.ok(created >= 0);
+  assert.ok(frames.filter(e => e === 'sharing-changed').length >= 2, 'once for the usage count, once when the session exists');
+  assert.ok(s.owner.guestSessionKeysFor('gwH', 'room1').length === 1);
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);

@@ -557,6 +557,7 @@ export class SharingManager {
     }
     db.prepare('INSERT OR REPLACE INTO peer_sessions (share_id, room_id, agent_id, session_key) VALUES (?, ?, ?, ?)').run(shareId, roomId, agentId, key);
     this._guestKeys = null;
+    this._changed(); // the room's list of answering sessions grew: the app needs it before the agent asks for an approval
     return key;
   }
 
