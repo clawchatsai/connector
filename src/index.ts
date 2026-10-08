@@ -71,6 +71,7 @@ interface AppInstance {
   sharing: {
     setShares: (shares: unknown[]) => void;
     onShareRevoked: (shareId: string) => void;
+    onGrantRejected: (shareId: string) => void;
     servePeer: (o: { dc: DataChannelLike; dtls: { local: string; remote: string }; shareId: string; requesterGatewayId: string }) => unknown;
     acceptsPeer: (shareId: string, requesterGatewayId: string) => boolean;
   } | null;
@@ -401,7 +402,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     // Gateway sharing: the server side signs grants and runs guest turns; the host provides the
     // signal server link and the WebRTC transport.
     peer: {
-      gatewayId: () => loadConfig()?.gatewayId || '',
+      gatewayId: () => loadConfig()?.gatewayId || signaling?.currentGatewayId || '', // legacy installs have none saved: the session's
       signal: (msg: Record<string, unknown>) => signaling?.send(msg),
       openPeer: (shareId: string) => openPeerLink(shareId),
     },
@@ -448,7 +449,20 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     app?.sharing?.onShareRevoked(shareId);
     if (connectionId) webrtcPeer?.closePeer(connectionId);
   });
-  signaling.on('share-grant-rejected', (shareId: string) => ctx.logger.warn(`[sharing] signal server rejected the grant for ${shareId}`));
+  signaling.on('share-grant-rejected', (shareId: string) => {
+    ctx.logger.warn(`[sharing] signal server rejected the grant for ${shareId}`);
+    app?.sharing?.onGrantRejected(shareId); // the owner sees it instead of "Saved"
+  });
+  // Installed before the setup flow saved the gateway id: log in by userId, then keep the id the server answers with,
+  // so the next login uses it and grants carry it. Nothing for the user to do.
+  signaling.on('gateway-id', (id: string) => {
+    const cfg = loadConfig();
+    if (cfg && !cfg.gatewayId) {
+      cfg.gatewayId = id;
+      saveConfig(cfg);
+      ctx.logger.info(`[clawchats] saved gateway id ${id} (this install had none; it logged in by user id)`);
+    }
+  });
 
   signaling.on('connected', () => {
     ctx.logger.info('Connected to signaling server');

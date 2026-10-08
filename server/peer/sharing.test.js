@@ -135,6 +135,31 @@ test("funnel: a person's chats go to the project chosen for them; renames follow
   assert.deepEqual(s.owner.funnels(), { 'h@x.dev': 'Team' });
 });
 
+test('a gateway with no id can\'t sign a grant (the server would refuse it silently); a refused grant is dropped and the owner told', async () => {
+  const s = setup();
+  const frames = [];
+  const gid = s.owner.gatewayId;
+  s.owner.broadcast = f => frames.push(JSON.parse(f));
+  s.owner.gatewayId = () => ''; // a legacy install: logged in by user id, no id saved
+  assert.throws(() => s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] }), /isn't connected to the signal server yet/);
+  assert.equal(s.ownerSignals.filter(m => m.type === 'share-grant').length, 0, 'nothing was sent');
+
+  s.owner.gatewayId = gid;
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  assert.equal(s.ownerSignals.filter(m => m.type === 'share-grant').at(-1).grant.ownerGatewayId, 'gwK');
+  // The server says no while the share is still pending: the local grant goes, and the browser is told.
+  s.owner.onGrantRejected('sh1');
+  assert.equal(s.owner._db().prepare('SELECT COUNT(*) n FROM peer_grants WHERE share_id = ?').get('sh1').n, 0);
+  assert.ok(frames.some(f => f.event === 'sharing-error' && f.shareId === 'sh1' && /Try again/.test(f.message)));
+
+  // An edit of a share that was already active: refused, but the share keeps working as it did.
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  s.activate();
+  s.owner.onGrantRejected('sh1');
+  assert.equal(s.owner._db().prepare('SELECT COUNT(*) n FROM peer_grants WHERE share_id = ?').get('sh1').n, 1);
+  assert.ok(frames.at(-2).message.includes('as it was'));
+});
+
 test('approve → verified on the requester → turn runs in a guest session on the owner, text streams back', async () => {
   const s = setup();
   assert.deepEqual(s.req.remoteAgents(), []);
