@@ -110,8 +110,21 @@ class BrowserClientMap<V> extends Map<string, V> {
 }
 const connectedClients = new BrowserClientMap<{ send: (data: string) => void }>();
 
-/** The local gateway's WebSocket URL (the app's gateway client and Desktop tunnels). */
-const GATEWAY_WS_URL = process.env.GATEWAY_WS_URL || 'ws://localhost:18789';
+const DEFAULT_GATEWAY_PORT = 18789;
+
+/**
+ * The local gateway's WebSocket URL (the app's gateway client and Desktop tunnels):
+ * GATEWAY_WS_URL, else the port in the gateway config (a gateway on a custom port),
+ * else the default port.
+ */
+function resolveGatewayWsUrl(gatewayConfig?: Record<string, unknown>): string {
+  if (process.env.GATEWAY_WS_URL) return process.env.GATEWAY_WS_URL;
+  const gw = gatewayConfig?.['gateway'] as Record<string, unknown> | undefined;
+  const port = Number(gw?.['port']) || DEFAULT_GATEWAY_PORT;
+  return `ws://127.0.0.1:${port}`;
+}
+/** Set when the service starts; the Desktop tunnels read it. */
+let GATEWAY_WS_URL = resolveGatewayWsUrl();
 /** Open Desktop tunnels per browser connection (server/desktop-tunnel.js); a viewer uses one or two. */
 const desktopTunnels = new Map<string, Set<{ close(): void }>>();
 const MAX_TUNNELS_PER_CONNECTION = 8;
@@ -137,6 +150,17 @@ let signaling: SignalingClient | null = null;
 let webrtcPeer: WebRTCPeerManagerType | null = null;
 let healthServer: http.Server | null = null;
 let _stopRequested = false;
+
+/**
+ * Where the connector is in its lifecycle, for `openclaw clawchats status` and the journal.
+ * The gateway gives a service's start() a few seconds to settle, so start() only schedules the
+ * real work; this records how that work is going.
+ */
+type ServiceState = 'stopped' | 'waiting-setup' | 'starting' | 'running' | 'failed';
+let _serviceState: ServiceState = 'stopped';
+let _serviceError = '';
+/** The background startup, so stop() can wait for it to unwind. */
+let _startupRun: Promise<void> | null = null;
 
 // Gateway sharing: links this gateway is opening to another gateway (it offers), by share.
 const PEER_OPEN_TIMEOUT_MS = 30_000;
@@ -232,7 +256,15 @@ interface OpenClawPluginDefinition {
 // Config helpers
 // ---------------------------------------------------------------------------
 
-const CONFIG_DIR = path.join(os.homedir(), '.openclaw', 'clawchats');
+/** The gateway's state directory: OPENCLAW_STATE_DIR (profiles, custom installs), else ~/.openclaw. */
+function stateRoot(): string {
+  return process.env.OPENCLAW_STATE_DIR || path.join(os.homedir(), '.openclaw');
+}
+/** The gateway's config file: OPENCLAW_CONFIG_PATH, else <state>/openclaw.json. */
+function gatewayConfigPath(): string {
+  return process.env.OPENCLAW_CONFIG_PATH || path.join(stateRoot(), 'openclaw.json');
+}
+const CONFIG_DIR = path.join(stateRoot(), 'clawchats');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const RUNTIME_FILE = path.join(CONFIG_DIR, 'runtime.json');
 
@@ -320,8 +352,10 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   const require = createRequire(import.meta.url);
   const ndcRoot = resolvePackageRoot(require, 'node-datachannel');
   if (!ndcRoot) {
-    ctx.logger.error('[clawchats] node-datachannel package not resolvable; WebRTC unavailable.');
-    return;
+    throw new Error(
+      `the WebRTC library (node-datachannel) is missing from this install. ` +
+      `Reinstall the plugin: openclaw plugins install @clawchatsai/connector --force`,
+    );
   }
   const targetPath = path.join(ndcRoot, 'build', 'Release', 'node_datachannel.node');
 
@@ -333,12 +367,11 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   const prebuiltPath = path.join(pluginDir, 'prebuilds', prebuildKey, 'node_datachannel.node');
 
   if (!fs.existsSync(prebuiltPath)) {
-    ctx.logger.error(
-      `[clawchats] No prebuilt binary for ${prebuildKey}. ` +
-      `WebRTC will be unavailable. To fix manually: ` +
-      `cd ~/.openclaw/extensions/connector && npm rebuild node-datachannel`,
+    throw new Error(
+      `no prebuilt WebRTC binary for ${prebuildKey} (Node ${process.version}). ` +
+      `Build it from source (needs cmake, make and a C++ compiler): ` +
+      `cd ${pluginDir} && npm rebuild node-datachannel`,
     );
-    return;
   }
 
   ctx.logger.info(`[clawchats] Installing node-datachannel prebuilt for ${prebuildKey}...`);
@@ -347,24 +380,78 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
     fs.copyFileSync(prebuiltPath, targetPath);
     ctx.logger.info('[clawchats] node-datachannel ready.');
   } catch (e) {
-    // Surface the manual remedy: the service import fails moments later with an
-    // opaque "Cannot find module '../../../build/Release/node_datachannel.node'",
-    // which says nothing about what to actually do.
-    ctx.logger.error(
-      `[clawchats] Failed to install prebuilt: ${(e as Error).message}\n` +
-      `  To fix manually:\n    mkdir -p ${path.dirname(targetPath)}\n` +
-      `    cp ${prebuiltPath} ${targetPath}`,
+    // Say what to do: the import fails moments later with an opaque
+    // "Cannot find module '../../../build/Release/node_datachannel.node'".
+    throw new Error(
+      `could not install the WebRTC binary (${(e as Error).message}). To fix manually: ` +
+      `mkdir -p ${path.dirname(targetPath)} && cp ${prebuiltPath} ${targetPath}`,
     );
   }
 }
 
+/**
+ * Service entry point. Returns at once: the gateway kills a service whose start() has not
+ * settled within ~5 s, and the real startup can take far longer (waiting for the user to run
+ * setup, loading the native WebRTC module on a slow box, the signaling handshake).
+ */
 async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<void> {
   _stopRequested = false;
+  _serviceError = '';
+  _startupRun = runClawChats(ctx, api).catch((e: unknown) => {
+    _serviceState = 'failed';
+    _serviceError = (e as Error)?.message || String(e);
+    ctx.logger.error(`ClawChats failed to start: ${_serviceError}`);
+  });
+}
 
+/**
+ * The local status endpoint `openclaw clawchats status` queries. Started first thing, so status
+ * can say "waiting for setup" or why startup failed, not just "offline".
+ */
+function startHealthEndpoint(ctx: PluginServiceContext): void {
+  if (healthServer) return;
+  healthServer = http.createServer((req, res) => {
+    if (req.url === '/status' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        version: PLUGIN_VERSION,
+        pid: process.pid,
+        uptime: process.uptime(),
+        state: _serviceState,
+        error: _serviceError || undefined,
+        gateway: { connected: app?.gatewayClient?.connected ?? false },
+        signaling: { connected: signaling?.isConnected ?? false },
+        clients: { active: connectedClients.size },
+      }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  healthServer.listen(0, '127.0.0.1', () => {
+    const addr = healthServer!.address() as net.AddressInfo;
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(RUNTIME_FILE, JSON.stringify({
+      pid: process.pid,
+      healthPort: addr.port,
+      startedAt: new Date().toISOString(),
+    }, null, 2), { mode: 0o600 });
+    ctx.logger.info(`Health endpoint on 127.0.0.1:${addr.port}`);
+  });
+}
+
+const SETUP_HINT =
+  'ClawChats is installed but not set up yet. Next step: open https://app.clawchats.ai, sign in, ' +
+  'and follow "Connect a gateway" — it gives you a command like `openclaw clawchats setup <token>` to run here.';
+
+async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<void> {
+  startHealthEndpoint(ctx);
   let config = loadConfig();
 
   if (!config) {
-    ctx.logger.info('ClawChats not configured. Waiting for setup...');
+    _serviceState = 'waiting-setup';
+    ctx.logger.info(SETUP_HINT);
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     while (!config && !_stopRequested) {
       await new Promise(r => setTimeout(r, 2000));
@@ -373,6 +460,8 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     if (_stopRequested || !config) return;
     ctx.logger.info('Setup detected — connecting to ClawChats...');
   }
+  _serviceState = 'starting';
+  GATEWAY_WS_URL = resolveGatewayWsUrl(api.config);
 
   // 1. Resolve gateway token: runtime API → config file → error
   const gwCfg = api.config as Record<string, unknown> | undefined;
@@ -380,12 +469,12 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
   const gatewayToken = (gwAuth?.['token'] as string | undefined) || config.gatewayToken || '';
 
   if (!gatewayToken) {
-    ctx.logger.error('No gateway token available. Re-run: openclaw clawchats setup <token>');
-    return;
+    throw new Error('no gateway token available (the gateway config has no gateway.auth.token). Re-run: openclaw clawchats setup <token>');
   }
 
   // 3. Ensure native modules are built (OpenClaw installs with --ignore-scripts)
   await ensureNativeModules(ctx);
+  if (_stopRequested) return;
 
   // 4. Import server.js and create app instance with plugin paths
   const dataDir = path.join(ctx.stateDir, 'clawchats', 'data');
@@ -409,7 +498,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     openaiApiKey:  (() => {
       // Resolve OpenAI API key: openclaw config → env var
       try {
-        const oc = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.openclaw', 'openclaw.json'), 'utf8'));
+        const oc = JSON.parse(fs.readFileSync(gatewayConfigPath(), 'utf8'));
         const fromConfig = oc?.skills?.entries?.['openai-whisper-api']?.apiKey;
         if (fromConfig) return fromConfig;
       } catch { /* ok */ }
@@ -481,6 +570,7 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
 
   // 6. Initialize WebRTC peer manager (lazy import — native module must be built first)
   const { WebRTCPeerManager } = await import('./webrtc-peer.js');
+  if (_stopRequested) { teardownRuntime(); return; }
   webrtcPeer = new WebRTCPeerManager();
 
   webrtcPeer.on('datachannel', (dc: DataChannelLike, connectionId: string) => {
@@ -576,44 +666,37 @@ async function startClawChats(ctx: PluginServiceContext, api: PluginApi): Promis
     signaling?.sendIceCandidate(data.connectionId, data.candidate);
   });
 
-  await signaling.connect();
+  // The first connection can fail (offline, firewall, server restart); the client keeps retrying with
+  // backoff on its own, so that is a state to report, not a failed start.
+  try {
+    await signaling.connect();
+  } catch (e) {
+    ctx.logger.warn(`Can't reach the ClawChats server yet (${(e as Error).message}); retrying in the background.`);
+  }
+  if (_stopRequested) { teardownRuntime(); return; }
 
-  // 7. Start health endpoint for CLI status queries
-  healthServer = http.createServer((req, res) => {
-    if (req.url === '/status' && req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        version: PLUGIN_VERSION,
-        pid: process.pid,
-        uptime: process.uptime(),
-        gateway: { connected: app?.gatewayClient?.connected ?? false },
-        signaling: { connected: signaling?.isConnected ?? false },
-        clients: { active: connectedClients.size },
-      }));
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-
-  healthServer.listen(0, '127.0.0.1', () => {
-    const addr = healthServer!.address() as net.AddressInfo;
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_FILE, JSON.stringify({
-      pid: process.pid,
-      healthPort: addr.port,
-      startedAt: new Date().toISOString(),
-    }, null, 2), { mode: 0o600 });
-    ctx.logger.info(`Health endpoint on 127.0.0.1:${addr.port}`);
-  });
-
+  if (_stopRequested) { teardownRuntime(); return; }
+  _serviceState = 'running';
   ctx.logger.info('ClawChats service started');
 }
 
 async function stopClawChats(ctx: PluginServiceContext): Promise<void> {
   _stopRequested = true;
+  _serviceState = 'stopped';
   ctx.logger.info('ClawChats service stopping...');
 
+  // Let a startup that is mid-flight notice the stop and unwind; never wait long for it.
+  if (_startupRun) {
+    await Promise.race([_startupRun, new Promise<void>(r => { setTimeout(r, 3000).unref?.(); })]);
+    _startupRun = null;
+  }
+  teardownRuntime();
+
+  ctx.logger.info('ClawChats service stopped');
+}
+
+/** Releases everything a started service holds. Safe to call more than once. */
+function teardownRuntime(): void {
   // 0. Tear down health endpoint
   if (healthServer) { healthServer.close(); healthServer = null; }
   try { fs.unlinkSync(RUNTIME_FILE); } catch { /* already gone */ }
@@ -638,8 +721,6 @@ async function stopClawChats(ctx: PluginServiceContext): Promise<void> {
   // 4. Close SQLite databases
   app?.shutdown();
   app = null;
-
-  ctx.logger.info('ClawChats service stopped');
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1113,8 @@ function broadcastToClients(msg: Record<string, unknown>): void {
 function formatStatus(): string {
   const lines: string[] = [];
   lines.push(`ClawChats Plugin v${PLUGIN_VERSION}`);
+  if (_serviceState === 'waiting-setup') { lines.push(SETUP_HINT); return lines.join('\n'); }
+  if (_serviceState === 'failed') { lines.push(`Failed to start: ${_serviceError || 'unknown error'}`); return lines.join('\n'); }
   lines.push(`Gateway: ${app?.gatewayClient?.connected ? 'connected' : 'disconnected'}`);
   lines.push(`Signaling: ${signaling?.isConnected ? 'connected' : 'disconnected'}`);
   lines.push(`Clients: ${connectedClients.size}`);
@@ -1068,7 +1151,7 @@ async function handleSetup(token: string, options: { skipTotp?: boolean } = {}):
   // Read gateway token from OpenClaw config
   let gatewayToken = '';
   try {
-    const openclawConfigPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
+    const openclawConfigPath = gatewayConfigPath();
     const openclawConfig = JSON.parse(fs.readFileSync(openclawConfigPath, 'utf8'));
     gatewayToken = openclawConfig.gateway?.auth?.token || openclawConfig.auth?.token || openclawConfig.token || '';
   } catch {
@@ -1438,7 +1521,7 @@ async function handleReauth(): Promise<void> {
 
 async function handleExportHistory(api: PluginApi, mode?: string): Promise<void> {
   if (mode !== undefined && mode !== 'check') {
-    console.error(`Unknown option "${mode}". Use: ocplatform clawchats export-history [check]`);
+    console.error(`Unknown option "${mode}". Use: openclaw clawchats export-history [check]`);
     process.exitCode = 1;
     return;
   }
@@ -1446,11 +1529,11 @@ async function handleExportHistory(api: PluginApi, mode?: string): Promise<void>
   const gw = gwCfg?.['gateway'] as Record<string, unknown> | undefined;
   const token = ((gw?.['auth'] as Record<string, unknown> | undefined)?.['token'] as string | undefined) || loadConfig()?.gatewayToken || '';
   if (!token) {
-    console.error('No gateway token found. Is ClawChats set up? (ocplatform clawchats setup <token>)');
+    console.error('No gateway token found. Is ClawChats set up? (openclaw clawchats setup <token>)');
     process.exitCode = 1;
     return;
   }
-  const port = (gw?.['port'] as number | undefined) || 18789;
+  const port = (gw?.['port'] as number | undefined) || DEFAULT_GATEWAY_PORT;
   // @ts-expect-error — server/ is plain JS with no .d.ts
   const serverModule: { exportHistory: (o: Record<string, unknown>) => Promise<{ exported: number }> } = await import('../server/history-export.js');
   try {
@@ -1482,11 +1565,15 @@ async function handleImportDates(): Promise<void> {
 async function handleStatus(): Promise<void> {
   // CLI runs in a separate process — module-level vars are null here.
   // Query the live service via the health endpoint instead.
+  const configured = loadConfig() !== null;
   let runtime: { pid: number; healthPort: number; startedAt: string };
   try {
     runtime = JSON.parse(fs.readFileSync(RUNTIME_FILE, 'utf8'));
   } catch {
-    console.log('ClawChats: offline (service not running)');
+    console.log('ClawChats: the service is not running.');
+    console.log(configured
+      ? '  The gateway starts it with the plugin. Check: openclaw plugins inspect connector — then openclaw plugins reload connector'
+      : `  ${SETUP_HINT}`);
     return;
   }
 
@@ -1494,7 +1581,7 @@ async function handleStatus(): Promise<void> {
   try {
     process.kill(runtime.pid, 0);
   } catch {
-    console.log('ClawChats: offline (stale runtime file)');
+    console.log('ClawChats: the service is not running (stale runtime file).');
     try { fs.unlinkSync(RUNTIME_FILE); } catch { /* ignore */ }
     return;
   }
@@ -1514,18 +1601,32 @@ async function handleStatus(): Promise<void> {
     const status = JSON.parse(body) as {
       version: string;
       uptime: number;
+      state?: ServiceState;
+      error?: string;
       gateway: { connected: boolean };
       signaling: { connected: boolean };
       clients: { active: number };
     };
 
     console.log(`ClawChats Plugin v${status.version}`);
+    if (status.state === 'waiting-setup') {
+      console.log('State: waiting for setup');
+      console.log(`  ${SETUP_HINT}`);
+      return;
+    }
+    if (status.state === 'failed') {
+      console.log('State: failed to start');
+      console.log(`  ${status.error || 'unknown error'}`);
+      console.log('  After fixing it: openclaw plugins reload connector');
+      return;
+    }
+    if (status.state === 'starting') console.log('State: starting');
     console.log(`Uptime: ${Math.floor(status.uptime)}s`);
     console.log(`Gateway: ${status.gateway.connected ? 'connected' : 'disconnected'}`);
     console.log(`Signaling: ${status.signaling.connected ? 'connected' : 'disconnected'}`);
     console.log(`Clients: ${status.clients.active}`);
   } catch {
-    console.log('ClawChats: offline (could not reach service)');
+    console.log('ClawChats: the service is running but did not answer (could not reach it).');
   }
 }
 

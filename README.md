@@ -31,12 +31,39 @@ The signaling server only facilitates the handshake. After step 4, it is out of 
 
 ## Installation
 
+Requires OpenClaw 2026.9.7 or newer on the machine that runs your gateway.
+
 ```bash
 openclaw plugins install @clawchatsai/connector
-openclaw gateway restart
 ```
 
-Then open [app.clawchats.ai](https://app.clawchats.ai) and follow the setup flow.
+The gateway loads the plugin right away; no restart is needed. OpenClaw warns that the package is
+outside ClawHub review — answer `y` to continue (pass `--force` in scripts).
+
+Install while your gateway is running. If it is not, OpenClaw installs locally instead and asks you to
+re-run the same command with `--accept-capabilities` after reviewing what the plugin declares.
+
+Then connect it to your ClawChats account:
+
+1. Open [app.clawchats.ai](https://app.clawchats.ai), sign in, and choose **Connect a gateway**.
+2. Run the `openclaw clawchats setup <token>` command it shows, on the gateway machine.
+3. Check the result: `openclaw clawchats status` — Gateway and Signaling should say `connected`.
+
+Until step 2 is done the plugin idles and `openclaw clawchats status` says it is waiting for setup.
+
+### Supported platforms
+
+A WebRTC binary is bundled for Linux (x64, arm64, arm; glibc and musl), macOS (Intel and Apple
+silicon) and Windows (x64, arm64). Nothing is compiled during install.
+
+### Troubleshooting
+
+| Symptom | What to do |
+| --- | --- |
+| `openclaw clawchats status` says *waiting for setup* | Finish step 2 above. |
+| Status says *failed to start* | The message names the cause and the fix. After fixing, run `openclaw plugins reload connector`. |
+| Signaling shows `disconnected` | The gateway machine cannot reach the ClawChats server (offline, proxy or firewall). It keeps retrying; see `journalctl --user -u openclaw-gateway -g clawchats`. |
+| Gateway on a custom port, profile or state directory | Supported: the plugin follows the gateway's config, `OPENCLAW_STATE_DIR` and `OPENCLAW_CONFIG_PATH`. |
 
 ## Architecture
 
