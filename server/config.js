@@ -5,6 +5,18 @@ import { fileURLToPath } from 'node:url';
 
 export const HOME = os.homedir();
 
+/** The gateway's state directory: OPENCLAW_STATE_DIR (profiles, custom installs), else ~/.openclaw. */
+export const STATE_DIR = process.env.OPENCLAW_STATE_DIR || path.join(HOME, '.openclaw');
+
+/** Where the gateway's config file may be, most specific first. */
+export function gatewayConfigCandidates() {
+  return [
+    process.env.OPENCLAW_CONFIG_PATH,
+    path.join(STATE_DIR, 'openclaw.json'),
+    '/etc/openclaw/openclaw.json',
+  ].filter(Boolean);
+}
+
 // Resolve __dirname for ESM (esbuild inlines this correctly)
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,7 +42,7 @@ export const AUTH_TOKEN = parseConfigField('authToken') || '';
 // (that's the browser's external-facing URL and would cause a routing loop through Caddy)
 // Note: GATEWAY_WS_URL env var is read by the plugin host (src/index.ts) and passed via createApp().
 export function discoverGatewayWsUrl() {
-  for (const cfgPath of [path.join(HOME, '.openclaw', 'openclaw.json'), '/etc/openclaw/openclaw.json']) {
+  for (const cfgPath of gatewayConfigCandidates()) {
     try {
       const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
       const port = raw.gateway?.port || raw.port;
@@ -44,11 +56,11 @@ export const GATEWAY_WS_URL = discoverGatewayWsUrl();
 
 // Agent workspace dir (relative /api/file paths resolve against it): openclaw config → default.
 export function discoverWorkspaceDir() {
-  for (const cfgPath of [path.join(HOME, '.openclaw', 'openclaw.json'), '/etc/openclaw/openclaw.json']) {
+  for (const cfgPath of gatewayConfigCandidates()) {
     try {
       const ws = JSON.parse(fs.readFileSync(cfgPath, 'utf8')).agents?.defaults?.workspace;
       if (ws) return ws;
     } catch { /* try next */ }
   }
-  return path.join(HOME, '.openclaw', 'workspace');
+  return path.join(STATE_DIR, 'workspace');
 }

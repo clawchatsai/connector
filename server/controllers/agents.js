@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { send } from '../util/http.js';
+import { STATE_DIR } from '../config.js';
 
 /**
  * List available OpenClaw agents.
@@ -9,7 +9,7 @@ import { send } from '../util/http.js';
  */
 export function handleAgents(req, res) {
   try {
-    const agentsDir = path.join(os.homedir(), '.openclaw', 'agents');
+    const agentsDir = path.join(STATE_DIR, 'agents');
     const agents = fs.readdirSync(agentsDir, { withFileTypes: true })
       .filter(e => e.isDirectory())
       .map(e => e.name);
