@@ -66,4 +66,12 @@ test('bookmarks: add is idempotent per message, rename, delete, dropped with the
   assert.equal(extras.deleteBookmark('b4'), false);
   extras.deleteThreadExtras('agent:main:x');
   assert.deepEqual(extras.listBookmarks(), []);
+
+  // Sessions deleted while the connector wasn't listening: dropped against the live roster.
+  extras.addBookmark('b5', { sessionKey: 'agent:main:live', messageId: 'm1' });
+  extras.addBookmark('b6', { sessionKey: 'agent:main:gone', messageId: 'm1' });
+  extras.setThreadExtra('agent:main:gone2', 'intel', { a: 1 });
+  assert.equal(extras.pruneThreadExtras(new Set(['agent:main:live'])), 2);
+  assert.deepEqual(extras.listBookmarks().map(b => b.id), ['b5']);
+  assert.equal(extras.pruneThreadExtras(new Set(['agent:main:live'])), 0);
 });

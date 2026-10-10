@@ -102,7 +102,7 @@ export class GatewayClient {
       this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: this._connectParams(msg.payload?.nonce || '', ['tool-events']) }));
       return;
     }
-    if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); this.sync?.onConnected(); this.onConnected?.(); this.request('sessions.subscribe', {}).catch(e => console.warn(`[lens] sessions.subscribe failed: ${e.message}`)); this.lens?.seed().catch(e => console.warn(`[lens] seed failed: ${e.message}`)); }
+    if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); this.sync?.onConnected(); this.onConnected?.(); this.request('sessions.subscribe', {}).catch(e => console.warn(`[lens] sessions.subscribe failed: ${e.message}`)); this.lens?.seedWithRetry(); }
     // Session events arrive through the connector's own subscription; the lens filters them
     // for the browser (session.message only for chats a browser subscribed to).
     if (msg.type === 'event' && (msg.event === 'sessions.changed' || msg.event === 'session.message')) {

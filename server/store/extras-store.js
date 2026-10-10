@@ -130,6 +130,15 @@ export function createExtrasStore(getGlobalDb) {
       db().prepare('DELETE FROM bookmarks WHERE session_key = ?').run(sessionKey);
     },
 
+    /** Drop per-session data of sessions not in `liveKeys` (deleted while the connector wasn't
+     *  listening). Returns how many sessions were dropped. */
+    pruneThreadExtras(liveKeys) {
+      const keys = db().prepare('SELECT session_key FROM thread_extras UNION SELECT session_key FROM bookmarks').all().map(r => r.session_key);
+      const gone = keys.filter(k => !liveKeys.has(k));
+      for (const k of gone) this.deleteThreadExtras(k);
+      return gone.length;
+    },
+
     /** All bookmarks, newest first. */
     listBookmarks() {
       return db().prepare('SELECT * FROM bookmarks ORDER BY created_at DESC').all().map(bookmarkRow);

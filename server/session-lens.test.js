@@ -101,6 +101,48 @@ test('group rename/delete move project styles only on success', () => {
   assert.deepEqual(calls, [['rename', 'A', 'B'], ['delete', 'C'], ['thread', CHAT]]);
 });
 
+test('delete drops extras even for a hidden session', () => {
+  const calls = [];
+  const { l } = lens({ deleteThreadExtras: k => calls.push(k) });
+  l.sessionsChanged({ sessionKey: CHILD, reason: 'create', parentSessionKey: CHAT });
+  assert.equal(l.sessionsChanged({ sessionKey: CHILD, reason: 'delete' }), null);
+  assert.deepEqual(calls, [CHILD]);
+});
+
+test('seed prunes extras of sessions missing from a complete roster', async () => {
+  const pruned = [];
+  const sent = [];
+  const pages = [{ sessions: [{ key: CHAT }], hasMore: true, nextOffset: 1 }, { sessions: [{ key: DISCORD }], hasMore: false }];
+  const l = new SessionLens({ broadcast: d => sent.push(JSON.parse(d)), request: async () => pages.shift(), logger: { info() {} },
+    extras: { pruneThreadExtras: keys => { pruned.push([...keys]); return 1; } } });
+  await l.seed();
+  assert.deepEqual(pruned, [[CHAT, DISCORD]]);
+  assert.deepEqual(sent, [{ type: 'clawchats', event: 'bookmarks-changed' }]);
+
+  // A failed or empty roster prunes nothing.
+  const l2 = new SessionLens({ broadcast() {}, request: async () => ({ sessions: [] }), logger: { info() {} },
+    extras: { pruneThreadExtras: () => { throw new Error('must not prune'); } } });
+  await l2.seed();
+  const l3 = new SessionLens({ broadcast() {}, request: async () => { throw new Error('down'); }, logger: { info() {} },
+    extras: { pruneThreadExtras: () => { throw new Error('must not prune'); } } });
+  await assert.rejects(l3.seed());
+});
+
+test('seedWithRetry retries a failed roster', async () => {
+  let calls = 0;
+  const pruned = [];
+  const l = new SessionLens({ broadcast() {}, logger: { info() {}, warn() {} },
+    request: async () => { if (++calls < 3) throw new Error('PluginInstanceUnavailableError'); return { sessions: [{ key: CHAT }] }; },
+    extras: { pruneThreadExtras: keys => { pruned.push([...keys]); return 0; } } });
+  await l.seedWithRetry(4, 1);
+  assert.equal(calls, 3);
+  assert.deepEqual(pruned, [[CHAT]]);
+  let n = 0;
+  const l2 = new SessionLens({ broadcast() {}, logger: { info() {}, warn() {} }, request: async () => { n++; throw new Error('down'); } });
+  await l2.seedWithRetry(2, 1);
+  assert.equal(n, 2);
+});
+
 test('trimRow keeps only allow-listed fields', () => {
   assert.deepEqual(trimRow({ key: 'k', unread: true, participants: [], thinkingOptions: [] }), { key: 'k', unread: true });
 });

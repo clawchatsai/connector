@@ -206,17 +206,39 @@ export class SessionLens {
     return isUtilityKey(key) || this.isVisible(key) || !!this.team?.isWorkKey(key);
   }
 
-  /** Seed `hidden` from a full roster so partial events of child sessions stay hidden. */
+  /** Seed `hidden` from a full roster so partial events of child sessions stay hidden. With the
+   *  whole roster in hand, also drop ClawChats data (bookmarks etc.) of sessions deleted while
+   *  the connector wasn't listening for `sessions.changed`. */
   async seed() {
     if (!this.request) return;
-    let offset = 0, rows = 0;
+    let offset = 0, rows = 0, complete = false;
+    const live = new Set();
     for (let page = 0; page < 50; page++) {
       const res = await this.request('sessions.list', { archived: 'all', limit: 1000, offset }, 60000);
-      for (const row of res?.sessions || []) { this.observe(row.key, row); rows++; }
-      if (!res?.hasMore || res.nextOffset == null) break;
+      for (const row of res?.sessions || []) { this.observe(row.key, row); live.add(row.key); rows++; }
+      if (!res?.hasMore || res.nextOffset == null) { complete = true; break; }
       offset = res.nextOffset;
     }
     this.log.info?.(`[lens] seeded from ${rows} sessions (${this.hidden.size} hidden chat-shaped)`);
+    if (complete && live.size && this.extras?.pruneThreadExtras) {
+      const dropped = this.extras.pruneThreadExtras(live);
+      if (dropped) {
+        this.log.info?.(`[lens] dropped bookmarks/extras of ${dropped} deleted sessions`);
+        this.broadcast(JSON.stringify({ type: 'clawchats', event: 'bookmarks-changed' }));
+      }
+    }
+  }
+
+  /** seed(), retried: right after a plugin reload the gateway can briefly fail sessions.list
+   *  (PluginInstanceUnavailableError), and a missed seed also skips the extras prune. */
+  async seedWithRetry(tries = 4, delayMs = 5000) {
+    for (let i = 1; ; i++) {
+      try { return await this.seed(); } catch (e) {
+        this.log.warn?.(`[lens] seed failed (${i}/${tries}): ${e.message}`);
+        if (i >= tries) return;
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
   }
 
   // ── Gateway → browser ───────────────────────────────────────────────
@@ -232,8 +254,9 @@ export class SessionLens {
     if (payload.reason === 'patch' && this.team?.onSessionPatched) {
       this.team.onSessionPatched(key).catch(e => this.log.warn?.(`[lens] team patch: ${e.message}`));
     }
-    if (!this.observe(key, payload.session || payload)) return null;
+    // Before the visibility check: a deleted session's bookmarks go even if the lens had it hidden.
     if (payload.reason === 'delete' && this.extras) this.extras.deleteThreadExtras?.(key);
+    if (!this.observe(key, payload.session || payload)) return null;
     const out = trimEvent(payload);
     if (payload.reason !== 'delete') this._withParent(key, out.session || out);
     return { type: 'event', event: 'sessions.changed', payload: out };
