@@ -11,6 +11,7 @@ import { GatewayClient } from './gateway.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload, handleWorkspaceCreate, handleWorkspaceMove, handleWorkspaceCopy } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
+import { createTalkOfferHandler } from './controllers/talk-offer.js';
 import { handleStatic } from './controllers/static.js';
 import { handleAgents } from './controllers/agents.js';
 import { createTitleHandler, createTitler } from './controllers/title.js';
@@ -117,6 +118,7 @@ export function createApp(config = {}) {
 
   // Instantiate controllers
   const handleGatewayMedia = createGatewayMediaHandler({ gatewayWsUrl: gatewayUrl, gatewayToken });
+  const handleTalkOffer = createTalkOfferHandler({ gatewayWsUrl: gatewayUrl });
 
   // Settings — file I/O lives in settings.js
   const { handleGetSettings, handleSaveSettings } = createSettingsHandlers(SETTINGS_FILE);
@@ -195,6 +197,7 @@ export function createApp(config = {}) {
       // File serving & workspace browser
       if (method === 'GET' && urlPath === '/api/file') return handleServeFile(req, res, query, workspaceDir);
       if (method === 'GET' && urlPath === '/api/gw-media') return handleGatewayMedia(req, res, query);
+      if (method === 'POST' && urlPath === '/api/talk/offer') return await handleTalkOffer(req, res);
       if (method === 'GET' && urlPath === '/api/workspace') return handleWorkspaceList(req, res, query);
       if (method === 'GET' && urlPath === '/api/workspace/file') return handleWorkspaceFileRead(req, res, query, workspaceDir, query.session ? await sessionRoot(query.session) : null);
       if (method === 'PUT' && urlPath === '/api/workspace/file') return await handleWorkspaceFileWrite(req, res, query);
