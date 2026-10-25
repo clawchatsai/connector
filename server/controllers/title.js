@@ -54,7 +54,17 @@ export function createTitleHandler(llm) {
     if (typeof llm?.complete !== 'function') return sendError(res, 501, 'This OpenClaw version has no plugin model completion');
     const { message } = await parseBody(req);
     if (typeof message !== 'string' || !message.trim()) return sendError(res, 400, 'Missing message');
-    const result = await complete(Array.from(message.trim()).slice(0, SOURCE_MAX_CHARS).join(''));
-    return send(res, 200, { title: normalizeTitle(result?.text), model: result?.provider && result?.model ? `${result.provider}/${result.model}` : undefined });
+    const source = Array.from(message.trim()).slice(0, SOURCE_MAX_CHARS).join('');
+    let result;
+    try {
+      result = await complete(source);
+    } catch (err) {
+      console.warn(`[title] completion failed (source ${source.length} chars): ${err?.code || ''} ${err?.stack || err}`);
+      throw err;
+    }
+    const title = normalizeTitle(result?.text);
+    // The reason a retitle comes back empty: which model answered, and what it actually returned.
+    if (!title) console.warn(`[title] no title from ${result?.provider}/${result?.model} (source ${source.length} chars, reply ${JSON.stringify(String(result?.text ?? '').slice(0, 200))}, keys ${Object.keys(result || {}).join(',')})`);
+    return send(res, 200, { title, model: result?.provider && result?.model ? `${result.provider}/${result.model}` : undefined });
   };
 }
