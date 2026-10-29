@@ -25,7 +25,9 @@ import type { DataChannelLike, PeerChannelInfo } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
 
-import { initAuth, handleAuthMessage, cleanupAuth, type AuthConfig } from './auth-handler.js';
+import { attachBrowserChannel, revokeStaleChannels, loadAuthState } from './auth-handler.js';
+import { readConfig, writeConfig, updateConfig, readAuthConfig, removeBackupCode, writeFileAtomic } from './config-store.js';
+import { ChunkReassembler } from './chunk-reassembly.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
 import { fileURLToPath } from 'node:url';
@@ -129,21 +131,9 @@ let GATEWAY_WS_URL = resolveGatewayWsUrl();
 const desktopTunnels = new Map<string, Set<{ close(): void }>>();
 const MAX_TUNNELS_PER_CONNECTION = 8;
 
-/** Reassembly buffers for chunked RPC requests from browser (large uploads). */
-const rpcReqChunkBuffers = new Map<string, {
-  chunks: string[];
-  received: number;
-  total: number;
-  createdAt: number;
-}>();
-
-/** Reassembly buffers for chunked gateway-msg from browser (large payloads like image attachments). */
-const gatewayMsgChunkBuffers = new Map<string, {
-  chunks: string[];
-  received: number;
-  total: number;
-  createdAt: number;
-}>();
+/** Reassembly of chunked RPC requests (large uploads) and gateway-msg (e.g. image attachments) from browsers. */
+const rpcReqChunks = new ChunkReassembler();
+const gatewayMsgChunks = new ChunkReassembler();
 
 let app: AppInstance | null = null;
 let signaling: SignalingClient | null = null;
@@ -267,23 +257,18 @@ function gatewayConfigPath(): string {
 const CONFIG_DIR = path.join(stateRoot(), 'clawchats');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const RUNTIME_FILE = path.join(CONFIG_DIR, 'runtime.json');
+/** Browser login failures and lockout (auth-handler.ts), kept across restarts. */
+const AUTH_STATE_FILE = path.join(CONFIG_DIR, 'auth-state.json');
+/** setup-totp's QR as an image, for agent-driven setups; deleted by verify-totp. */
+const TOTP_QR_IMAGE = path.join(CONFIG_DIR, 'totp-qr.gif');
 
+// All writes are atomic; a change to part of the config is a read-modify-write (config-store.ts).
 function loadConfig(): PluginConfig | null {
-  try {
-    const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
-    const cfg = JSON.parse(raw) as PluginConfig;
-    if (!cfg.userId || !cfg.apiKey || !cfg.serverUrl) {
-      return null;
-    }
-    return cfg;
-  } catch {
-    return null;
-  }
+  return readConfig(CONFIG_FILE);
 }
 
 function saveConfig(config: PluginConfig): void {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+  writeConfig(CONFIG_FILE, config);
 }
 
 // ---------------------------------------------------------------------------
@@ -431,12 +416,11 @@ function startHealthEndpoint(ctx: PluginServiceContext): void {
 
   healthServer.listen(0, '127.0.0.1', () => {
     const addr = healthServer!.address() as net.AddressInfo;
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_FILE, JSON.stringify({
+    writeFileAtomic(RUNTIME_FILE, JSON.stringify({
       pid: process.pid,
       healthPort: addr.port,
       startedAt: new Date().toISOString(),
-    }, null, 2), { mode: 0o600 });
+    }, null, 2));
     ctx.logger.info(`Health endpoint on 127.0.0.1:${addr.port}`);
   });
 }
@@ -545,12 +529,13 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
   // Installed before the setup flow saved the gateway id: log in by userId, then keep the id the server answers with,
   // so the next login uses it and grants carry it. Nothing for the user to do.
   signaling.on('gateway-id', (id: string) => {
-    const cfg = loadConfig();
-    if (cfg && !cfg.gatewayId) {
+    let saved = false;
+    updateConfig(CONFIG_FILE, (cfg) => {
+      if (cfg.gatewayId) return false;
       cfg.gatewayId = id;
-      saveConfig(cfg);
-      ctx.logger.info(`[clawchats] saved gateway id ${id} (this install had none; it logged in by user id)`);
-    }
+      saved = true;
+    });
+    if (saved) ctx.logger.info(`[clawchats] saved gateway id ${id} (this install had none; it logged in by user id)`);
   });
 
   signaling.on('connected', () => {
@@ -572,6 +557,8 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
   const { WebRTCPeerManager } = await import('./webrtc-peer.js');
   if (_stopRequested) { teardownRuntime(); return; }
   webrtcPeer = new WebRTCPeerManager();
+  loadAuthState(AUTH_STATE_FILE);
+  watchConfigForRevocation(ctx);
 
   webrtcPeer.on('datachannel', (dc: DataChannelLike, connectionId: string) => {
     ctx.logger.info(`Browser connected via DataChannel: ${connectionId}`);
@@ -700,6 +687,7 @@ function teardownRuntime(): void {
   // 0. Tear down health endpoint
   if (healthServer) { healthServer.close(); healthServer = null; }
   try { fs.unlinkSync(RUNTIME_FILE); } catch { /* already gone */ }
+  if (configWatcher) { fs.unwatchFile(CONFIG_FILE, configWatcher); configWatcher = null; }
 
   // 1. Notify connected browsers and close DataChannels
   for (const [id, client] of connectedClients) {
@@ -747,106 +735,50 @@ function setupDataChannelHandler(
   connectionId: string,
   ctx: PluginServiceContext,
 ): void {
-  // Build auth config from plugin config
-  const config = loadConfig();
-  const isDevMode = process.env.CLAWCHATS_DEV === 'true';
-  const hasGoogle = !!config?.google;
-  const authEnabled = config?.schemaVersion === 2 && config?.totp && config?.sessionSecret;
-
-  if (authEnabled) {
-    // In dev mode without Google identity, use placeholder
-    const google = config!.google ?? {
-      clientId: 'dev-placeholder',
-      authorizedSub: 'dev-placeholder',
-      authorizedEmail: 'dev@localhost',
-    };
-
-    // Auth-gated: don't add to broadcast clients until authenticated
-    const authConfig: AuthConfig = {
-      userId: config!.userId,
-      totp: config!.totp!,
-      google,
-      sessionSecret: config!.sessionSecret!,
-      backupCodeHashes: config!.backupCodeHashes,
-      devMode: isDevMode,
-    };
-
-    const authStarted = initAuth(dc, connectionId);
-    if (!authStarted) return; // rate-limited, DC will be closed
-
-    dc.onMessage(async (data: string) => {
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(data);
-      } catch {
-        dc.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
-        return;
-      }
-
-      // Check auth state
-      const authResult = await handleAuthMessage(dc, connectionId, msg, authConfig);
-
-      switch (authResult) {
-        case 'authenticated':
-          // Auth succeeded — add to broadcast clients and inform gateway
-          connectedClients.set(connectionId, dc);
-          ctx.logger.info(`Browser authenticated: ${connectionId}`);
-
-          // Persist backup code changes if any were consumed
-          if (authConfig.backupCodeHashes && config!.backupCodeHashes) {
-            config!.backupCodeHashes = authConfig.backupCodeHashes;
-            saveConfig(config!);
-          }
-          return;
-
-        case 'pending':
-          // Still waiting for valid auth
-          return;
-
-        case 'blocked':
-          // Pre-auth non-auth message — drop silently
-          return;
-
-        case 'pass':
-          // Completed auth on this connection — process message normally.
-          // A connection whose auth timed out or was rate-limited gets
-          // 'blocked', never 'pass'; the client reconnects (Fix 4).
-          break;
-      }
-
-      // Authenticated message processing
-      processAuthenticatedMessage(dc, connectionId, msg, ctx);
-    });
-  } else {
-    // No auth configured (schemaVersion 1 or missing TOTP)
-    if (config && config.schemaVersion !== undefined && config.schemaVersion < 2) {
-      ctx.logger.warn('TOTP not configured — DataChannel access blocked. Run: openclaw clawchats reauth');
-      dc.send(JSON.stringify({
-        type: 'auth-required-setup',
-        message: 'Two-factor authentication is required. Run "openclaw clawchats reauth" on your gateway machine to set it up.',
-      }));
-      return; // Don't process any messages
-    }
-
-    // Legacy path: no config at all (shouldn't happen in normal flow)
-    connectedClients.set(connectionId, dc);
-    dc.onMessage(async (data: string) => {
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(data);
-      } catch {
-        dc.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
-        return;
-      }
-      processAuthenticatedMessage(dc, connectionId, msg, ctx);
-    });
-  }
-
   dc.onClosed(() => {
     connectedClients.delete(connectionId);
-    cleanupAuth(connectionId);
+    rpcReqChunks.dropConnection(connectionId);
+    gatewayMsgChunks.dropConnection(connectionId);
     app?.debugLogger.handleClientDisconnect(dc);
   });
+
+  // Login gate (auth-handler.ts): refuses and closes the channel unless config.json is complete
+  // with TOTP set up, and hands messages on only after the browser logged in.
+  attachBrowserChannel(dc, connectionId, {
+    loadAuthConfig: () => readAuthConfig(CONFIG_FILE, process.env.CLAWCHATS_DEV === 'true'),
+    consumeBackupCode: (hash) => {
+      const consumed = removeBackupCode(CONFIG_FILE, hash);
+      if (consumed) ctx.logger.warn(`Browser ${connectionId} logged in with a backup code`);
+      return consumed;
+    },
+    onAuthenticated: () => {
+      // Auth succeeded — add to broadcast clients and inform gateway
+      connectedClients.set(connectionId, dc);
+      ctx.logger.info(`Browser authenticated: ${connectionId}`);
+    },
+    onMessage: (msg) => processAuthenticatedMessage(dc, connectionId, msg, ctx),
+    onLoginFailure: (reason) => {
+      ctx.logger.warn(`Failed ClawChats login attempt on ${connectionId} (${reason})`);
+      broadcastToClients({ type: 'auth-attempt-failed', reason, at: new Date().toISOString() });
+    },
+    log: ctx.logger,
+  });
+}
+
+/**
+ * Browsers that logged in under secrets the config no longer has (`reauth`, `reset`, a deleted
+ * config) are signed out. Polls the file's stat, so atomic renames and deletion are both seen.
+ */
+let configWatcher: ((curr: fs.Stats, prev: fs.Stats) => void) | null = null;
+function watchConfigForRevocation(ctx: PluginServiceContext): void {
+  if (configWatcher) fs.unwatchFile(CONFIG_FILE, configWatcher);
+  configWatcher = () => {
+    for (const id of revokeStaleChannels(readAuthConfig(CONFIG_FILE))) {
+      connectedClients.delete(id);
+      ctx.logger.warn(`Browser ${id} signed out: ClawChats login settings changed (reauth/reset)`);
+    }
+  };
+  fs.watchFile(CONFIG_FILE, { interval: 2000, persistent: false }, configWatcher);
 }
 
 /**
@@ -857,48 +789,25 @@ function processAuthenticatedMessage(
   connectionId: string,
   msg: Record<string, unknown>,
   ctx: PluginServiceContext,
-): void {
+): void | Promise<void> {
   switch (msg['type']) {
     case 'rpc':
-      handleRpcMessage(dc, msg, ctx);
-      break;
+      return handleRpcMessage(dc, msg, ctx);
 
     case 'rpc-chunk-req': {
-      const chunkId = msg['id'] as string;
-      const index = msg['index'] as number;
-      const total = msg['total'] as number;
-      const chunkData = msg['data'] as string;
-
-      if (!chunkId || typeof index !== 'number' || typeof total !== 'number' || !chunkData) {
-        dc.send(JSON.stringify({ type: 'error', message: 'malformed rpc-chunk-req' }));
+      const r = rpcReqChunks.add(connectionId, msg);
+      if (!r) break;
+      if ('error' in r) {
+        dc.send(JSON.stringify({ type: 'error', message: `malformed rpc-chunk-req: ${r.error}` }));
         break;
       }
-
-      if (!rpcReqChunkBuffers.has(chunkId)) {
-        rpcReqChunkBuffers.set(chunkId, {
-          chunks: new Array(total),
-          received: 0,
-          total,
-          createdAt: Date.now(),
-        });
-        setTimeout(() => rpcReqChunkBuffers.delete(chunkId), 30_000);
+      let reassembled: unknown;
+      try { reassembled = JSON.parse(r.done); } catch { reassembled = null; }
+      if (!reassembled || typeof reassembled !== 'object') {
+        dc.send(JSON.stringify({ type: 'rpc-res', id: msg['id'], status: 400, body: { error: 'Failed to reassemble chunked RPC' } }));
+        break;
       }
-      const rpcBuf = rpcReqChunkBuffers.get(chunkId)!;
-      if (!rpcBuf.chunks[index]) {
-        rpcBuf.chunks[index] = chunkData;
-        rpcBuf.received++;
-      }
-      if (rpcBuf.received === rpcBuf.total) {
-        rpcReqChunkBuffers.delete(chunkId);
-        const fullMsg = rpcBuf.chunks.join('');
-        try {
-          const reassembled = JSON.parse(fullMsg) as Record<string, unknown>;
-          handleRpcMessage(dc, reassembled, ctx);
-        } catch (e) {
-          dc.send(JSON.stringify({ type: 'rpc-res', id: chunkId, status: 400, body: { error: 'Failed to reassemble chunked RPC' } }));
-        }
-      }
-      break;
+      return handleRpcMessage(dc, reassembled as Record<string, unknown>, ctx);
     }
 
     case 'gateway-msg':
@@ -909,37 +818,13 @@ function processAuthenticatedMessage(
       break;
 
     case 'gateway-msg-chunk': {
-      const chunkId = msg['id'] as string;
-      const index = msg['index'] as number;
-      const total = msg['total'] as number;
-      const chunkData = msg['data'] as string;
-
-      if (!chunkId || typeof index !== 'number' || typeof total !== 'number' || !chunkData) {
-        dc.send(JSON.stringify({ type: 'error', message: 'malformed gateway-msg-chunk' }));
+      const r = gatewayMsgChunks.add(connectionId, msg);
+      if (!r) break;
+      if ('error' in r) {
+        dc.send(JSON.stringify({ type: 'error', message: `malformed gateway-msg-chunk: ${r.error}` }));
         break;
       }
-
-      if (!gatewayMsgChunkBuffers.has(chunkId)) {
-        gatewayMsgChunkBuffers.set(chunkId, {
-          chunks: new Array(total),
-          received: 0,
-          total,
-          createdAt: Date.now(),
-        });
-        setTimeout(() => gatewayMsgChunkBuffers.delete(chunkId), 30_000);
-      }
-      const buf = gatewayMsgChunkBuffers.get(chunkId)!;
-      if (!buf.chunks[index]) {
-        buf.chunks[index] = chunkData;
-        buf.received++;
-      }
-      if (buf.received === buf.total) {
-        gatewayMsgChunkBuffers.delete(chunkId);
-        const fullPayload = buf.chunks.join('');
-        if (app?.gatewayClient) {
-          app.gatewayClient.forwardFromBrowser(fullPayload);
-        }
-      }
+      app?.gatewayClient?.forwardFromBrowser(r.done);
       break;
     }
 
@@ -1296,14 +1181,12 @@ async function enrollTotp(config: PluginConfig): Promise<boolean> {
       // Generate a brand new TOTP secret
       totpSecret = generateTotpSecret();
       const email = config.google?.authorizedEmail || config.userId;
-      void buildOtpauthUri(totpSecret, email); // keep import used
       const formatted = totpSecret.match(/.{1,4}/g)?.join(' ') || totpSecret;
 
       console.log('');
       console.log('  🔐 Setting up two-factor authentication');
       console.log('');
-      console.log('  Open this link to scan the QR code with your authenticator app:');
-      console.log(`  ${config.serverUrl.replace('wss://', 'https://').replace(/\/ws\/?$/, '')}/totp-setup#${totpSecret}`);
+      await printTotpQr(totpSecret, email);
       console.log('');
       console.log(`  Or enter this code manually: ${formatted}`);
       console.log('');
@@ -1331,10 +1214,28 @@ async function enrollTotp(config: PluginConfig): Promise<boolean> {
       return false;
     }
 
-    console.log('  ✅ Two-factor authentication enabled!');
-
-    // Generate backup codes
+    // Generate backup codes and a new session secret (invalidates every session token)
     const { codes, hashes } = generateBackupCodes();
+    const sessionSecret = generateSessionSecret();
+
+    // Update only the 2FA fields of the config as it is on disk now (the prompts above can take
+    // minutes; the running service may have changed it meanwhile)
+    const saved = updateConfig(CONFIG_FILE, (c) => {
+      c.totp = {
+        secret: totpSecret,
+        algorithm: 'SHA1',
+        digits: 6,
+        period: 30,
+        enabledAt: new Date().toISOString(),
+      };
+      c.sessionSecret = sessionSecret;
+      c.backupCodeHashes = hashes;
+      c.schemaVersion = 2;
+      delete c.totpPending;
+    });
+    if (!saved) throw new Error('the ClawChats config is gone (was it reset?). Run setup again.');
+
+    console.log('  ✅ Two-factor authentication enabled!');
     console.log('');
     console.log('  🔑 Backup codes (save these somewhere safe — one-time use):');
     for (const code of codes) {
@@ -1342,23 +1243,6 @@ async function enrollTotp(config: PluginConfig): Promise<boolean> {
     }
     console.log('');
     console.log('  ⚠️  These codes will NOT be shown again.');
-
-    // Generate session secret
-    const sessionSecret = generateSessionSecret();
-
-    // Update config
-    config.totp = {
-      secret: totpSecret,
-      algorithm: 'SHA1',
-      digits: 6,
-      period: 30,
-      enabledAt: new Date().toISOString(),
-    };
-    config.sessionSecret = sessionSecret;
-    config.backupCodeHashes = hashes;
-    config.schemaVersion = 2;
-
-    saveConfig(config);
     console.log('');
 
     rl.close();
@@ -1367,6 +1251,33 @@ async function enrollTotp(config: PluginConfig): Promise<boolean> {
     rl.close();
     console.error(`  TOTP setup failed: ${(e as Error).message}`);
     return false;
+  }
+}
+
+/**
+ * Draw the authenticator QR code (otpauth URI) here, in the terminal: the TOTP secret never
+ * goes to another server. `imageFile` also saves it as a GIF (owner-only).
+ */
+async function printTotpQr(secret: string, email: string, imageFile?: string): Promise<void> {
+  const uri = buildOtpauthUri(secret, email);
+  let qr: QRCode;
+  try {
+    // Loaded only here (CLI): the service never needs it
+    const { default: qrcode } = await import('qrcode-generator');
+    qr = qrcode(0, 'M');
+    qr.addData(uri);
+    qr.make();
+  } catch (e) {
+    console.log(`  (Could not draw the QR code: ${(e as Error).message}.) Add this to your authenticator app:`);
+    console.log(`  ${uri}`);
+    return;
+  }
+  console.log('  Scan this QR code with your authenticator app:');
+  console.log('');
+  console.log(qr.createASCII(1, 4).split('\n').map(line => `  ${line}`).join('\n'));
+  if (imageFile) {
+    writeFileAtomic(imageFile, Buffer.from(qr.createDataURL(6, 4).split(',')[1], 'base64'));
+    console.log(`  The same QR code as an image: ${imageFile}`);
   }
 }
 
@@ -1419,23 +1330,20 @@ async function handleSetupTotp(): Promise<void> {
     } else {
       // Expired — generate a fresh one
       totpSecret = process.env.CLAWCHATS_DEV_TOTP_SECRET || generateTotpSecret();
-      config.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() };
-      saveConfig(config);
+      updateConfig(CONFIG_FILE, (c) => { c.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() }; });
     }
   } else {
     totpSecret = process.env.CLAWCHATS_DEV_TOTP_SECRET || generateTotpSecret();
-    config.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() };
-    saveConfig(config);
+    updateConfig(CONFIG_FILE, (c) => { c.totpPending = { secret: totpSecret, generatedAt: new Date().toISOString() }; });
   }
 
   const formatted = totpSecret.match(/.{1,4}/g)?.join(' ') || totpSecret;
-  const setupUrl = `${config.serverUrl.replace('wss://', 'https://').replace(/\/ws\/?$/, '')}/totp-setup#${totpSecret}`;
 
   console.log('');
   console.log('  🔐 ClawChats Two-Factor Authentication Setup');
   console.log('');
-  console.log('  Open this URL to scan the QR code with your authenticator app:');
-  console.log(`  ${setupUrl}`);
+  // Agent-driven: the agent can't show a terminal drawing reliably, so the QR is also saved as an image
+  await printTotpQr(totpSecret, config.google?.authorizedEmail || config.userId, TOTP_QR_IMAGE);
   console.log('');
   console.log(`  Or enter manually: ${formatted}`);
   console.log('');
@@ -1466,8 +1374,29 @@ async function handleVerifyTotp(code: string): Promise<void> {
     process.exit(1);
   }
 
-  // Generate backup codes
+  // Generate backup codes and session secret; finalize the config as it is on disk now
   const { codes, hashes } = generateBackupCodes();
+  const sessionSecret = generateSessionSecret();
+  const secret = config.totpPending.secret;
+  const saved = updateConfig(CONFIG_FILE, (c) => {
+    c.totp = {
+      secret,
+      algorithm: 'SHA1',
+      digits: 6,
+      period: 30,
+      enabledAt: new Date().toISOString(),
+    };
+    c.sessionSecret = sessionSecret;
+    c.backupCodeHashes = hashes;
+    c.schemaVersion = 2;
+    delete c.totpPending;
+  });
+  if (!saved) {
+    console.error('  The ClawChats config is gone (was it reset?). Run setup again.');
+    process.exit(1);
+  }
+  try { fs.unlinkSync(TOTP_QR_IMAGE); } catch { /* never written or already deleted */ }
+
   console.log('');
   console.log('  🔑 Backup codes (save these somewhere safe — one-time use):');
   for (const backupCode of codes) {
@@ -1475,21 +1404,6 @@ async function handleVerifyTotp(code: string): Promise<void> {
   }
   console.log('');
   console.log('  ⚠️  These codes will NOT be shown again.');
-
-  // Generate session secret and finalize config
-  const sessionSecret = generateSessionSecret();
-  config.totp = {
-    secret: config.totpPending.secret,
-    algorithm: 'SHA1',
-    digits: 6,
-    period: 30,
-    enabledAt: new Date().toISOString(),
-  };
-  config.sessionSecret = sessionSecret;
-  config.backupCodeHashes = hashes;
-  config.schemaVersion = 2;
-  delete config.totpPending;
-  saveConfig(config);
 
   console.log('');
   console.log('  ✅ Two-factor authentication enabled!');
@@ -1632,6 +1546,8 @@ async function handleStatus(): Promise<void> {
 
 async function handleReset(): Promise<void> {
   try {
+    // Config first: a running service then refuses (and signs out) every browser at once
+    fs.rmSync(CONFIG_FILE, { force: true });
     fs.rmSync(CONFIG_DIR, { recursive: true, force: true });
     console.log('ClawChats data removed. Plugin disconnected.');
   } catch (e) {
@@ -1696,8 +1612,7 @@ async function handleImport(sourcePath: string): Promise<void> {
   const parentConfigPath = path.join(path.dirname(resolvedSource), 'config.json');
   if (fs.existsSync(parentConfigPath)) {
     try {
-      fs.mkdirSync(CONFIG_DIR, { recursive: true });
-      fs.copyFileSync(parentConfigPath, CONFIG_FILE);
+      writeFileAtomic(CONFIG_FILE, fs.readFileSync(parentConfigPath));
       console.log('  ✓ config.json (plugin credentials migrated)');
     } catch (e) {
       console.error(`  Failed to migrate config.json: ${(e as Error).message}`);

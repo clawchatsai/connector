@@ -100,3 +100,13 @@ test('a peer that never authenticates is dropped; frames before auth are refused
   assert.match(await until(r2, 'failed'), /before auth/);
   void dx;
 });
+
+test('malformed frames (null, numbers, arrays) fail the link instead of throwing', async () => {
+  for (const frame of ['null', '5', '"x"', '[]', '{"t":"auth"}']) {
+    const { req, own } = linkPair();
+    const failed = until(own, 'failed');
+    assert.doesNotThrow(() => own.dc.handlers.forEach(h => h(frame)));
+    assert.ok(await failed, frame);
+    req.close();
+  }
+});

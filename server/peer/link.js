@@ -48,7 +48,10 @@ export class PeerLink extends EventEmitter {
     this._handlers = new Map(); // method -> async (params, emit) => result
     this._timer = setTimeout(() => this._fail('handshake timed out'), handshakeMs);
     this._timer.unref?.();
-    dc.onMessage(data => this._onFrame(data));
+    dc.onMessage(data => {
+      // A frame must never throw into the channel's dispatch (that would take the gateway down)
+      try { this._onFrame(data); } catch (e) { this.log.warn?.(`[peer] ${this.shareId}: frame handling failed: ${e?.message}`); this._fail('bad frame'); }
+    });
     dc.onClosed(() => this._onClosed());
     this._send({ t: 'hello', v: 1, role, shareId, nonce: this.nonce });
   }
@@ -63,6 +66,7 @@ export class PeerLink extends EventEmitter {
     if (typeof data !== 'string' || data.length > MAX_FRAME) return this._fail('oversized frame');
     let m;
     try { m = JSON.parse(data); } catch { return this._fail('bad frame'); }
+    if (!m || typeof m !== 'object') return this._fail('bad frame');
     if (!this.ready) return this._onHandshake(m);
     if (m.t === 'req') return this._onRequest(m);
     if (m.t === 'res') {

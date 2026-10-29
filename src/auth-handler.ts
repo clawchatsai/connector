@@ -1,20 +1,24 @@
 /**
- * auth-handler.ts — DataChannel authentication state machine
+ * auth-handler.ts — DataChannel authentication gate
  *
- * Manages the auth flow for each DataChannel connection:
- * 1. Send auth-required with nonce
- * 2. Wait for auth-session (cached JWT) or auth-full (Google + TOTP)
- * 3. Verify credentials
- * 4. Issue session token on success
- * 5. Block all non-auth messages until authenticated
+ * Every browser DataChannel goes through attachBrowserChannel() before anything else sees it:
+ * 1. Refuse (message + close) unless the config on disk is complete with TOTP set up
+ * 2. Send auth-required with nonce
+ * 3. Wait for auth-session (cached JWT) or auth-full (Google + TOTP), validating every field
+ * 4. Verify against the config as it is on disk at that moment
+ * 5. Issue session token on success; only then are messages handed to the request handlers
+ * A channel that does not log in within 60 s, fails too often or sends malformed login
+ * messages is closed. Login failures and lockouts survive a restart (auth-state.json).
  *
  * Spec: datachannel-auth-totp.md §4
  */
 
 import * as crypto from 'node:crypto';
+import * as fs from 'node:fs';
 import { verifyTotp, verifyBackupCode } from './totp.js';
 import { verifyGoogleIdToken, clearJWKSCache } from './google-jwt.js';
 import { issueSessionToken, verifySessionToken } from './session-token.js';
+import { authEpoch, writeFileAtomic, type AuthConfigResult } from './config-store.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,362 +44,366 @@ export interface AuthConfig {
   devMode?: boolean;
 }
 
-export interface DataChannelSend {
-  send: (data: string) => void;
+/** The DataChannel surface the gate needs (webrtc-peer.ts DataChannelLike). */
+export interface AuthChannel {
+  send(data: string): void;
+  close(): void;
+  onMessage(handler: (data: string) => void): void;
+  onClosed(handler: () => void): void;
 }
 
-type AuthState = 'awaiting-auth' | 'authenticated' | 'failed';
+export interface BrowserChannelHooks {
+  /** Fresh read of the login settings from disk. Called on open and again at every verification. */
+  loadAuthConfig: () => AuthConfigResult;
+  /** Remove one backup code (by hash) from the config on disk; false if it is no longer there. */
+  consumeBackupCode: (hash: string) => boolean;
+  /** The channel logged in. */
+  onAuthenticated: () => void;
+  /** A message on a logged-in channel. Errors (thrown or rejected) are logged, never propagated. */
+  onMessage: (msg: Record<string, unknown>) => void | Promise<void>;
+  /** A wrong TOTP / backup code was tried (for telling already logged-in browsers). */
+  onLoginFailure?: (reason: string) => void;
+  log: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void };
+}
 
-interface AuthSession {
-  state: AuthState;
-  nonce: string;
+interface ChannelState {
   connectionId: string;
+  dc: AuthChannel;
+  status: 'pending' | 'authenticated' | 'closed';
+  nonce: string;
   failCount: number;
-  createdAt: number;
-  timeoutHandle: ReturnType<typeof setTimeout>;
-  dc: DataChannelSend;
+  timer?: ReturnType<typeof setTimeout>;
+  /** authEpoch() of the config this channel logged in under. */
+  epoch?: string;
+  /** Pre-auth messages are handled one at a time, in order. */
+  chain: Promise<void>;
 }
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/** Channels waiting to log in, gateway-wide. Further ones are refused until some finish. */
+export const MAX_PENDING_CHANNELS = 10;
+/** A channel that has not logged in by then is closed. */
+export const AUTH_TIMEOUT_MS = 60_000; // enough time to open authenticator app and enter code
+const MAX_FAILURES = 5; // per channel, then it is closed
+const MAX_PREAUTH_MESSAGE_LENGTH = 16 * 1024;
+const MAX_TOKEN_LENGTH = 8 * 1024; // Google ID tokens and session JWTs are ~1-2 KB
+const MAX_CODE_LENGTH = 64;
+const GLOBAL_MAX_FAILURES = 5;
+const GLOBAL_LOCKOUT_BASE_MS = 60_000; // doubles per consecutive lockout
+const GLOBAL_LOCKOUT_MAX_MS = 60 * 60_000;
+
+const SETUP_MESSAGES: Record<'missing' | 'needs-2fa' | 'invalid', string> = {
+  'needs-2fa': 'Two-factor authentication is required. Run "openclaw clawchats reauth" on your gateway machine to set it up.',
+  invalid: 'The ClawChats login settings on your gateway are incomplete or damaged. Run "openclaw clawchats reauth" on your gateway machine.',
+  missing: 'ClawChats is not set up on your gateway. Run "openclaw clawchats setup <token>" on your gateway machine.',
+};
 
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
 
-/** Tracks per-connection auth state */
-const authSessions = new Map<string, AuthSession>();
+const channels = new Set<ChannelState>();
 
 /**
- * Connections that completed auth. This is the only thing that grants access:
- * a connection whose auth session was dropped (timeout, rate limit, eviction)
- * is NOT authenticated, it is blocked until it reconnects.
+ * Gateway-wide TOTP lockout and replay guard. Per-channel limits alone reset on every
+ * reconnect, so failures are also counted across all channels, and kept across restarts.
  */
-const authenticatedConnections = new Set<string>();
+interface PersistedAuthState {
+  failCount: number;
+  lockoutCount: number;
+  lockedUntil: number;
+  lastUsedTotpStep: number;
+}
+const freshState = (): PersistedAuthState => ({ failCount: 0, lockoutCount: 0, lockedUntil: 0, lastUsedTotpStep: 0 });
+let authState = freshState();
+let authStateFile: string | null = null;
 
-/** Rate limiting: connectionIds blocked after too many failures */
-const blockedConnections = new Map<string, number>(); // connectionId → unblock timestamp
+/** Load the persisted lockout state (call once at service start). Unreadable = fresh state. */
+export function loadAuthState(file: string): void {
+  authStateFile = file;
+  authState = freshState();
+  let raw: unknown;
+  try { raw = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return; }
+  if (!raw || typeof raw !== 'object') return;
+  for (const k of Object.keys(authState) as Array<keyof PersistedAuthState>) {
+    const v = (raw as Record<string, unknown>)[k];
+    if (typeof v === 'number' && Number.isFinite(v) && v >= 0) authState[k] = v;
+  }
+}
 
-/** TOTP replay prevention */
-let lastUsedTotpStep = 0;
-
-/**
- * Gateway-wide auth-full lockout. Per-connection limits alone reset on every
- * reconnect, so failures are also counted across all connections.
- */
-let globalFailCount = 0;
-let globalLockoutCount = 0;
-let globalLockedUntil = 0;
-
-/** Max nonces to prevent memory leaks from connection storms */
-const MAX_PENDING_NONCES = 10;
-
-const AUTH_TIMEOUT_MS = 60_000; // 60s — enough time to open authenticator app and enter code
-const MAX_FAILURES = 5;
-const BLOCK_DURATION_MS = 60_000;
-const GLOBAL_MAX_FAILURES = 5;
-const GLOBAL_LOCKOUT_BASE_MS = 60_000; // doubles per consecutive lockout
-const GLOBAL_LOCKOUT_MAX_MS = 60 * 60_000;
+function saveAuthState(): void {
+  if (!authStateFile) return;
+  try { writeFileAtomic(authStateFile, JSON.stringify(authState)); }
+  catch (e) { console.error(`[Auth] could not save login lockout state: ${(e as Error).message}`); }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize auth for a new DataChannel connection.
- * Sends auth-required and starts the timeout.
- *
- * @returns true if auth was initiated, false if connection is blocked
+ * Put a new browser DataChannel behind the login gate. Nothing reaches hooks.onMessage
+ * before the channel has logged in.
  */
-export function initAuth(
-  dc: DataChannelSend,
-  connectionId: string,
-): boolean {
-  // Check if this connection is rate-limited
-  const blockedUntil = blockedConnections.get(connectionId);
-  if (blockedUntil && Date.now() < blockedUntil) {
-    dc.send(JSON.stringify({
-      type: 'auth-failed',
-      reason: 'rate_limited',
-    }));
-    return false;
-  }
-  blockedConnections.delete(connectionId);
+export function attachBrowserChannel(dc: AuthChannel, connectionId: string, hooks: BrowserChannelHooks): void {
+  const ch: ChannelState = { connectionId, dc, status: 'pending', nonce: '', failCount: 0, chain: Promise.resolve() };
+  dc.onClosed(() => detach(ch));
 
-  // Cap pending nonces to prevent memory leaks
-  if (authSessions.size >= MAX_PENDING_NONCES) {
-    // Evict oldest
-    let oldestKey: string | null = null;
-    let oldestTime = Infinity;
-    for (const [key, session] of authSessions) {
-      if (session.createdAt < oldestTime) {
-        oldestTime = session.createdAt;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey) {
-      const old = authSessions.get(oldestKey)!;
-      clearTimeout(old.timeoutHandle);
-      authSessions.delete(oldestKey);
-      // Tell the evicted client so it reconnects instead of hanging
-      old.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'auth_timeout' }));
-    }
+  const cfg = hooks.loadAuthConfig();
+  if (!cfg.ok) {
+    refuseSetup(ch, cfg.reason, hooks);
+    return;
+  }
+  if (pendingCount() >= MAX_PENDING_CHANNELS) {
+    hooks.log.warn(`Browser ${connectionId} refused: ${MAX_PENDING_CHANNELS} connections are already waiting to log in`);
+    refuse(ch, { type: 'auth-failed', reason: 'rate_limited' });
+    return;
   }
 
-  const nonce = crypto.randomBytes(32).toString('hex');
-
-  const timeoutHandle = setTimeout(() => {
-    const session = authSessions.get(connectionId);
-    if (session && session.state === 'awaiting-auth') {
-      dc.send(JSON.stringify({
-        type: 'auth-failed',
-        reason: 'auth_timeout',
-      }));
-      authSessions.delete(connectionId);
-    }
+  channels.add(ch);
+  ch.nonce = crypto.randomBytes(32).toString('hex');
+  ch.timer = setTimeout(() => {
+    if (ch.status === 'pending') refuse(ch, { type: 'auth-failed', reason: 'auth_timeout' });
   }, AUTH_TIMEOUT_MS);
-
-  authSessions.set(connectionId, {
-    state: 'awaiting-auth',
-    nonce,
-    connectionId,
-    failCount: 0,
-    createdAt: Date.now(),
-    timeoutHandle,
-    dc,
-  });
-
-  dc.send(JSON.stringify({
-    type: 'auth-required',
-    nonce,
-  }));
-
-  return true;
+  ch.timer.unref?.();
+  dc.onMessage((data: string) => onData(ch, data, hooks));
+  dc.send(JSON.stringify({ type: 'auth-required', nonce: ch.nonce }));
 }
 
 /**
- * Handle an incoming message on an auth-gated DataChannel.
- *
- * @returns 'authenticated' if the message was an auth message and auth succeeded,
- *          'pending' if auth is still in progress,
- *          'pass' if the connection is already authenticated (message should be processed normally),
- *          'blocked' if the message was dropped (pre-auth non-auth message)
+ * The config on disk changed: close logged-in channels whose login secrets are gone
+ * (`reauth`, `reset`, a deleted or broken config). Returns their connection ids.
  */
-export async function handleAuthMessage(
-  dc: DataChannelSend,
-  connectionId: string,
-  msg: Record<string, unknown>,
-  config: AuthConfig,
-): Promise<'authenticated' | 'pending' | 'pass' | 'blocked'> {
-  if (authenticatedConnections.has(connectionId)) {
-    return 'pass';
-  }
-
-  const session = authSessions.get(connectionId);
-
-  // No auth session and never authenticated: the session was dropped (timeout,
-  // rate limit, eviction) or never started. Block; the client must reconnect.
-  if (!session || session.state !== 'awaiting-auth') {
-    return 'blocked';
-  }
-
-  // Only accept auth messages pre-auth
-  const msgType = msg['type'] as string;
-  if (msgType !== 'auth-session' && msgType !== 'auth-full') {
-    return 'blocked';
-  }
-
-  // Handle auth-session (cached JWT)
-  if (msgType === 'auth-session') {
-    const token = msg['sessionToken'] as string;
-    if (!token) {
-      return sendFailure(dc, connectionId, 'invalid_session');
+export function revokeStaleChannels(current: AuthConfigResult): string[] {
+  const epoch = current.ok ? authEpoch(current.config) : null;
+  const revoked: string[] = [];
+  for (const ch of [...channels]) {
+    if (ch.status === 'authenticated' && ch.epoch !== epoch) {
+      // invalid_session: the browser forgets its session token and asks for a new login
+      refuse(ch, { type: 'auth-failed', reason: 'invalid_session' });
+      revoked.push(ch.connectionId);
     }
+  }
+  return revoked;
+}
 
+/** Tests only: forget every channel and the lockout state. */
+export function _resetAuthForTests(): void {
+  for (const ch of channels) if (ch.timer) clearTimeout(ch.timer);
+  channels.clear();
+  authState = freshState();
+  authStateFile = null;
+}
+
+// ---------------------------------------------------------------------------
+// Message handling
+// ---------------------------------------------------------------------------
+
+function onData(ch: ChannelState, data: string, hooks: BrowserChannelHooks): void {
+  if (ch.status === 'closed') return;
+  if (ch.status === 'authenticated') { void handleAuthenticated(ch, data, hooks); return; }
+  ch.chain = ch.chain
+    .then(() => handlePreAuth(ch, data, hooks))
+    .catch((e: unknown) => {
+      hooks.log.error(`Login handling failed for ${ch.connectionId}: ${(e as Error)?.stack || e}`);
+      refuse(ch, { type: 'auth-failed', reason: 'internal_error' });
+    });
+}
+
+async function handleAuthenticated(ch: ChannelState, data: string, hooks: BrowserChannelHooks): Promise<void> {
+  try {
+    let msg: unknown;
+    try { msg = JSON.parse(data); } catch { msg = undefined; }
+    if (!isObject(msg)) {
+      ch.dc.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' }));
+      return;
+    }
+    await hooks.onMessage(msg);
+  } catch (e) {
+    hooks.log.error(`Message handling failed on ${ch.connectionId}: ${(e as Error)?.stack || e}`);
+  }
+}
+
+async function handlePreAuth(ch: ChannelState, data: string, hooks: BrowserChannelHooks): Promise<void> {
+  if (ch.status === 'authenticated') return handleAuthenticated(ch, data, hooks); // queued behind the login
+  if (ch.status !== 'pending') return;
+
+  let msg: unknown;
+  if (typeof data === 'string' && data.length <= MAX_PREAUTH_MESSAGE_LENGTH) {
+    try { msg = JSON.parse(data); } catch { msg = undefined; }
+  }
+  if (!isObject(msg)) return refuseMalformed(ch, hooks, 'not a JSON object or too large');
+
+  if (msg['type'] === 'auth-session') return authSession(ch, msg, hooks);
+  if (msg['type'] === 'auth-full') return authFull(ch, msg, hooks);
+  // Anything else before login is dropped: it never reaches a request handler.
+}
+
+async function authSession(ch: ChannelState, msg: Record<string, unknown>, hooks: BrowserChannelHooks): Promise<void> {
+  const token = msg['sessionToken'];
+  if (typeof token !== 'string' || !token || token.length > MAX_TOKEN_LENGTH) {
+    return refuseMalformed(ch, hooks, 'bad sessionToken');
+  }
+  const cfg = hooks.loadAuthConfig();
+  if (!cfg.ok) return refuseSetup(ch, cfg.reason, hooks);
+  const config = cfg.config;
+  try {
+    verifySessionToken(token, config.sessionSecret, config.userId, config.google.authorizedSub);
+  } catch (e) {
+    // On expired session, don't count as failure — just prompt for full auth
+    if ((e as Error).message === 'expired_session') {
+      ch.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'expired_session' }));
+      return;
+    }
+    return failure(ch, 'invalid_session');
+  }
+  succeed(ch, config, hooks, { type: 'auth-ok' });
+}
+
+async function authFull(ch: ChannelState, msg: Record<string, unknown>, hooks: BrowserChannelHooks): Promise<void> {
+  const { idToken, totp, nonce } = msg;
+  if (typeof idToken !== 'string' || idToken.length > MAX_TOKEN_LENGTH
+    || typeof totp !== 'string' || totp.length > MAX_CODE_LENGTH
+    || typeof nonce !== 'string') {
+    return refuseMalformed(ch, hooks, 'bad auth-full fields');
+  }
+  const sessionDays = typeof msg['sessionDays'] === 'number' && Number.isFinite(msg['sessionDays']) ? msg['sessionDays'] : 7;
+
+  // Gateway-wide lockout: refuse without checking anything, so no guess is tested
+  if (Date.now() < authState.lockedUntil) {
+    ch.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'rate_limited' }));
+    return;
+  }
+
+  if (nonce !== ch.nonce) return failure(ch, 'nonce_mismatch');
+
+  const before = hooks.loadAuthConfig();
+  if (!before.ok) return refuseSetup(ch, before.reason, hooks);
+  const google = before.config.google;
+
+  // Google ID token check. The frontend sends 'signaling-verified' on purpose
+  // (bd29058): login.clawchats.ai already did Google sign-in, so TOTP is the
+  // connector-side factor and the gateway-wide lockout above protects it.
+  const skipGoogle = !google.clientId || google.clientId === 'dev-placeholder'
+    || idToken === 'signaling-verified'
+    || (before.config.devMode && idToken === 'dev-mode-no-google');
+  if (skipGoogle) {
+    console.log('[Auth] Skipping Google ID token verification (TOTP-only auth)');
+  } else {
+    const opts = { clientId: google.clientId, authorizedSub: google.authorizedSub, authorizedEmail: google.authorizedEmail };
     try {
-      verifySessionToken(
-        token,
-        config.sessionSecret,
-        config.userId,
-        config.google.authorizedSub,
-      );
-      return authSuccess(dc, connectionId);
+      await verifyGoogleIdToken(idToken, opts);
     } catch (e) {
-      const reason = (e as Error).message as string;
-      // On expired session, don't count as failure — just prompt for full auth
-      if (reason === 'expired_session') {
-        dc.send(JSON.stringify({ type: 'auth-failed', reason: 'expired_session' }));
-        return 'pending';
-      }
-      return sendFailure(dc, connectionId, 'invalid_session');
-    }
-  }
-
-  // Handle auth-full (Google ID token + TOTP)
-  if (msgType === 'auth-full') {
-    const idToken = msg['idToken'] as string;
-    const totp = msg['totp'] as string;
-    const sessionDays = msg['sessionDays'] as number || 7;
-    const msgNonce = msg['nonce'] as string;
-
-    // Gateway-wide lockout: refuse without checking anything, so no guess is tested
-    if (Date.now() < globalLockedUntil) {
-      dc.send(JSON.stringify({ type: 'auth-failed', reason: 'rate_limited' }));
-      return 'pending';
-    }
-
-    // Verify nonce
-    if (msgNonce !== session.nonce) {
-      return sendFailure(dc, connectionId, 'nonce_mismatch');
-    }
-
-    // Google ID token check. The frontend sends 'signaling-verified' on purpose
-    // (bd29058): login.clawchats.ai already did Google sign-in, so TOTP is the
-    // connector-side factor and the gateway-wide lockout above protects it.
-    const skipGoogle = !config.google.clientId || config.google.clientId === 'dev-placeholder'
-      || idToken === 'signaling-verified'
-      || (config.devMode && idToken === 'dev-mode-no-google');
-    if (skipGoogle) {
-      console.log('[Auth] Skipping Google ID token verification (TOTP-only auth)');
-    } else {
+      console.error(`[Auth] Google ID token verification failed: ${(e as Error).message}`);
+      // Retry with fresh JWKS on first failure (key rotation)
+      clearJWKSCache();
       try {
-        await verifyGoogleIdToken(idToken, {
-          clientId: config.google.clientId,
-          authorizedSub: config.google.authorizedSub,
-          authorizedEmail: config.google.authorizedEmail,
-        });
-      } catch (e) {
-        console.error(`[Auth] Google ID token verification failed: ${(e as Error).message}`);
-        // Retry with fresh JWKS on first failure (key rotation)
-        clearJWKSCache();
-        try {
-          await verifyGoogleIdToken(idToken, {
-            clientId: config.google.clientId,
-            authorizedSub: config.google.authorizedSub,
-            authorizedEmail: config.google.authorizedEmail,
-          });
-        } catch {
-          return sendFailure(dc, connectionId, 'invalid_id_token');
-        }
+        await verifyGoogleIdToken(idToken, opts);
+      } catch {
+        return failure(ch, 'invalid_id_token');
       }
     }
+  }
+  if (ch.status !== 'pending') return; // closed or timed out while Google was checked
 
-    // Verify TOTP or backup code
-    const totpStep = verifyTotp(totp, config.totp.secret, lastUsedTotpStep);
-    if (totpStep >= 0) {
-      lastUsedTotpStep = totpStep;
-    } else {
-      // Try backup code
-      const backupIndex = config.backupCodeHashes
-        ? verifyBackupCode(totp, config.backupCodeHashes)
-        : -1;
+  // Verify against the config on disk now, not the one read before the wait above:
+  // a `reauth` in between must not let the old secrets through.
+  const cfg = hooks.loadAuthConfig();
+  if (!cfg.ok) return refuseSetup(ch, cfg.reason, hooks);
+  const config = cfg.config;
+  if (Date.now() < authState.lockedUntil) { // another channel triggered the lockout meanwhile
+    ch.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'rate_limited' }));
+    return;
+  }
 
-      if (backupIndex >= 0) {
-        // Consume the backup code
-        config.backupCodeHashes!.splice(backupIndex, 1);
-        // Caller should persist the updated config
-      } else {
-        recordGlobalFailure();
-        return sendFailure(dc, connectionId, 'invalid_totp');
-      }
+  // Verify TOTP or backup code
+  const totpStep = verifyTotp(totp, config.totp.secret, authState.lastUsedTotpStep);
+  if (totpStep >= 0) {
+    authState.lastUsedTotpStep = totpStep;
+  } else {
+    const backupIndex = config.backupCodeHashes ? verifyBackupCode(totp, config.backupCodeHashes) : -1;
+    // A backup code is one-time: it counts only if it was still on disk and is now removed.
+    if (backupIndex < 0 || !hooks.consumeBackupCode(config.backupCodeHashes![backupIndex])) {
+      recordGlobalFailure();
+      hooks.onLoginFailure?.('invalid_totp');
+      return failure(ch, 'invalid_totp');
     }
-
-    globalFailCount = 0;
-    globalLockoutCount = 0;
-
-    // Issue session token
-    const sessionToken = issueSessionToken(
-      config.userId,
-      config.google.authorizedSub,
-      sessionDays,
-      config.sessionSecret,
-    );
-
-    const expiresAt = new Date(
-      Date.now() + Math.min(Math.max(sessionDays, 1), 30) * 86400 * 1000
-    ).toISOString();
-
-    clearTimeout(session.timeoutHandle);
-    authSessions.delete(connectionId);
-    authenticatedConnections.add(connectionId);
-
-    dc.send(JSON.stringify({
-      type: 'auth-ok',
-      sessionToken,
-      expiresAt,
-    }));
-
-    return 'authenticated';
   }
+  authState.failCount = 0;
+  authState.lockoutCount = 0;
+  saveAuthState();
 
-  return 'blocked';
-}
-
-/**
- * Clean up auth state for a disconnected DataChannel.
- */
-export function cleanupAuth(connectionId: string): void {
-  const session = authSessions.get(connectionId);
-  if (session) {
-    clearTimeout(session.timeoutHandle);
-    authSessions.delete(connectionId);
-  }
-  authenticatedConnections.delete(connectionId);
-}
-
-/**
- * Check if a connection completed auth.
- */
-export function isAuthenticated(connectionId: string): boolean {
-  return authenticatedConnections.has(connectionId);
+  const sessionToken = issueSessionToken(config.userId, config.google.authorizedSub, sessionDays, config.sessionSecret);
+  const expiresAt = new Date(
+    Date.now() + Math.min(Math.max(sessionDays, 1), 30) * 86400 * 1000,
+  ).toISOString();
+  succeed(ch, config, hooks, { type: 'auth-ok', sessionToken, expiresAt });
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function authSuccess(
-  dc: DataChannelSend,
-  connectionId: string,
-): 'authenticated' {
-  const session = authSessions.get(connectionId);
-  if (session) {
-    clearTimeout(session.timeoutHandle);
-    authSessions.delete(connectionId);
-  }
-  authenticatedConnections.add(connectionId);
-  dc.send(JSON.stringify({ type: 'auth-ok' }));
-  return 'authenticated';
+function isObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function pendingCount(): number {
+  let n = 0;
+  for (const ch of channels) if (ch.status === 'pending') n++;
+  return n;
+}
+
+function succeed(ch: ChannelState, config: AuthConfig, hooks: BrowserChannelHooks, ok: Record<string, unknown>): void {
+  if (ch.timer) clearTimeout(ch.timer);
+  ch.status = 'authenticated';
+  ch.epoch = authEpoch(config);
+  ch.dc.send(JSON.stringify(ok));
+  hooks.onAuthenticated();
+}
+
+/** Wrong credentials: tell the browser; too many on one channel closes it. */
+function failure(ch: ChannelState, reason: string): void {
+  ch.failCount++;
+  if (ch.failCount >= MAX_FAILURES) return refuse(ch, { type: 'auth-failed', reason: 'rate_limited' });
+  ch.dc.send(JSON.stringify({ type: 'auth-failed', reason }));
+}
+
+function refuseSetup(ch: ChannelState, reason: 'missing' | 'needs-2fa' | 'invalid', hooks: BrowserChannelHooks): void {
+  hooks.log.warn(`Browser ${ch.connectionId} refused: ${reason === 'needs-2fa' ? 'TOTP not set up' : `ClawChats config ${reason}`}. Run: openclaw clawchats reauth`);
+  refuse(ch, { type: 'auth-required-setup', message: SETUP_MESSAGES[reason] });
+}
+
+function refuseMalformed(ch: ChannelState, hooks: BrowserChannelHooks, why: string): void {
+  hooks.log.warn(`Browser ${ch.connectionId} closed: malformed login message (${why})`);
+  refuse(ch, { type: 'auth-failed', reason: 'invalid_request' });
+}
+
+/** Send a last message and close the channel. No further message on it is handled. */
+function refuse(ch: ChannelState, last: Record<string, unknown>): void {
+  if (ch.status === 'closed') return;
+  detach(ch);
+  try { ch.dc.send(JSON.stringify(last)); } catch { /* already gone */ }
+  try { ch.dc.close(); } catch { /* already gone */ }
+}
+
+function detach(ch: ChannelState): void {
+  ch.status = 'closed';
+  if (ch.timer) clearTimeout(ch.timer);
+  channels.delete(ch);
 }
 
 function recordGlobalFailure(): void {
-  globalFailCount++;
-  if (globalFailCount < GLOBAL_MAX_FAILURES) return;
-  const duration = Math.min(
-    GLOBAL_LOCKOUT_BASE_MS * 2 ** globalLockoutCount,
-    GLOBAL_LOCKOUT_MAX_MS,
-  );
-  globalLockedUntil = Date.now() + duration;
-  globalLockoutCount++;
-  globalFailCount = 0;
-  console.warn(`[Auth] ${GLOBAL_MAX_FAILURES} failed TOTP attempts — full auth locked for ${duration / 1000}s`);
-}
-
-function sendFailure(
-  dc: DataChannelSend,
-  connectionId: string,
-  reason: string,
-): 'pending' {
-  const session = authSessions.get(connectionId);
-  if (!session) return 'pending';
-
-  session.failCount++;
-
-  if (session.failCount >= MAX_FAILURES) {
-    dc.send(JSON.stringify({ type: 'auth-failed', reason: 'rate_limited' }));
-    clearTimeout(session.timeoutHandle);
-    authSessions.delete(connectionId);
-    blockedConnections.set(connectionId, Date.now() + BLOCK_DURATION_MS);
-    return 'pending';
+  authState.failCount++;
+  if (authState.failCount >= GLOBAL_MAX_FAILURES) {
+    const duration = Math.min(GLOBAL_LOCKOUT_BASE_MS * 2 ** authState.lockoutCount, GLOBAL_LOCKOUT_MAX_MS);
+    authState.lockedUntil = Date.now() + duration;
+    authState.lockoutCount++;
+    authState.failCount = 0;
+    console.warn(`[Auth] ${GLOBAL_MAX_FAILURES} failed TOTP attempts — full auth locked for ${duration / 1000}s`);
   }
-
-  dc.send(JSON.stringify({ type: 'auth-failed', reason }));
-  return 'pending';
+  saveAuthState();
 }

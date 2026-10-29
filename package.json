@@ -20,12 +20,13 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "node --test 'server/**/*.test.js'",
+    "test": "tsc && node --test 'server/**/*.test.js' 'test/**/*.test.js'",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "jose": "^5.10.0",
     "node-datachannel": "^0.32.1",
+    "qrcode-generator": "^2.0.4",
     "ws": "^8.0.0"
   },
   "openclaw": {

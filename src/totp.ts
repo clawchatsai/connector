@@ -60,7 +60,7 @@ export function verifyTotp(
   secretBase32: string,
   lastUsedStep: number,
 ): number {
-  if (!/^\d{6}$/.test(code)) return -1;
+  if (typeof code !== 'string' || !/^\d{6}$/.test(code)) return -1;
 
   const secret = base32Decode(secretBase32);
   const currentStep = Math.floor(Date.now() / 1000 / PERIOD);
@@ -130,6 +130,7 @@ export function generateBackupCodes(): { codes: string[]; hashes: string[] } {
  * Verify a backup code against stored hashes. Returns the index consumed, or -1.
  */
 export function verifyBackupCode(code: string, hashes: string[]): number {
+  if (typeof code !== 'string' || !Array.isArray(hashes)) return -1;
   const normalized = code.toUpperCase().replace(/\s/g, '');
   const hash = crypto.createHash('sha256').update(normalized).digest('hex');
   const index = hashes.indexOf(hash);

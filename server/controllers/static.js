@@ -24,6 +24,21 @@ const STATIC_MAP = {
 };
 
 /**
+ * The real path of `rel` inside rootDir, or null if it is missing or would escape rootDir
+ * (`..`, an absolute path, a NUL byte, or a symlink pointing outside).
+ */
+export function resolveStaticPath(rootDir, rel) {
+  if (typeof rel !== 'string' || rel.includes('\0')) return null;
+  try {
+    const root = fs.realpathSync(path.resolve(rootDir));
+    const real = fs.realpathSync(path.resolve(root, rel));
+    return real.startsWith(root + path.sep) ? real : null;
+  } catch {
+    return null; // missing
+  }
+}
+
+/**
  * Serve static files from pluginDir.
  * Returns true if the request was handled, false if it should fall through.
  * Keeps fs.createReadStream out of the HTTP router (server/index.js).
@@ -41,11 +56,12 @@ export function handleStatic(req, res, pluginDir) {
 
   if (!isAllowed) return false;
 
-  const staticPath = path.join(pluginDir, fileName || urlPath.slice(1));
-  if (!fs.existsSync(staticPath) || !fs.statSync(staticPath).isFile()) return false;
+  const staticPath = resolveStaticPath(pluginDir, fileName || urlPath.slice(1));
+  if (!staticPath) return false;
+  const stat = fs.statSync(staticPath);
+  if (!stat.isFile()) return false;
 
   const ext  = path.extname(staticPath).toLowerCase();
-  const stat = fs.statSync(staticPath);
   res.writeHead(200, {
     'Content-Type':   MIME[ext] || 'application/octet-stream',
     'Content-Length': stat.size,

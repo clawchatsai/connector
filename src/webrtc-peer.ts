@@ -74,7 +74,15 @@ function wrapDataChannel(dc: any): DataChannelLike {
       : Buffer.isBuffer(event.data)
         ? event.data.toString('utf8')
         : String(event.data);
-    for (const h of messageHandlers) h(str);
+    // Safety net: a handler error must not escape into the native event dispatch (gateway process)
+    for (const h of messageHandlers) {
+      try {
+        const r: unknown = h(str);
+        if (r instanceof Promise) r.catch((err) => console.error('[WebRTCPeerManager] DataChannel message handler failed:', err));
+      } catch (err) {
+        console.error('[WebRTCPeerManager] DataChannel message handler failed:', err);
+      }
+    }
   };
 
   dc.onclose = () => {

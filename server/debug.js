@@ -25,7 +25,9 @@ export class DebugLogger {
 
   start(ts, originatingClient) {
     if (this.active) return { error: 'already-active', sessionId: this.sessionId };
-    this.sessionId = ts.replace(/[:.]/g, '-');
+    // The id names files in baseDir: only an ISO-timestamp-like token, never a path
+    const id = typeof ts === 'string' ? ts.replace(/[:.]/g, '-') : '';
+    this.sessionId = /^[A-Za-z0-9_-]{1,64}$/.test(id) ? id : new Date().toISOString().replace(/[:.]/g, '-');
     this.originatingClient = originatingClient;
     fs.mkdirSync(this.baseDir, { recursive: true });
     this.wsStream = fs.createWriteStream(path.join(this.baseDir, `session-${this.sessionId}-ws.log`), { flags: 'a' });
