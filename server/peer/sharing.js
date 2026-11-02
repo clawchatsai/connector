@@ -23,15 +23,26 @@ const DEFAULT_DAILY_CAP = 50;
 const MAX_CONCURRENT_TURNS = 2;   // per share: the daily cap alone would allow 50 parallel 10-minute runs
 const ACCESS_MODES = { restricted: 'read-only', trusted: 'guarded' };
 /**
+ * Requests one contact's gateway may make of this one over the sharing link: [burst, per ms] token
+ * buckets per contact and kind. Far above what a person and their agents send in a chat (a turn per
+ * agent per round, a post per message, batched room pushes); they stop a peer that floods.
+ */
+const PEER_RATES = { turn: [20, 60_000], 'room.post': [30, 60_000], 'room.sync': [300, 60_000], '*': [120, 60_000] };
+/**
  * The gateway loads any local image path or file:// URL written in a prompt (detectImageReferences),
  * ignoring the agent's tool policy and fs.workspaceOnly, so a guest could type the path of one of the
  * owner's screenshots and have the agent describe it. A zero-width space before each path with a file
  * extension (and inside `file://`) stops that match; the agent still reads the text normally, and
  * other text (`/commands`, `~`) passes through unchanged.
+ * The gateway blanks attachment markers ("[media attached: \u2026]", "[Image: source: \u2026]") before it looks
+ * for paths, so a path right after one starts a fresh word there: markers are broken too (and `]`
+ * counts as a word start), and "MEDIA:" lines never pass as the gateway's attachment syntax.
  */
-export const defangLocalPaths = text => text
+export const defangLocalPaths = text => String(text ?? '')
+  .replace(/\[(?=\s*(?:media\s+attached|image\s*:))/gi, '[\u200b')
   .replace(/file:\/\//gi, 'file:\u200b//')
-  .replace(/(^|[\s"'`(])(?=(?:\.\.?\/|[~/]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
+  .replace(/\bMEDIA:/gi, m => `${m.slice(0, -1)}\u200b:`)
+  .replace(/(^|[\s"'`(\]])(?=(?:\.\.?[\\/]|[~/\\]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
 const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team chat on behalf of your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 // The same agent in its owner's own team chat, answering another person's agent (localTurnFor).
 const ACTING_FOR_NOTE = (name, byPerson) => `(Shared session: in your owner's team chat, you are answering ${byPerson ? name : `${name}'s agent`}, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
@@ -67,7 +78,9 @@ export class SharingManager {
     this._linking = new Map();    // shareId -> Promise<PeerLink>
     this._served = new Set();     // owner-side PeerLinks
     this._runs = new Map();       // runId -> { resolve, timer, text } (owner-side guest runs)
-    this._turns = new Map();      // `${shareId}:${turnId}` -> { sessionKey, runId }
+    // Owner-side guest turns, keyed by an id made here (never the requester's): { shareId, clientTurnId, sessionKey, runId, aborted }
+    this._turns = new Map();
+    this._buckets = new Map();    // `${gateway}|${kind}` -> { tokens, at } (PEER_RATES)
     this._ready = false;
   }
 
@@ -86,6 +99,18 @@ export class SharingManager {
       // counts as verified on every share with it, a different key doesn't).
       g.exec(`CREATE TABLE IF NOT EXISTS peer_key_verified (share_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, verified_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS peer_guest_agents (agent_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
+      // Each contact's key, by their gateway id, pinned on first use (either direction). A share can't bring
+      // another key for that gateway; only the owner can accept a changed one (trustNewKey).
+      g.exec(`CREATE TABLE IF NOT EXISTS peer_gateway_keys (gateway_id TEXT PRIMARY KEY, pubkey TEXT NOT NULL, created_at INTEGER NOT NULL)`);
+      // Requester side: the owner gateway a share's pinned key signed for (ownerOf, also once the share has ended).
+      if (!g.prepare('PRAGMA table_info(peer_pins)').all().some(c => c.name === 'owner_gateway_id')) g.exec('ALTER TABLE peer_pins ADD COLUMN owner_gateway_id TEXT');
+      // Gateways already approved here keep the key they were approved with (newest grant first).
+      for (const r of g.prepare('SELECT grant_json FROM peer_grants WHERE revoked_at IS NULL ORDER BY created_at DESC').all()) {
+        try {
+          const gr = JSON.parse(r.grant_json);
+          if (gr.requesterGatewayId && gr.requesterPubKey) g.prepare('INSERT OR IGNORE INTO peer_gateway_keys (gateway_id, pubkey, created_at) VALUES (?, ?, ?)').run(gr.requesterGatewayId, gr.requesterPubKey, Date.now());
+        } catch { /* unreadable grant */ }
+      }
       this._ready = true;
     }
     return g;
@@ -165,8 +190,41 @@ export class SharingManager {
         out.theirKey = pin ? fingerprint(pin) : null;
         out.keyVerified = !!pin && this._keyVerified(s.id, pin);
       }
+      // The server shows a different key for them than the one pinned for their gateway: refused until the owner trusts it.
+      const presented = s.as === 'owner' ? s.requester?.pubKey : s.owner?.pubKey;
+      const pinned = this._gatewayKey(this._other(s).gatewayId);
+      out.keyChanged = !!(presented && pinned && presented !== pinned);
       return out;
     });
+  }
+
+  /** The key pinned for a contact's gateway, or null before first use. */
+  _gatewayKey(gatewayId) {
+    return gatewayId ? this._db().prepare('SELECT pubkey FROM peer_gateway_keys WHERE gateway_id = ?').get(gatewayId)?.pubkey || null : null;
+  }
+
+  /** Pin a gateway's key on first use. False when another key is pinned for it. */
+  _pinGatewayKey(gatewayId, pubKey) {
+    if (!gatewayId || !pubKey) return false;
+    this._db().prepare('INSERT OR IGNORE INTO peer_gateway_keys (gateway_id, pubkey, created_at) VALUES (?, ?, ?)').run(gatewayId, pubKey, Date.now());
+    return this._gatewayKey(gatewayId) === pubKey;
+  }
+
+  /**
+   * The owner accepts the key the server now shows for this share's other side (they reinstalled, say),
+   * after checking it with them. Until then a changed key is refused on every share with that gateway.
+   */
+  trustNewKey(shareId) {
+    const s = this._shares.find(x => x.id === shareId);
+    const gw = s && this._other(s).gatewayId;
+    const key = s?.as === 'owner' ? s.requester?.pubKey : s?.owner?.pubKey;
+    if (!gw || !key) throw new Error('Nothing to trust yet');
+    this._db().prepare('INSERT OR REPLACE INTO peer_gateway_keys (gateway_id, pubkey, created_at) VALUES (?, ?, ?)').run(gw, key, Date.now());
+    if (s.as === 'requester') this._db().prepare('DELETE FROM peer_pins WHERE share_id = ?').run(shareId); // its own pin follows
+    this._nameCache = null;
+    this._changed();
+    this._sharesChanged();
+    return { theirKey: fingerprint(key) };
   }
 
   /** The other side's key this gateway trusts for a share (owner: from the signed grant, or the request's key
@@ -202,11 +260,14 @@ export class SharingManager {
   _revokeLocal(shareId) {
     this._db().prepare('UPDATE peer_grants SET revoked_at = ? WHERE share_id = ? AND revoked_at IS NULL').run(Date.now(), shareId);
     for (const link of this._served) if (link.shareId === shareId) link.close();
-    // Runs already going stop too: "Stop sharing" must not leave a guest run working for minutes.
-    for (const [key, t] of this._turns) {
-      if (!key.startsWith(`${shareId}:`) || !t.runId) continue;
-      this.request('chat.abort', { sessionKey: t.sessionKey, runId: t.runId }).catch(() => {});
-    }
+    // Runs already going stop too: "Stop sharing" must not leave a guest run working for minutes. One still
+    // being set up is marked, so it never starts (or is aborted the moment it has started).
+    for (const t of this._turns.values()) if (t.shareId === shareId) this._abortTurn(t);
+  }
+
+  _abortTurn(t) {
+    t.aborted = true;
+    if (t.runId) this.request('chat.abort', { sessionKey: t.sessionKey, runId: t.runId }).catch(() => {});
   }
 
   /** Remember an agent created here as a guest version (ClawChats → Sharing). */
@@ -265,6 +326,11 @@ export class SharingManager {
     if (prev && JSON.parse(prev.grant_json).requesterPubKey !== s.requester.pubKey) {
       throw new Error("The requester's gateway key changed since you approved them. Stop sharing and ask them to request again.");
     }
+    // Nor can a new request bring another key for a gateway this one already knows (a server posing as them).
+    const pinned = this._gatewayKey(s.requester.gatewayId);
+    if (pinned && pinned !== s.requester.pubKey) {
+      throw new Error(`${cleanName(s.requester.name || s.requester.email, 60) || 'Their'} gateway key isn't the one you connected with before. Check "Their key" with them, then trust the new key.`);
+    }
     // The signal server only activates a grant signed for this gateway's own id; without one it would say no, silently.
     const ownerGatewayId = this.gatewayId();
     if (!ownerGatewayId) throw new Error("This gateway isn't connected to the signal server yet. Try again in a moment.");
@@ -274,6 +340,7 @@ export class SharingManager {
       agents: list, access, dailyCap: Math.max(1, Math.min(1000, Math.floor(Number(dailyCap) || DEFAULT_DAILY_CAP))), issuedAt: Date.now(),
     };
     const sig = this.key.signJson(grant);
+    this._pinGatewayKey(grant.requesterGatewayId, grant.requesterPubKey);
     this._db().prepare('INSERT INTO peer_grants (share_id, grant_json, sig, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(share_id) DO UPDATE SET grant_json = excluded.grant_json, sig = excluded.sig, created_at = excluded.created_at, revoked_at = NULL')
       .run(shareId, JSON.stringify(grant), sig, Date.now());
     // An agent removed from the grant: its links pick up the new list on the next turn.
@@ -313,13 +380,34 @@ export class SharingManager {
       return null;
     }
     const link = new PeerLink({ dc, dtls, role: 'owner', shareId, key: this.key, peerKey: g.grant.requesterPubKey, log: this.log });
+    const gw = g.grant.requesterGatewayId; // the gateway the key this link authenticates was approved for
     this._served.add(link);
     link.on('closed', () => this._served.delete(link));
-    link.handle('agents', async () => ({ agents: this._grant(shareId)?.grant.agents || [] }));
-    link.handle('turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false, byPerson: false }, emit)); // only localTurnFor sets these
-    link.handle('abort', async p => this._guestAbort(shareId, p?.turnId));
-    this._wireRooms(link, requesterGatewayId);
+    link.handle('agents', this._limited(gw, 'agents', async () => ({ agents: this._grant(shareId)?.grant.agents || [] })));
+    link.handle('turn', this._limited(gw, 'turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false, byPerson: false }, emit))); // only localTurnFor sets these
+    link.handle('abort', this._limited(gw, 'abort', async p => this._guestAbort(shareId, p?.turnId)));
+    this._wireRooms(link, gw);
     return link;
+  }
+
+  /** A peer request handler, refused once that contact's gateway goes over its rate (PEER_RATES). */
+  _limited(gatewayId, method, fn) {
+    return (p, emit) => {
+      const kind = PEER_RATES[method] ? method : '*';
+      const [burst, per] = PEER_RATES[kind];
+      const now = Date.now();
+      const key = `${gatewayId}|${kind}`;
+      const b = this._buckets.get(key) || { tokens: burst, at: now };
+      b.tokens = Math.min(burst, b.tokens + ((now - b.at) * burst) / per);
+      b.at = now;
+      this._buckets.set(key, b);
+      if (b.tokens < 1) {
+        this.log.warn?.(`[sharing] ${gatewayId} is sending too many ${kind === '*' ? 'requests' : kind} requests: refused`);
+        return Promise.reject(Object.assign(new Error('Too many requests; try again in a moment'), { code: 'rate_limited' }));
+      }
+      b.tokens -= 1;
+      return fn(p, emit);
+    };
   }
 
   /**
@@ -330,10 +418,10 @@ export class SharingManager {
    */
   _wireRooms(link, otherGatewayId) {
     for (const method of ['room.sync', 'room.post', 'room.leave', 'room.fetch']) {
-      link.handle(method, async p => {
+      link.handle(method, this._limited(otherGatewayId, method, async p => {
         if (!this.onRoom) throw Object.assign(new Error('team chats are not available'), { code: 'unavailable' });
         return this.onRoom(method, p || {}, otherGatewayId);
-      });
+      }));
     }
     const ready = () => { try { this.onPeerReady?.(otherGatewayId); } catch (e) { this.log.warn?.(`[sharing] peer ready: ${e.message}`); } };
     if (link.ready) setImmediate(ready); else link.once('ready', ready);
@@ -344,7 +432,9 @@ export class SharingManager {
   /** The other person of a share, as this side sees them: { gatewayId, name, email }. */
   _other(s) {
     const p = s.as === 'owner' ? s.requester : s.owner;
-    return { gatewayId: p?.gatewayId || null, name: cleanName(p?.name || p?.email, 60) || 'Someone', email: p?.email || null };
+    // Their gateway as this side signed or verified it, not as the server lists it now.
+    const gatewayId = s.as === 'owner' ? this._grant(s.id)?.grant.requesterGatewayId || p?.gatewayId : this._ownerGateway(s) || p?.gatewayId;
+    return { gatewayId: gatewayId || null, name: cleanName(p?.name || p?.email, 60) || 'Someone', email: p?.email || null };
   }
 
   /**
@@ -417,11 +507,38 @@ export class SharingManager {
   /** The gateway id of whoever owns a shared agent ('peer:<share>:<agent>'), or null. */
   ownerOf(remoteAgentId) {
     const id = SharingManager.parseRemoteId(remoteAgentId);
-    return (id && this._shares.find(s => s.id === id.shareId && s.as === 'requester')?.owner?.gatewayId) || null;
+    return id ? this._ownerGateway(this._shares.find(s => s.id === id.shareId && s.as === 'requester')) : null;
+  }
+
+  /**
+   * The owner gateway of a share shared with this one: the id its grant was signed for by the key pinned
+   * for it (the server's word alone can't make it someone else). Remembered after the share ends.
+   */
+  _ownerGateway(s) {
+    if (!s) return null;
+    const g = this._verifiedGrant(s);
+    if (g) return g.ownerGatewayId;
+    const pin = this._db().prepare('SELECT owner_pubkey, owner_gateway_id FROM peer_pins WHERE share_id = ?').get(s.id);
+    if (pin?.owner_gateway_id) return pin.owner_gateway_id;
+    // Pinned before the owner gateway was recorded with it: the grant still says, if the pinned key signed it.
+    const ok = pin && s.grant && s.grant.ownerGatewayId === s.owner?.gatewayId && verifySignature(pin.owner_pubkey, canonicalJson(s.grant), s.signature);
+    return ok ? s.grant.ownerGatewayId : null;
   }
 
   /** Whether this gateway owns (granted) that share. */
   ownsShare(shareId) { return !!this._grant(shareId); }
+
+  /** Whether this gateway shares `agentId` with that gateway (an unrevoked grant it signed; only that share, if given). */
+  grantedTo(gatewayId, agentId, shareId = null) {
+    if (!gatewayId || !agentId) return false;
+    return this._localGrants().some(r => {
+      if (shareId && r.share_id !== shareId) return false;
+      try {
+        const g = JSON.parse(r.grant_json);
+        return g.requesterGatewayId === gatewayId && (g.agents || []).some(a => a?.id === agentId);
+      } catch { return false; }
+    });
+  }
 
   /** This gateway's person, as the others see them (from any share). */
   selfName() {
@@ -463,15 +580,23 @@ export class SharingManager {
     const roomId = String(p.roomId || '').slice(0, 200);
     if (!roomId || typeof p.message !== 'string' || !p.message.trim()) throw Object.assign(new Error('Bad turn'), { code: 'bad_request' });
     if (this._usage(shareId) >= grant.dailyCap) throw Object.assign(new Error(`Daily limit reached (${grant.dailyCap} replies)`), { code: 'cap' });
-    if ([...this._turns.keys()].filter(k => k.startsWith(`${shareId}:`)).length >= MAX_CONCURRENT_TURNS) {
-      throw Object.assign(new Error('Too many replies at once; try again shortly'), { code: 'busy' });
-    }
-    const turnKey = `${shareId}:${p.turnId || crypto.randomUUID()}`;
-    this._turns.set(turnKey, { sessionKey: null, runId: null }); // counts toward the limit from here on
+    // The requester's turn id only names the turn for its Stop; the turn itself is tracked under an id made here,
+    // so reusing one can't hide a turn from the limit or from "Stop sharing".
+    const clientTurnId = typeof p.turnId === 'string' && p.turnId ? p.turnId.slice(0, 200) : null;
+    const running = [...this._turns.values()].filter(t => t.shareId === shareId);
+    if (clientTurnId && running.some(t => t.clientTurnId === clientTurnId)) throw Object.assign(new Error('That turn is already running'), { code: 'bad_request' });
+    if (running.length >= MAX_CONCURRENT_TURNS) throw Object.assign(new Error('Too many replies at once; try again shortly'), { code: 'busy' });
+    const turnKey = crypto.randomUUID();
+    this._turns.set(turnKey, { shareId, clientTurnId, sessionKey: null, runId: null, aborted: false }); // counts toward the limit from here on
     // Counted before any await, so parallel turns can't both pass the cap.
     this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
     this._changed(); // the owner's Sharing view shows today's count
-    try { return await this._runGuestTurn(shareId, grant, agent, roomId, p, emit, turnKey); }
+    try {
+      const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, emit, this._turns.get(turnKey));
+      // What this gateway's agent said for that gateway's room: its copy of the room may show it as ours (team.js).
+      if (!p.inOwnerRoom && r?.text) try { this.onGuestReply?.(grant.requesterGatewayId, roomId, shareId, agent.id, r.text); } catch { /* best effort */ }
+      return r;
+    }
     catch (e) {
       // A reply that failed without saying anything doesn't use up the day's replies. A timeout still
       // counts: it ran for the full turn timeout.
@@ -484,7 +609,7 @@ export class SharingManager {
     finally { this._turns.delete(turnKey); }
   }
 
-  async _runGuestTurn(shareId, grant, agent, roomId, p, emit, turnKey) {
+  async _runGuestTurn(shareId, grant, agent, roomId, p, emit, turn) {
     const cfg = await this.request('config.get', {}, 30_000);
     // A guest version whose restrictions were edited away (e.g. in the Control UI) isn't served.
     const isGuest = this._db().prepare('SELECT 1 FROM peer_guest_agents WHERE agent_id = ?').get(agent.id);
@@ -506,14 +631,17 @@ export class SharingManager {
       timer.unref?.();
       this._runs.set(runId, { resolve, timer, text: '', emit, sessionKey });
     });
-    this._turns.set(turnKey, { sessionKey, runId });
+    Object.assign(turn, { sessionKey, runId });
     try {
       if (!this._grant(shareId)) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' }); // revoked while setting up
+      if (turn.aborted) return { state: 'aborted', text: '' }; // stopped while setting up
       await this.request('chat.send', {
         sessionKey, message: defangLocalPaths(`${p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
         timeoutMs: TURN_TIMEOUT_MS, suppressCommandInterpretation: true,
         expectedPermissionMode: permissionMode, expectedToolOverrides: toolOverrides,
       }, 30_000);
+      // Stopped or revoked while the send was on its way (the abort may have reached the gateway before the run).
+      if (turn.aborted || !this._grant(shareId)) this._abortTurn(turn);
       const r = await done;
       if (r.state === 'final') return { state: 'final', text: r.message ? messageText(r.message) : await this._lastReply(sessionKey) };
       if (r.state === 'aborted') return { state: 'aborted', text: r.text || '' };
@@ -526,8 +654,7 @@ export class SharingManager {
   }
 
   async _guestAbort(shareId, turnId) {
-    const t = this._turns.get(`${shareId}:${turnId}`);
-    if (t) await this.request('chat.abort', { sessionKey: t.sessionKey, runId: t.runId }).catch(() => {});
+    for (const t of this._turns.values()) if (t.shareId === shareId && turnId && t.clientTurnId === turnId) this._abortTurn(t);
     return { ok: true };
   }
 
@@ -628,14 +755,24 @@ export class SharingManager {
     if (s?.as !== 'requester' || s.status !== 'active' || !s.grant || !s.signature || !s.owner?.pubKey) return null;
     if (this._db().prepare('SELECT 1 FROM peer_removed WHERE share_id = ?').get(s.id)) return null;
     if (s.grant.requesterGatewayId !== this.gatewayId() || s.grant.shareId !== s.id || s.grant.requesterPubKey !== this.key.publicKey) return null;
+    // Signed for the gateway the server says it's from: a grant from one contact can't pass as another's.
+    if (!s.owner.gatewayId || s.grant.ownerGatewayId !== s.owner.gatewayId) return null;
     const db = this._db();
-    const pin = db.prepare('SELECT owner_pubkey FROM peer_pins WHERE share_id = ?').get(s.id)?.owner_pubkey;
-    if (pin && pin !== s.owner.pubKey) {
-      this.log.warn?.(`[sharing] owner key changed for ${s.id} (was ${fingerprint(pin)}, now ${fingerprint(s.owner.pubKey)}): refusing`);
+    const pinRow = db.prepare('SELECT owner_pubkey, owner_gateway_id FROM peer_pins WHERE share_id = ?').get(s.id);
+    const pin = pinRow?.owner_pubkey;
+    const gwPin = this._gatewayKey(s.owner.gatewayId);
+    if ((pin && pin !== s.owner.pubKey) || (gwPin && gwPin !== s.owner.pubKey)) {
+      const was = pin && pin !== s.owner.pubKey ? pin : gwPin;
+      if (!(this._warnedKeys ??= new Set()).has(`${s.id}|${s.owner.pubKey}`)) {
+        this._warnedKeys.add(`${s.id}|${s.owner.pubKey}`);
+        this.log.warn?.(`[sharing] owner key changed for ${s.id} (was ${fingerprint(was)}, now ${fingerprint(s.owner.pubKey)}): refusing`);
+      }
       return null;
     }
     if (!verifySignature(s.owner.pubKey, canonicalJson(s.grant), s.signature)) return null;
-    if (!pin) db.prepare('INSERT OR IGNORE INTO peer_pins (share_id, owner_pubkey, created_at) VALUES (?, ?, ?)').run(s.id, s.owner.pubKey, Date.now());
+    if (!pin) db.prepare('INSERT OR IGNORE INTO peer_pins (share_id, owner_pubkey, created_at, owner_gateway_id) VALUES (?, ?, ?, ?)').run(s.id, s.owner.pubKey, Date.now(), s.owner.gatewayId);
+    else if (!pinRow.owner_gateway_id) db.prepare('UPDATE peer_pins SET owner_gateway_id = ? WHERE share_id = ?').run(s.owner.gatewayId, s.id);
+    if (!gwPin) this._pinGatewayKey(s.owner.gatewayId, s.owner.pubKey);
     return s.grant;
   }
 
@@ -664,14 +801,15 @@ export class SharingManager {
     if (cur?.ready && !cur.closed) return cur;
     if (this._linking.has(shareId)) return this._linking.get(shareId);
     const s = this._shares.find(x => x.id === shareId);
-    if (!this._verifiedGrant(s)) throw Object.assign(new Error('This share is not active'), { code: 'revoked' });
+    const grant = this._verifiedGrant(s);
+    if (!grant) throw Object.assign(new Error('This share is not active'), { code: 'revoked' });
     const p = (async () => {
       const { dc, dtls } = await this.openPeer(shareId);
       const link = new PeerLink({ dc, dtls, role: 'requester', shareId, key: this.key, peerKey: s.owner.pubKey, log: this.log });
       await new Promise((resolve, reject) => { link.once('ready', resolve); link.once('closed', () => reject(new Error(`Couldn't reach ${firstName(s.owner)}'s gateway`))); });
       this._links.set(shareId, link);
       link.on('closed', () => { if (this._links.get(shareId) === link) this._links.delete(shareId); });
-      this._wireRooms(link, s.owner?.gatewayId);
+      this._wireRooms(link, grant.ownerGatewayId); // the gateway the key this link authenticated signed for
       return link;
     })().finally(() => this._linking.delete(shareId));
     this._linking.set(shareId, p);
@@ -709,10 +847,10 @@ export class SharingManager {
       const id = SharingManager.parseRemoteId(who);
       const theirs = id && this._shares.find(s => s.id === id.shareId && s.as === 'requester');
       if (!theirs) return null;
-      gw = theirs.owner?.gatewayId; email = String(theirs.owner?.email || '').toLowerCase();
+      gw = this._ownerGateway(theirs); email = String(theirs.owner?.email || '').toLowerCase();
     }
     const candidates = this._shares.filter(s => s.as === 'owner' && s.status === 'active');
-    const mine = candidates.find(s => gw && s.requester?.gatewayId === gw)
+    const mine = candidates.find(s => gw && this._other(s).gatewayId === gw)
       || candidates.find(s => email && String(s.requester?.email || '').toLowerCase() === email);
     const g = mine && this._grant(mine.id);
     return g ? { shareId: mine.id, grant: g.grant } : null;

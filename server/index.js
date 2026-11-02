@@ -290,6 +290,12 @@ export function createApp(config = {}) {
         try { return send(res, 200, sharing.markKeyVerified(p.id)); }
         catch (e) { return sendError(res, 400, e.message); }
       }
+      // Their gateway key changed (shares list `keyChanged`): the owner accepts the new one after checking it with them.
+      if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/trust-key'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        try { return send(res, 200, sharing.trustNewKey(p.id)); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/revoke'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
         sharing.revoke(p.id);
