@@ -14,6 +14,8 @@ import {
   RTCSessionDescription,
   RTCIceCandidate,
 } from 'node-datachannel/polyfill';
+import { sdpFingerprint as strictSdpFingerprint } from './channel-binding.js';
+import type { DtlsFingerprints } from './auth-handler.js';
 
 // ---------------------------------------------------------------------------
 // Public interfaces
@@ -126,6 +128,8 @@ export class WebRTCPeerManager extends EventEmitter {
   private activeChannels: Map<string, DataChannelLike> = new Map();
   /** Gateway-sharing connections: never handed to the browser path, not counted as devices. */
   private peerInfo: Map<string, PeerChannelInfo> = new Map();
+  /** Browser connections: both DTLS fingerprints as the SDPs set on this peer connection say, fixed at the first offer. */
+  private browserDtls: Map<string, DtlsFingerprints> = new Map();
 
   constructor() {
     super();
@@ -234,6 +238,14 @@ export class WebRTCPeerManager extends EventEmitter {
     await pc.setLocalDescription(answer);
     const info = this.peerInfo.get(connectionId);
     if (info) info.dtls.local = sdpFingerprint(pc.localDescription?.sdp || answer.sdp);
+    else {
+      // What the login signs (auth-handler.ts). Read from the descriptions the peer connection
+      // holds, which are what DTLS verifies the other side's certificate against.
+      this.browserDtls.set(connectionId, {
+        browser: strictSdpFingerprint(pc.remoteDescription?.sdp),
+        connector: strictSdpFingerprint(pc.localDescription?.sdp || answer.sdp),
+      });
+    }
 
     console.log(`[WebRTCPeerManager] Answer created for connection ${connectionId}`);
 
@@ -282,6 +294,7 @@ export class WebRTCPeerManager extends EventEmitter {
     try { this.peerConnections.get(connectionId)?.close(); } catch { /* gone */ }
     this.peerConnections.delete(connectionId);
     this.peerInfo.delete(connectionId);
+    this.browserDtls.delete(connectionId);
     this.pendingIceServers.delete(connectionId);
   }
 
@@ -318,6 +331,7 @@ export class WebRTCPeerManager extends EventEmitter {
     this.peerConnections.clear();
     this.pendingIceServers.clear();
     this.peerInfo.clear();
+    this.browserDtls.clear();
   }
 
   /** Browser connections (gateway-sharing links aren't devices). */
@@ -347,11 +361,12 @@ export class WebRTCPeerManager extends EventEmitter {
 
       const info = this.peerInfo.get(connectionId);
       this.peerInfo.delete(connectionId);
+      this.browserDtls.delete(connectionId);
       this.emit(info ? 'peer-datachannel-closed' : 'datachannel-closed', connectionId);
     });
 
     const info = this.peerInfo.get(connectionId);
     if (info) this.emit('peer-datachannel', channel, info);
-    else this.emit('datachannel', channel, connectionId);
+    else this.emit('datachannel', channel, connectionId, this.browserDtls.get(connectionId));
   }
 }

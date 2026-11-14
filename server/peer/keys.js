@@ -5,6 +5,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { WORDS } from './wordlist.js';
 
 /** JSON with sorted keys: what both sides sign and verify (same as the signal server's). */
 export function canonicalJson(v) {
@@ -25,6 +26,17 @@ export function verifySignature(pubB64, data, sigB64) {
 export function fingerprint(pubB64) {
   const h = crypto.createHash('sha256').update(Buffer.from(String(pubB64 || ''), 'base64')).digest('hex').slice(0, 20);
   return h.match(/.{4}/g).join('-');
+}
+
+/**
+ * The same key as four easy-to-compare words, e.g. `maple-orbit-tiger-lantern` (4 x 12.9 = about
+ * 52 bits). Display only: the pinned and compared value stays the key itself. The browser has the
+ * identical function (frontend/connection/device-auth.js keyWords) and the identical list.
+ * Each word is the next 32 bits of the key's SHA-256 modulo 7776 (bias below 10^-6).
+ */
+export function fingerprintWords(pubB64) {
+  const h = crypto.createHash('sha256').update(Buffer.from(String(pubB64 || ''), 'base64')).digest();
+  return [0, 4, 8, 12].map(i => WORDS[h.readUInt32BE(i) % WORDS.length]).join('-');
 }
 
 /** Load the key pair from `<dataDir>/peer-key.json`, creating it (mode 0600) on first use. */

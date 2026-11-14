@@ -10,6 +10,7 @@
  * Spec: specs/multitenant-p2p.md sections 6.1-6.2
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as net from 'node:net';
@@ -25,8 +26,9 @@ import type { DataChannelLike, PeerChannelInfo } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
 import { dispatchRpc, type RpcRequest } from './shim.js';
 
-import { attachBrowserChannel, revokeStaleChannels, loadAuthState } from './auth-handler.js';
-import { readConfig, writeConfig, updateConfig, readAuthConfig, removeBackupCode, writeFileAtomic } from './config-store.js';
+import { attachBrowserChannel, revokeStaleChannels, loadAuthState, type DtlsFingerprints } from './auth-handler.js';
+import { readConfig, writeConfig, updateConfig, readAuthConfig, removeBackupCode, writeFileAtomic, addDevice, touchDevice } from './config-store.js';
+import { listDevices, revokeDevice, showFingerprint } from './devices-cli.js';
 import { ChunkReassembler } from './chunk-reassembly.js';
 import { generateTotpSecret, verifyTotp, generateBackupCodes, buildOtpauthUri } from './totp.js';
 import { generateSessionSecret } from './session-token.js';
@@ -77,7 +79,7 @@ interface AppInstance {
     servePeer: (o: { dc: DataChannelLike; dtls: { local: string; remote: string }; shareId: string; requesterGatewayId: string }) => unknown;
     acceptsPeer: (shareId: string, requesterGatewayId: string) => boolean;
   } | null;
-  peerKey: { publicKey: string; fingerprint: string };
+  peerKey: { publicKey: string; fingerprint: string; sign: (data: string) => string };
 }
 
 /**
@@ -560,9 +562,9 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
   loadAuthState(AUTH_STATE_FILE);
   watchConfigForRevocation(ctx);
 
-  webrtcPeer.on('datachannel', (dc: DataChannelLike, connectionId: string) => {
+  webrtcPeer.on('datachannel', (dc: DataChannelLike, connectionId: string, dtls?: DtlsFingerprints) => {
     ctx.logger.info(`Browser connected via DataChannel: ${connectionId}`);
-    setupDataChannelHandler(dc, connectionId, ctx);
+    setupDataChannelHandler(dc, connectionId, ctx, dtls);
     signaling?.reportConnectionCount(webrtcPeer?.activeCount ?? 0);
   });
 
@@ -734,6 +736,7 @@ function setupDataChannelHandler(
   dc: DataChannelLike,
   connectionId: string,
   ctx: PluginServiceContext,
+  dtls?: DtlsFingerprints,
 ): void {
   dc.onClosed(() => {
     connectedClients.delete(connectionId);
@@ -743,18 +746,35 @@ function setupDataChannelHandler(
   });
 
   // Login gate (auth-handler.ts): refuses and closes the channel unless config.json is complete
-  // with TOTP set up, and hands messages on only after the browser logged in.
+  // with TOTP set up, and hands messages on only after the browser logged in with a paired
+  // device key (or paired with a code). The connector proves itself first, with the key it uses
+  // for gateway sharing.
+  if (!app?.peerKey) { // the key is created with the app; without it nobody can be told who we are
+    ctx.logger.error(`Browser ${connectionId} refused: no connector key`);
+    dc.close();
+    return;
+  }
   attachBrowserChannel(dc, connectionId, {
-    loadAuthConfig: () => readAuthConfig(CONFIG_FILE, process.env.CLAWCHATS_DEV === 'true'),
+    loadAuthConfig: () => readAuthConfig(CONFIG_FILE),
+    connectorKey: app.peerKey,
+    addDevice: (device, totpSecret) => addDevice(CONFIG_FILE, device, totpSecret),
+    touchDevice: (deviceId) => {
+      try { touchDevice(CONFIG_FILE, deviceId); } catch (e) { ctx.logger.warn(`Could not save last-seen for device ${deviceId}: ${(e as Error).message}`); }
+    },
     consumeBackupCode: (hash) => {
       const consumed = removeBackupCode(CONFIG_FILE, hash);
       if (consumed) ctx.logger.warn(`Browser ${connectionId} logged in with a backup code`);
       return consumed;
     },
-    onAuthenticated: () => {
+    onAuthenticated: ({ deviceId, label, paired }) => {
       // Auth succeeded — add to broadcast clients and inform gateway
+      if (paired) {
+        // Tell the browsers that are already in: a device they did not pair would show up here
+        ctx.logger.warn(`New device paired: "${label}" (${deviceId}) on ${connectionId}`);
+        broadcastToClients({ type: 'device-paired', deviceId, label, at: new Date().toISOString() });
+      }
       connectedClients.set(connectionId, dc);
-      ctx.logger.info(`Browser authenticated: ${connectionId}`);
+      ctx.logger.info(`Browser authenticated: ${connectionId} (${label})`);
     },
     onMessage: (msg) => processAuthenticatedMessage(dc, connectionId, msg, ctx),
     onLoginFailure: (reason) => {
@@ -762,11 +782,11 @@ function setupDataChannelHandler(
       broadcastToClients({ type: 'auth-attempt-failed', reason, at: new Date().toISOString() });
     },
     log: ctx.logger,
-  });
+  }, dtls);
 }
 
 /**
- * Browsers that logged in under secrets the config no longer has (`reauth`, `reset`, a deleted
+ * Browsers whose device the config no longer has (`devices revoke`, `reauth`, `reset`, a deleted
  * config) are signed out. Polls the file's stat, so atomic renames and deletion are both seen.
  */
 let configWatcher: ((curr: fs.Stats, prev: fs.Stats) => void) | null = null;
@@ -775,10 +795,10 @@ function watchConfigForRevocation(ctx: PluginServiceContext): void {
   configWatcher = () => {
     for (const id of revokeStaleChannels(readAuthConfig(CONFIG_FILE))) {
       connectedClients.delete(id);
-      ctx.logger.warn(`Browser ${id} signed out: ClawChats login settings changed (reauth/reset)`);
+      ctx.logger.warn(`Browser ${id} signed out: its device was revoked or the ClawChats login settings changed (devices revoke/reauth/reset)`);
     }
   };
-  fs.watchFile(CONFIG_FILE, { interval: 2000, persistent: false }, configWatcher);
+  fs.watchFile(CONFIG_FILE, { interval: 1000, persistent: false }, configWatcher);
 }
 
 /**
@@ -1229,6 +1249,7 @@ async function enrollTotp(config: PluginConfig): Promise<boolean> {
         enabledAt: new Date().toISOString(),
       };
       c.sessionSecret = sessionSecret;
+      c.devices = []; // new secrets: every browser pairs again
       c.backupCodeHashes = hashes;
       c.schemaVersion = 2;
       delete c.totpPending;
@@ -1301,6 +1322,30 @@ async function handleShowTotp(): Promise<void> {
   console.log('  2. On the new machine: openclaw clawchats setup <token>');
   console.log('  3. When prompted for a TOTP secret, paste the value above');
   console.log('');
+}
+
+/** `openclaw clawchats devices [revoke <id|label>]` */
+async function handleDevices(action?: string, target?: string): Promise<void> {
+  const out = (line: string) => console.log(line);
+  if (action === undefined) { listDevices(CONFIG_FILE, out); return; }
+  if (action !== 'revoke' || !target) {
+    console.error('Usage: openclaw clawchats devices            (list paired browsers)');
+    console.error('       openclaw clawchats devices revoke <id|label>');
+    process.exitCode = 1;
+    return;
+  }
+  if (!revokeDevice(CONFIG_FILE, target, out)) process.exitCode = 1;
+}
+
+/** `openclaw clawchats show-fingerprint`: read from peer-key.json, never creating it. */
+async function handleShowFingerprint(): Promise<void> {
+  let publicKey: string | null = null;
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(CONFIG_DIR, 'data', 'peer-key.json'), 'utf8')) as { privateKey: string };
+    publicKey = crypto.createPublicKey(crypto.createPrivateKey({ key: Buffer.from(saved.privateKey, 'base64'), format: 'der', type: 'pkcs8' }))
+      .export({ format: 'der', type: 'spki' }).toString('base64');
+  } catch { /* no key yet */ }
+  if (!showFingerprint(publicKey, (line) => console.log(line))) process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1387,6 +1432,7 @@ async function handleVerifyTotp(code: string): Promise<void> {
       enabledAt: new Date().toISOString(),
     };
     c.sessionSecret = sessionSecret;
+    c.devices = []; // new secrets: every browser pairs again
     c.backupCodeHashes = hashes;
     c.schemaVersion = 2;
     delete c.totpPending;
@@ -1422,13 +1468,13 @@ async function handleReauth(): Promise<void> {
 
   console.log('🔐 Re-initializing ClawChats authentication...');
   console.log('');
-  console.log('  ⚠️  This will invalidate all existing sessions.');
-  console.log('  All connected browsers will need to re-authenticate.');
+  console.log('  ⚠️  This will unpair every browser.');
+  console.log('  All connected browsers will need to pair again with a code.');
   console.log('');
 
   const success = await enrollTotp(config);
   if (success) {
-    console.log('  All previous sessions have been invalidated.');
+    console.log('  All paired browsers have been removed.');
     console.log('  Restart the gateway for changes to take effect: systemctl --user restart openclaw-gateway');
   }
 }
@@ -1671,6 +1717,14 @@ const plugin: OpenClawPluginDefinition = {
       cmd.command('show-totp')
         .description('Show your TOTP secret (use when adding ClawChats to a second gateway)')
         .action(() => handleShowTotp());
+
+      cmd.command('devices [action] [target]')
+        .description('List the browsers paired with this gateway; "devices revoke <id|label>" signs one out and unpairs it')
+        .action((action: unknown, target: unknown) => handleDevices(action === undefined ? undefined : String(action), target === undefined ? undefined : String(target)));
+
+      cmd.command('show-fingerprint')
+        .description("Show this connector's key fingerprint, to compare with the one ClawChats shows when you pair a browser")
+        .action(() => handleShowFingerprint());
 
       cmd.command('reset')
         .description('Disconnect and remove all ClawChats data')

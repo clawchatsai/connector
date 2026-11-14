@@ -10,8 +10,9 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { PluginConfig } from './plugin-config.js';
+import type { PluginConfig, PairedDevice } from './plugin-config.js';
 import type { AuthConfig } from './auth-handler.js';
+import { deviceIdOf, isEd25519Spki } from './channel-binding.js';
 
 /**
  * Write a file so readers see either the old or the new content, never a partial one.
@@ -105,9 +106,9 @@ const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0
 
 /**
  * The browser login settings, freshly read from disk. Only a complete schemaVersion 2 config
- * with TOTP and a session secret allows logins; anything else refuses every browser.
+ * with TOTP and a session secret allows logins (the session secret is no longer used to log in; it stays so a rollback finds a valid config); anything else refuses every browser.
  */
-export function readAuthConfig(file: string, devMode = false): AuthConfigResult {
+export function readAuthConfig(file: string): AuthConfigResult {
   const cfg = readConfig(file);
   if (!cfg) return { ok: false, reason: fs.existsSync(file) ? 'invalid' : 'missing' };
   if (!cfg.totp && !cfg.sessionSecret && (cfg.schemaVersion === undefined || cfg.schemaVersion < 2)) {
@@ -120,7 +121,8 @@ export function readAuthConfig(file: string, devMode = false): AuthConfigResult 
     || !isStr(cfg.sessionSecret) || !/^[0-9a-f]{64}$/i.test(cfg.sessionSecret)
     || (cfg.backupCodeHashes !== undefined && (!Array.isArray(cfg.backupCodeHashes) || !cfg.backupCodeHashes.every(isStr)))
     || (g !== undefined && (!g || typeof g !== 'object' || typeof g.clientId !== 'string'
-      || typeof g.authorizedSub !== 'string' || typeof g.authorizedEmail !== 'string'))) {
+      || typeof g.authorizedSub !== 'string' || typeof g.authorizedEmail !== 'string'))
+    || (cfg.devices !== undefined && !Array.isArray(cfg.devices))) {
     return { ok: false, reason: 'invalid' };
   }
   return {
@@ -128,19 +130,60 @@ export function readAuthConfig(file: string, devMode = false): AuthConfigResult 
     config: {
       userId: cfg.userId,
       totp: t,
-      // No Google identity bound (dev installs): placeholder, Google check skipped
-      google: g ?? { clientId: 'dev-placeholder', authorizedSub: 'dev-placeholder', authorizedEmail: 'dev@localhost' },
-      sessionSecret: cfg.sessionSecret,
       backupCodeHashes: cfg.backupCodeHashes,
-      devMode,
+      // A malformed entry is a device that cannot log in, not a reason to refuse everyone
+      devices: (cfg.devices ?? []).filter(isDevice),
     },
   };
 }
 
+const isDevice = (d: unknown): d is PairedDevice => {
+  const x = d as PairedDevice;
+  return !!x && typeof x === 'object' && isStr(x.deviceId) && isEd25519Spki(x.pubkey) && x.deviceId === deviceIdOf(x.pubkey)
+    && typeof x.label === 'string' && typeof x.createdAt === 'string' && typeof x.lastSeen === 'string';
+};
+
+/** The most browsers one connector pairs with. */
+export const MAX_DEVICES = 20;
+
 /**
- * Identifies the login secrets a browser authenticated under. It changes on `reauth` (new TOTP
- * secret and session secret) and authenticated connections from before are then closed.
+ * Pair a device (or refresh the label of one that is already paired): re-reads the config, so
+ * nothing else in it is overwritten. 'full' = MAX_DEVICES others are already paired; 'gone' = no
+ * config; 'stale' = the TOTP secret is no longer the one the pairing code was checked against
+ * (a `reauth` ran in between).
  */
-export function authEpoch(config: AuthConfig): string {
-  return crypto.createHash('sha256').update(`${config.sessionSecret}\n${config.totp.secret}`).digest('hex').slice(0, 32);
+export function addDevice(file: string, device: PairedDevice, totpSecret: string): 'ok' | 'full' | 'gone' | 'stale' {
+  let result: 'ok' | 'full' | 'stale' = 'ok';
+  const saved = updateConfig(file, (cfg) => {
+    if (cfg.totp?.secret !== totpSecret) { result = 'stale'; return false; }
+    const all = Array.isArray(cfg.devices) ? cfg.devices : [];
+    const before = all.find(d => d.deviceId === device.deviceId);
+    const list = all.filter(d => d.deviceId !== device.deviceId);
+    if (list.length >= MAX_DEVICES) { result = 'full'; return false; }
+    result = 'ok';
+    list.push(before ? { ...device, createdAt: before.createdAt } : device);
+    cfg.devices = list;
+  });
+  return saved ? result : 'gone';
+}
+
+/** Remove the devices `match` selects; returns them. Re-reads the config first. */
+export function removeDevices(file: string, match: (d: PairedDevice) => boolean): PairedDevice[] {
+  let removed: PairedDevice[] = [];
+  updateConfig(file, (cfg) => {
+    const list = Array.isArray(cfg.devices) ? cfg.devices : [];
+    removed = list.filter(match);
+    if (!removed.length) return false;
+    cfg.devices = list.filter(d => !match(d));
+  });
+  return removed;
+}
+
+/** Record that a device logged in (rewrites only that device's lastSeen). */
+export function touchDevice(file: string, deviceId: string, at = new Date().toISOString()): void {
+  updateConfig(file, (cfg) => {
+    const d = (Array.isArray(cfg.devices) ? cfg.devices : []).find(x => x.deviceId === deviceId);
+    if (!d) return false;
+    d.lastSeen = at;
+  });
 }

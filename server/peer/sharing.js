@@ -194,6 +194,8 @@ export class SharingManager {
       const presented = s.as === 'owner' ? s.requester?.pubKey : s.owner?.pubKey;
       const pinned = this._gatewayKey(this._other(s).gatewayId);
       out.keyChanged = !!(presented && pinned && presented !== pinned);
+      // What "Trust new key" would accept, as fingerprints to compare with the contact out of band.
+      if (out.keyChanged) out.keyChange = { was: fingerprint(pinned), now: fingerprint(presented) };
       return out;
     });
   }

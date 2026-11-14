@@ -92,7 +92,7 @@ src/                      # OpenClaw plugin wrapper (TypeScript)
 
 **Session cleanup:** When a thread or workspace is deleted, the plugin removes the associated OpenClaw session files (`.jsonl`) to prevent stale context. These are files created by the gateway itself during that session.
 
-**Auth:** The DataChannel connection is authenticated with TOTP + Google session token before any data is processed. The HTTP API uses a local bearer token (set via `CLAWCHATS_AUTH_TOKEN` or `config.js`). No credentials are sent to external servers.
+**Auth:** Before any data is processed, the connector proves its identity to the browser (a signature over the WebRTC connection's DTLS fingerprints, made with the connector's own key), then the browser logs in by signing the same data with its device key. A new browser pairs once with a TOTP or backup code. There is no session token. Manage paired browsers with `openclaw clawchats devices` and `openclaw clawchats devices revoke <id|label>`; compare the connector key with `openclaw clawchats show-fingerprint`. The HTTP API uses a local bearer token (set via `CLAWCHATS_AUTH_TOKEN` or `config.js`). No credentials are sent to external servers.
 
 **No shell execution:** The plugin contains no `exec`, `spawn`, or shell calls. SQLite is handled by Node's built-in `node:sqlite` module — no native binary compilation required.
 

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Database } from '../bootstrap/native.js';
 import { SharingManager, defangLocalPaths } from './sharing.js';
-import { loadOrCreatePeerKey } from './keys.js';
+import { loadOrCreatePeerKey, fingerprint } from './keys.js';
 import { GUEST_TOOLS } from './guest-agent.js';
 
 const quiet = { warn() {}, info() {} };
@@ -695,6 +695,8 @@ test('a contact\'s key is pinned to their gateway: another share can\'t bring a 
   s.req.setShares([{ ...active, as: 'requester' }, { ...forged, as: 'requester' }]);
   assert.deepEqual(s.req.remoteAgents().map(a => a.agentId), ['peer:sh1:jarvis'], 'the second key for gwK is refused');
   assert.equal(s.req.list().find(x => x.id === 'sh2').keyChanged, true);
+  assert.deepEqual(s.req.list().find(x => x.id === 'sh2').keyChange, { was: fingerprint(active.owner.pubKey), now: fingerprint(evil.publicKey) });
+  assert.equal(s.req.list().find(x => x.id === 'sh1').keyChange, undefined);
 
   // Owner side: a new request from Houman's gateway carrying another key is refused too.
   s.owner.setShares([{ ...active, as: 'owner' }, { ...active, id: 'sh3', status: 'pending', grant: null, signature: null, requester: { ...active.requester, pubKey: evil.publicKey }, as: 'owner' }]);

@@ -1,24 +1,32 @@
 /**
- * auth-handler.ts — DataChannel authentication gate
+ * auth-handler.ts — DataChannel authentication gate (device keys, authVersion 2)
  *
  * Every browser DataChannel goes through attachBrowserChannel() before anything else sees it:
  * 1. Refuse (message + close) unless the config on disk is complete with TOTP set up
- * 2. Send auth-required with nonce
- * 3. Wait for auth-session (cached JWT) or auth-full (Google + TOTP), validating every field
+ * 2. Send auth-required: a random nonce, this connector's public key, and its signature over the
+ *    channel (nonce, connection id, both DTLS fingerprints). The browser checks that first, so
+ *    it never sends anything to a relay that terminated DTLS on its own.
+ * 3. Wait for auth-device (a paired browser signing the same channel data with its device key)
+ *    or auth-pair (a new browser: its public key, proven with a TOTP/backup code that is bound
+ *    to the channel and never sent), validating every field
  * 4. Verify against the config as it is on disk at that moment
- * 5. Issue session token on success; only then are messages handed to the request handlers
+ * 5. Only then are messages handed to the request handlers
+ * There is no bearer token: nothing a browser sends can be replayed on another channel.
  * A channel that does not log in within 60 s, fails too often or sends malformed login
- * messages is closed. Login failures and lockouts survive a restart (auth-state.json).
+ * messages is closed. Failed pairings and failed device signatures count towards a lockout that
+ * survives a restart (auth-state.json).
  *
- * Spec: datachannel-auth-totp.md §4
+ * Spec: specs/device-keys-auth.md (clawchats repo)
  */
 
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
-import { verifyTotp, verifyBackupCode } from './totp.js';
-import { verifyGoogleIdToken, clearJWKSCache } from './google-jwt.js';
-import { issueSessionToken, verifySessionToken } from './session-token.js';
-import { authEpoch, writeFileAtomic, type AuthConfigResult } from './config-store.js';
+import { totpCandidates } from './totp.js';
+import { writeFileAtomic, MAX_DEVICES, type AuthConfigResult } from './config-store.js';
+import type { PairedDevice } from './plugin-config.js';
+import {
+  AUTH_VERSION, transcript, deviceIdOf, verifyEd25519, isEd25519Spki, pairProof, proofEquals, type ChannelBinding,
+} from './channel-binding.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,15 +41,9 @@ export interface AuthConfig {
     period: number;
     enabledAt: string;
   };
-  google: {
-    clientId: string;
-    authorizedSub: string;
-    authorizedEmail: string;
-  };
-  sessionSecret: string;
   backupCodeHashes?: string[];
-  /** When true, skip Google ID token verification (accept 'dev-mode-no-google'). */
-  devMode?: boolean;
+  /** Paired browsers. */
+  devices: PairedDevice[];
 }
 
 /** The DataChannel surface the gate needs (webrtc-peer.ts DataChannelLike). */
@@ -52,16 +54,28 @@ export interface AuthChannel {
   onClosed(handler: () => void): void;
 }
 
+/** DTLS fingerprints of the two certificates on this connection, from the SDPs (64 hex digits each). */
+export interface DtlsFingerprints {
+  browser: string;
+  connector: string;
+}
+
 export interface BrowserChannelHooks {
   /** Fresh read of the login settings from disk. Called on open and again at every verification. */
   loadAuthConfig: () => AuthConfigResult;
   /** Remove one backup code (by hash) from the config on disk; false if it is no longer there. */
   consumeBackupCode: (hash: string) => boolean;
-  /** The channel logged in. */
-  onAuthenticated: () => void;
+  /** This connector's identity (server/peer/keys.js): the public key (SPKI base64) and Ed25519 signing. */
+  connectorKey: { publicKey: string; sign: (data: string) => string };
+  /** Save a newly paired device in the config on disk, if its TOTP secret is still `totpSecret` (the one the code was checked against). */
+  addDevice: (device: PairedDevice, totpSecret: string) => 'ok' | 'full' | 'gone' | 'stale';
+  /** A paired device logged in (updates its lastSeen; failures are not the login's problem). */
+  touchDevice: (deviceId: string) => void;
+  /** The channel logged in. `paired`: this login added the device. */
+  onAuthenticated: (info: { deviceId: string; label: string; paired: boolean }) => void;
   /** A message on a logged-in channel. Errors (thrown or rejected) are logged, never propagated. */
   onMessage: (msg: Record<string, unknown>) => void | Promise<void>;
-  /** A wrong TOTP / backup code was tried (for telling already logged-in browsers). */
+  /** A wrong code or signature was tried (for telling already logged-in browsers). */
   onLoginFailure?: (reason: string) => void;
   log: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void };
 }
@@ -70,11 +84,11 @@ interface ChannelState {
   connectionId: string;
   dc: AuthChannel;
   status: 'pending' | 'authenticated' | 'closed';
-  nonce: string;
+  binding: ChannelBinding | null;
   failCount: number;
   timer?: ReturnType<typeof setTimeout>;
-  /** authEpoch() of the config this channel logged in under. */
-  epoch?: string;
+  /** The device this channel logged in as. */
+  device?: { deviceId: string; pubkey: string };
   /** Pre-auth messages are handled one at a time, in order. */
   chain: Promise<void>;
 }
@@ -89,8 +103,8 @@ export const MAX_PENDING_CHANNELS = 10;
 export const AUTH_TIMEOUT_MS = 60_000; // enough time to open authenticator app and enter code
 const MAX_FAILURES = 5; // per channel, then it is closed
 const MAX_PREAUTH_MESSAGE_LENGTH = 16 * 1024;
-const MAX_TOKEN_LENGTH = 8 * 1024; // Google ID tokens and session JWTs are ~1-2 KB
-const MAX_CODE_LENGTH = 64;
+const MAX_SIG_LENGTH = 200; // Ed25519 signatures are 88 base64 characters
+const MAX_LABEL_LENGTH = 64;
 const GLOBAL_MAX_FAILURES = 5;
 const GLOBAL_LOCKOUT_BASE_MS = 60_000; // doubles per consecutive lockout
 const GLOBAL_LOCKOUT_MAX_MS = 60 * 60_000;
@@ -101,6 +115,13 @@ const SETUP_MESSAGES: Record<'missing' | 'needs-2fa' | 'invalid', string> = {
   missing: 'ClawChats is not set up on your gateway. Run "openclaw clawchats setup <token>" on your gateway machine.',
 };
 
+/**
+ * What a browser that still has the old login (session tokens, authVersion 1) is told. It shows
+ * a gateway's `auth-required-setup` text as is; its "reconnect" button reloads the page, which
+ * fetches the new frontend. (Other `auth-failed` reasons it does not know are silently ignored.)
+ */
+const OLD_FRONTEND_MESSAGE = 'This connector was updated and your browser still has the old ClawChats app. Reload the page (Ctrl+Shift+R) to get the new version, then pair this browser with a code from your authenticator app.';
+
 // ---------------------------------------------------------------------------
 // Module state
 // ---------------------------------------------------------------------------
@@ -108,7 +129,7 @@ const SETUP_MESSAGES: Record<'missing' | 'needs-2fa' | 'invalid', string> = {
 const channels = new Set<ChannelState>();
 
 /**
- * Gateway-wide TOTP lockout and replay guard. Per-channel limits alone reset on every
+ * Gateway-wide code lockout and replay guard. Per-channel limits alone reset on every
  * reconnect, so failures are also counted across all channels, and kept across restarts.
  */
 interface PersistedAuthState {
@@ -147,14 +168,21 @@ function saveAuthState(): void {
 /**
  * Put a new browser DataChannel behind the login gate. Nothing reaches hooks.onMessage
  * before the channel has logged in.
+ * @param dtls both certificates' fingerprints as this side sees them in the SDPs; without both
+ *             the channel cannot be bound and is refused.
  */
-export function attachBrowserChannel(dc: AuthChannel, connectionId: string, hooks: BrowserChannelHooks): void {
-  const ch: ChannelState = { connectionId, dc, status: 'pending', nonce: '', failCount: 0, chain: Promise.resolve() };
+export function attachBrowserChannel(dc: AuthChannel, connectionId: string, hooks: BrowserChannelHooks, dtls?: DtlsFingerprints): void {
+  const ch: ChannelState = { connectionId, dc, status: 'pending', binding: null, failCount: 0, chain: Promise.resolve() };
   dc.onClosed(() => detach(ch));
 
   const cfg = hooks.loadAuthConfig();
   if (!cfg.ok) {
     refuseSetup(ch, cfg.reason, hooks);
+    return;
+  }
+  if (!dtls?.browser || !dtls.connector) {
+    hooks.log.warn(`Browser ${connectionId} refused: could not read the DTLS fingerprints from the SDP`);
+    refuse(ch, { type: 'auth-failed', reason: 'no_channel_binding' });
     return;
   }
   if (pendingCount() >= MAX_PENDING_CHANNELS) {
@@ -164,26 +192,40 @@ export function attachBrowserChannel(dc: AuthChannel, connectionId: string, hook
   }
 
   channels.add(ch);
-  ch.nonce = crypto.randomBytes(32).toString('hex');
+  const { publicKey, sign } = hooks.connectorKey;
+  ch.binding = {
+    nonce: crypto.randomBytes(32).toString('hex'),
+    connectionId,
+    browserFp: dtls.browser,
+    connectorFp: dtls.connector,
+    connectorPub: publicKey,
+  };
   ch.timer = setTimeout(() => {
     if (ch.status === 'pending') refuse(ch, { type: 'auth-failed', reason: 'auth_timeout' });
   }, AUTH_TIMEOUT_MS);
   ch.timer.unref?.();
   dc.onMessage((data: string) => onData(ch, data, hooks));
-  dc.send(JSON.stringify({ type: 'auth-required', nonce: ch.nonce }));
+  dc.send(JSON.stringify({
+    type: 'auth-required',
+    authVersion: AUTH_VERSION,
+    nonce: ch.binding.nonce,
+    connectorKey: publicKey,
+    connectorSig: sign(transcript('connector', ch.binding)),
+  }));
 }
 
 /**
- * The config on disk changed: close logged-in channels whose login secrets are gone
- * (`reauth`, `reset`, a deleted or broken config). Returns their connection ids.
+ * The config on disk changed: close logged-in channels whose device is no longer paired
+ * (`devices revoke`, `reauth`, `reset`, a deleted or broken config). Returns their connection ids.
  */
 export function revokeStaleChannels(current: AuthConfigResult): string[] {
-  const epoch = current.ok ? authEpoch(current.config) : null;
   const revoked: string[] = [];
   for (const ch of [...channels]) {
-    if (ch.status === 'authenticated' && ch.epoch !== epoch) {
-      // invalid_session: the browser forgets its session token and asks for a new login
-      refuse(ch, { type: 'auth-failed', reason: 'invalid_session' });
+    if (ch.status !== 'authenticated') continue;
+    const still = current.ok && current.config.devices.some(d => d.deviceId === ch.device?.deviceId && d.pubkey === ch.device?.pubkey);
+    if (!still) {
+      // device_revoked: the browser asks for a new pairing
+      refuse(ch, { type: 'auth-failed', reason: 'device_revoked' });
       revoked.push(ch.connectionId);
     }
   }
@@ -237,40 +279,45 @@ async function handlePreAuth(ch: ChannelState, data: string, hooks: BrowserChann
   }
   if (!isObject(msg)) return refuseMalformed(ch, hooks, 'not a JSON object or too large');
 
-  if (msg['type'] === 'auth-session') return authSession(ch, msg, hooks);
-  if (msg['type'] === 'auth-full') return authFull(ch, msg, hooks);
+  if (msg['type'] === 'auth-device') return authDevice(ch, msg, hooks);
+  if (msg['type'] === 'auth-pair') return authPair(ch, msg, hooks);
+  if (msg['type'] === 'auth-session' || msg['type'] === 'auth-full') {
+    // The old login. Never honoured, whatever it carries.
+    hooks.log.warn(`Browser ${ch.connectionId} refused: it uses the old login (session token); it needs the new ClawChats app`);
+    return refuse(ch, { type: 'auth-required-setup', message: OLD_FRONTEND_MESSAGE });
+  }
   // Anything else before login is dropped: it never reaches a request handler.
 }
 
-async function authSession(ch: ChannelState, msg: Record<string, unknown>, hooks: BrowserChannelHooks): Promise<void> {
-  const token = msg['sessionToken'];
-  if (typeof token !== 'string' || !token || token.length > MAX_TOKEN_LENGTH) {
-    return refuseMalformed(ch, hooks, 'bad sessionToken');
+/** A paired browser: its signature over this channel, made with the device key. */
+function authDevice(ch: ChannelState, msg: Record<string, unknown>, hooks: BrowserChannelHooks): void {
+  const { deviceId, sig } = msg;
+  if (typeof deviceId !== 'string' || !/^[0-9a-f]{32}$/.test(deviceId) || typeof sig !== 'string' || sig.length > MAX_SIG_LENGTH) {
+    return refuseMalformed(ch, hooks, 'bad auth-device fields');
   }
   const cfg = hooks.loadAuthConfig();
   if (!cfg.ok) return refuseSetup(ch, cfg.reason, hooks);
-  const config = cfg.config;
-  try {
-    verifySessionToken(token, config.sessionSecret, config.userId, config.google.authorizedSub);
-  } catch (e) {
-    // On expired session, don't count as failure — just prompt for full auth
-    if ((e as Error).message === 'expired_session') {
-      ch.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'expired_session' }));
-      return;
-    }
-    return failure(ch, 'invalid_session');
+  const device = cfg.config.devices.find(d => d.deviceId === deviceId);
+  if (!device) return failure(ch, 'unknown_device'); // revoked, or never paired: the browser offers pairing
+  if (!verifyEd25519(device.pubkey, transcript('device', ch.binding!, device.pubkey), sig)) {
+    recordGlobalFailure();
+    hooks.onLoginFailure?.('invalid_signature');
+    return failure(ch, 'invalid_signature');
   }
-  succeed(ch, config, hooks, { type: 'auth-ok' });
+  hooks.touchDevice(device.deviceId);
+  succeed(ch, device, false, hooks);
 }
 
-async function authFull(ch: ChannelState, msg: Record<string, unknown>, hooks: BrowserChannelHooks): Promise<void> {
-  const { idToken, totp, nonce } = msg;
-  if (typeof idToken !== 'string' || idToken.length > MAX_TOKEN_LENGTH
-    || typeof totp !== 'string' || totp.length > MAX_CODE_LENGTH
-    || typeof nonce !== 'string') {
-    return refuseMalformed(ch, hooks, 'bad auth-full fields');
+/** A new browser: its public key, signed, with a proof of the one-time code that is tied to this channel. */
+function authPair(ch: ChannelState, msg: Record<string, unknown>, hooks: BrowserChannelHooks): void {
+  const { devicePub, label, kind, proof, sig } = msg;
+  if (!isEd25519Spki(devicePub)
+    || typeof label !== 'string' || !label.trim() || label.length > MAX_LABEL_LENGTH
+    || (kind !== 'totp' && kind !== 'backup')
+    || typeof proof !== 'string' || !/^[0-9a-f]{64}$/.test(proof)
+    || typeof sig !== 'string' || sig.length > MAX_SIG_LENGTH) {
+    return refuseMalformed(ch, hooks, 'bad auth-pair fields');
   }
-  const sessionDays = typeof msg['sessionDays'] === 'number' && Number.isFinite(msg['sessionDays']) ? msg['sessionDays'] : 7;
 
   // Gateway-wide lockout: refuse without checking anything, so no guess is tested
   if (Date.now() < authState.lockedUntil) {
@@ -278,69 +325,53 @@ async function authFull(ch: ChannelState, msg: Record<string, unknown>, hooks: B
     return;
   }
 
-  if (nonce !== ch.nonce) return failure(ch, 'nonce_mismatch');
-
-  const before = hooks.loadAuthConfig();
-  if (!before.ok) return refuseSetup(ch, before.reason, hooks);
-  const google = before.config.google;
-
-  // Google ID token check. The frontend sends 'signaling-verified' on purpose
-  // (bd29058): login.clawchats.ai already did Google sign-in, so TOTP is the
-  // connector-side factor and the gateway-wide lockout above protects it.
-  const skipGoogle = !google.clientId || google.clientId === 'dev-placeholder'
-    || idToken === 'signaling-verified'
-    || (before.config.devMode && idToken === 'dev-mode-no-google');
-  if (skipGoogle) {
-    console.log('[Auth] Skipping Google ID token verification (TOTP-only auth)');
-  } else {
-    const opts = { clientId: google.clientId, authorizedSub: google.authorizedSub, authorizedEmail: google.authorizedEmail };
-    try {
-      await verifyGoogleIdToken(idToken, opts);
-    } catch (e) {
-      console.error(`[Auth] Google ID token verification failed: ${(e as Error).message}`);
-      // Retry with fresh JWKS on first failure (key rotation)
-      clearJWKSCache();
-      try {
-        await verifyGoogleIdToken(idToken, opts);
-      } catch {
-        return failure(ch, 'invalid_id_token');
-      }
-    }
-  }
-  if (ch.status !== 'pending') return; // closed or timed out while Google was checked
-
-  // Verify against the config on disk now, not the one read before the wait above:
-  // a `reauth` in between must not let the old secrets through.
   const cfg = hooks.loadAuthConfig();
   if (!cfg.ok) return refuseSetup(ch, cfg.reason, hooks);
   const config = cfg.config;
-  if (Date.now() < authState.lockedUntil) { // another channel triggered the lockout meanwhile
-    ch.dc.send(JSON.stringify({ type: 'auth-failed', reason: 'rate_limited' }));
-    return;
+  const deviceId = deviceIdOf(devicePub);
+  if (config.devices.length >= MAX_DEVICES && !config.devices.some(d => d.deviceId === deviceId)) {
+    return failure(ch, 'too_many_devices');
   }
 
-  // Verify TOTP or backup code
-  const totpStep = verifyTotp(totp, config.totp.secret, authState.lastUsedTotpStep);
-  if (totpStep >= 0) {
-    authState.lastUsedTotpStep = totpStep;
-  } else {
-    const backupIndex = config.backupCodeHashes ? verifyBackupCode(totp, config.backupCodeHashes) : -1;
-    // A backup code is one-time: it counts only if it was still on disk and is now removed.
-    if (backupIndex < 0 || !hooks.consumeBackupCode(config.backupCodeHashes![backupIndex])) {
-      recordGlobalFailure();
-      hooks.onLoginFailure?.('invalid_totp');
-      return failure(ch, 'invalid_totp');
+  // The signature proves the sender holds the private half of devicePub and that label and key
+  // were not swapped in transit; the proof below ties the code to this channel and this key.
+  const signed = transcript('pair', ch.binding!, devicePub, label);
+  if (!verifyEd25519(devicePub, signed, sig)) {
+    recordGlobalFailure();
+    hooks.onLoginFailure?.('invalid_signature');
+    return failure(ch, 'invalid_signature');
+  }
+
+  let step = -1;
+  let backupHash: string | null = null;
+  if (kind === 'totp') {
+    for (const cand of totpCandidates(config.totp.secret, authState.lastUsedTotpStep)) {
+      if (proofEquals(pairProof(cand.code, signed), proof)) { step = cand.step; break; }
     }
+  } else {
+    for (const hash of config.backupCodeHashes ?? []) {
+      if (proofEquals(pairProof(hash, signed), proof)) { backupHash = hash; break; }
+    }
+  }
+  if (step >= 0) {
+    authState.lastUsedTotpStep = step;
+  } else if (!backupHash || !hooks.consumeBackupCode(backupHash)) {
+    // A backup code is one-time: it counts only if it was still on disk and is now removed.
+    recordGlobalFailure();
+    hooks.onLoginFailure?.('invalid_code');
+    return failure(ch, 'invalid_code');
   }
   authState.failCount = 0;
   authState.lockoutCount = 0;
   saveAuthState();
 
-  const sessionToken = issueSessionToken(config.userId, config.google.authorizedSub, sessionDays, config.sessionSecret);
-  const expiresAt = new Date(
-    Date.now() + Math.min(Math.max(sessionDays, 1), 30) * 86400 * 1000,
-  ).toISOString();
-  succeed(ch, config, hooks, { type: 'auth-ok', sessionToken, expiresAt });
+  const now = new Date().toISOString();
+  const device: PairedDevice = { deviceId, pubkey: devicePub, label: label.trim(), createdAt: now, lastSeen: now };
+  const added = hooks.addDevice(device, config.totp.secret);
+  if (added === 'gone') return refuseSetup(ch, 'missing', hooks);
+  if (added === 'full') return failure(ch, 'too_many_devices');
+  if (added === 'stale') return failure(ch, 'invalid_code'); // `reauth` ran while the code was being checked
+  succeed(ch, device, true, hooks);
 }
 
 // ---------------------------------------------------------------------------
@@ -357,12 +388,12 @@ function pendingCount(): number {
   return n;
 }
 
-function succeed(ch: ChannelState, config: AuthConfig, hooks: BrowserChannelHooks, ok: Record<string, unknown>): void {
+function succeed(ch: ChannelState, device: PairedDevice, paired: boolean, hooks: BrowserChannelHooks): void {
   if (ch.timer) clearTimeout(ch.timer);
   ch.status = 'authenticated';
-  ch.epoch = authEpoch(config);
-  ch.dc.send(JSON.stringify(ok));
-  hooks.onAuthenticated();
+  ch.device = { deviceId: device.deviceId, pubkey: device.pubkey };
+  ch.dc.send(JSON.stringify({ type: 'auth-ok', deviceId: device.deviceId, label: device.label, paired }));
+  hooks.onAuthenticated({ deviceId: device.deviceId, label: device.label, paired });
 }
 
 /** Wrong credentials: tell the browser; too many on one channel closes it. */
@@ -403,7 +434,7 @@ function recordGlobalFailure(): void {
     authState.lockedUntil = Date.now() + duration;
     authState.lockoutCount++;
     authState.failCount = 0;
-    console.warn(`[Auth] ${GLOBAL_MAX_FAILURES} failed TOTP attempts — full auth locked for ${duration / 1000}s`);
+    console.warn(`[Auth] ${GLOBAL_MAX_FAILURES} failed login attempts — pairing locked for ${duration / 1000}s`);
   }
   saveAuthState();
 }

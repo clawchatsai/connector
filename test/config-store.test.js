@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { writeFileAtomic, updateConfig, readAuthConfig, removeBackupCode, authEpoch } from '../dist/config-store.js';
+import { writeFileAtomic, updateConfig, readAuthConfig, removeBackupCode } from '../dist/config-store.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'cc-cfg-'));
 
@@ -52,7 +52,7 @@ test('updateConfig never overwrites a change another process made while it was w
   fs.rmSync(dir, { recursive: true });
 });
 
-test('readAuthConfig: missing vs damaged vs needs 2FA; epoch follows the secrets', () => {
+test('readAuthConfig: missing vs damaged vs needs 2FA', () => {
   const dir = tmp();
   const file = path.join(dir, 'config.json');
   assert.deepEqual(readAuthConfig(file), { ok: false, reason: 'missing' });
@@ -65,15 +65,11 @@ test('readAuthConfig: missing vs damaged vs needs 2FA; epoch follows the secrets
   fs.writeFileSync(file, JSON.stringify(v2));
   const r = readAuthConfig(file);
   assert.equal(r.ok, true);
-  assert.equal(r.config.google.clientId, 'dev-placeholder');
+  assert.deepEqual(r.config.devices, []);
   fs.writeFileSync(file, JSON.stringify({ ...v2, google: { clientId: 1 } }));
   assert.deepEqual(readAuthConfig(file), { ok: false, reason: 'invalid' });
   fs.writeFileSync(file, JSON.stringify({ ...v2, schemaVersion: 3 }));
   assert.deepEqual(readAuthConfig(file), { ok: false, reason: 'invalid' });
 
-  const e1 = authEpoch(r.config);
-  assert.equal(authEpoch({ ...r.config, backupCodeHashes: [] }), e1);
-  assert.notEqual(authEpoch({ ...r.config, sessionSecret: 'cd'.repeat(32) }), e1);
-  assert.notEqual(authEpoch({ ...r.config, totp: { ...r.config.totp, secret: 'X' } }), e1);
   fs.rmSync(dir, { recursive: true });
 });

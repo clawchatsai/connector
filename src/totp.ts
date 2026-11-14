@@ -78,6 +78,22 @@ export function verifyTotp(
 }
 
 /**
+ * The codes that are valid now (T-1, T, T+1, newest first) and not yet used, with their time
+ * steps. For a login that proves knowledge of the code without sending it (device pairing).
+ */
+export function totpCandidates(secretBase32: string, lastUsedStep: number): Array<{ step: number; code: string }> {
+  const secret = base32Decode(secretBase32);
+  const currentStep = Math.floor(Date.now() / 1000 / PERIOD);
+  const out: Array<{ step: number; code: string }> = [];
+  for (const offset of [1, 0, -1]) {
+    const step = currentStep + offset;
+    if (step <= lastUsedStep) continue; // replay protection
+    out.push({ step, code: generateForStep(secret, step) });
+  }
+  return out;
+}
+
+/**
  * Generate a random 20-byte TOTP secret, returned as base32.
  */
 export function generateTotpSecret(): string {
