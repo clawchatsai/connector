@@ -63,23 +63,26 @@ class FakeReq extends Readable {
         // Raw text string (e.g. file content) — push as-is without JSON wrapping
         this.push(parsed['data'] as string);
       } else if (parsed && (parsed as Record<string, unknown>)['_multipart']) {
-        // Multipart form data: { _multipart: true, fields: { key: string | { filename, contentType, data } } }
+        // Multipart form data: { _multipart: true, fields: { key: Entry | Entry[] } } where
+        // Entry = string | { filename, contentType, data }. An array is a repeated key (many files).
         const boundary = '----ClawChatsBoundary' + Date.now();
         this.headers['content-type'] = `multipart/form-data; boundary=${boundary}`;
         const fields = (parsed['fields'] as Record<string, unknown>) || {};
         const parts: Buffer[] = [];
-        for (const [key, value] of Object.entries(fields)) {
-          if (value && typeof value === 'object' && (value as Record<string, unknown>)['filename']) {
-            const f = value as { filename: string; contentType: string; data: string };
-            parts.push(Buffer.from(
-              `--${boundary}\r\nContent-Disposition: form-data; name="${key}"; filename="${f.filename}"\r\nContent-Type: ${f.contentType}\r\n\r\n`
-            ));
-            parts.push(Buffer.from(f.data, 'base64'));
-            parts.push(Buffer.from('\r\n'));
-          } else {
-            parts.push(Buffer.from(
-              `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${String(value)}\r\n`
-            ));
+        for (const [key, raw] of Object.entries(fields)) {
+          for (const value of Array.isArray(raw) ? raw : [raw]) {
+            if (value && typeof value === 'object' && (value as Record<string, unknown>)['filename']) {
+              const f = value as { filename: string; contentType: string; data: string };
+              parts.push(Buffer.from(
+                `--${boundary}\r\nContent-Disposition: form-data; name="${key}"; filename="${f.filename}"\r\nContent-Type: ${f.contentType}\r\n\r\n`
+              ));
+              parts.push(Buffer.from(f.data, 'base64'));
+              parts.push(Buffer.from('\r\n'));
+            } else {
+              parts.push(Buffer.from(
+                `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${String(value)}\r\n`
+              ));
+            }
           }
         }
         parts.push(Buffer.from(`--${boundary}--\r\n`));
