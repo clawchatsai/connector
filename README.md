@@ -34,14 +34,29 @@ The signaling server only facilitates the handshake. After step 4, it is out of 
 Requires OpenClaw 2026.9.7 or newer on the machine that runs your gateway.
 
 ```bash
-openclaw plugins install @clawchatsai/connector
+openclaw plugins install npm:@clawchatsai/connector
 ```
+
+Keep the `npm:` prefix: since OpenClaw 2026.11, a package name without a prefix is looked up only on
+ClawHub, and the install fails with "Package not found on ClawHub".
 
 The gateway loads the plugin right away; no restart is needed. OpenClaw warns that the package is
 outside ClawHub review — answer `y` to continue (pass `--force` in scripts).
 
 Install while your gateway is running. If it is not, OpenClaw installs locally instead and asks you to
 re-run the same command with `--accept-capabilities` after reviewing what the plugin declares.
+
+If the install fails with "This operation requires exclusive offline state ownership", stop the
+gateway, install, and start it again:
+
+```bash
+openclaw gateway stop
+openclaw plugins install npm:@clawchatsai/connector
+openclaw gateway start
+```
+
+If `gateway stop` doesn't release it, stop the gateway the way it was started (for example
+`systemctl --user stop openclaw-gateway`, or your container's stop command).
 
 Then connect it to your ClawChats account:
 
