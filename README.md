@@ -46,18 +46,6 @@ outside ClawHub review — answer `y` to continue (pass `--force` in scripts).
 Install while your gateway is running. If it is not, OpenClaw installs locally instead and asks you to
 re-run the same command with `--accept-capabilities` after reviewing what the plugin declares.
 
-If the install fails with "This operation requires exclusive offline state ownership", stop the
-gateway, install, and start it again:
-
-```bash
-openclaw gateway stop
-openclaw plugins install npm:@clawchatsai/connector
-openclaw gateway start
-```
-
-If `gateway stop` doesn't release it, stop the gateway the way it was started (for example
-`systemctl --user stop openclaw-gateway`, or your container's stop command).
-
 Then connect it to your ClawChats account:
 
 1. Open [app.clawchats.ai](https://app.clawchats.ai), sign in, and choose **Connect a gateway**.
