@@ -294,3 +294,43 @@ test('a patched session tells the team coordinator (a renamed room reaches its c
   l.sessionsChanged({ sessionKey: CHAT, reason: 'patch', label: 'New name' });
   assert.deepEqual(patched, [CHAT]);
 });
+
+test('onboarding chat: an agent created from ClawChats shows its main session; other main sessions stay hidden', () => {
+  const store = new Map();
+  const extras = {
+    listThreadExtraKeys: kind => [...store].filter(([, v]) => v.kind === kind).map(([k]) => k),
+    setThreadExtra: (key, kind) => store.set(key, { kind }),
+    deleteThreadExtras: key => store.delete(key),
+  };
+  const { l } = lens(extras);
+  const MAIN = 'agent:bot-1:main';
+  const rowOf = key => ({ key, kind: 'direct', updatedAt: 1, label: 'Scout' });
+  assert.equal(l.isVisible(MAIN), false);
+  assert.equal(l.outbound(JSON.stringify({ type: 'req', id: 'c1', method: 'agents.create', params: { name: 'Scout', onboarding: true } })) !== null, true);
+  l.response({ type: 'res', id: 'c1', ok: true, payload: { ok: true, agentId: 'bot-1', name: 'Scout', onboarding: { sessionKey: MAIN, status: 'completed' } } });
+  assert.ok(l.isVisible(MAIN));
+  assert.ok(l.forwardsRunEvent(MAIN));
+  assert.deepEqual(l._filterList({ sessions: [rowOf(MAIN), rowOf('agent:main:main')] }).sessions.map(r => r.key), [MAIN]);
+  assert.ok(l.sessionsChanged({ sessionKey: MAIN, reason: 'patch', session: rowOf(MAIN) }));
+  // A reply without an onboarding chat (gateway 2026.9) or a refusal adds nothing.
+  l.outbound(JSON.stringify({ type: 'req', id: 'c2', method: 'agents.create', params: { name: 'Old' } }));
+  l.response({ type: 'res', id: 'c2', ok: true, payload: { ok: true, agentId: 'old', name: 'Old' } });
+  l.outbound(JSON.stringify({ type: 'req', id: 'c3', method: 'agents.create', params: { name: 'Bad', onboarding: true } }));
+  l.response({ type: 'res', id: 'c3', ok: false, error: { message: 'model unavailable' } });
+  assert.deepEqual([...l.onboarding], [MAIN]);
+  // It survives a restart (kept in extras) and goes with the agent.
+  const again = lens(extras).l;
+  assert.ok(again.isVisible(MAIN));
+  again.outbound(JSON.stringify({ type: 'req', id: 'd1', method: 'agents.delete', params: { agentId: 'bot-1', deleteFiles: true } }));
+  again.response({ type: 'res', id: 'd1', ok: true, payload: { ok: true, agentId: 'bot-1', removedBindings: 0 } });
+  assert.equal(again.isVisible(MAIN), false);
+  assert.equal(store.size, 0);
+  // Deleting the session itself also forgets it, and the browser hears about the delete.
+  l.addOnboardingChat('agent:bot-2:main');
+  const f = l.sessionsChanged({ sessionKey: 'agent:bot-2:main', reason: 'delete' });
+  assert.equal(f.payload.reason, 'delete');
+  assert.equal(l.isVisible('agent:bot-2:main'), false);
+  // Only main-session keys qualify.
+  l.addOnboardingChat('agent:main:discord:channel:1');
+  assert.equal(l.isVisible('agent:main:discord:channel:1'), false);
+});

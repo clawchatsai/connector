@@ -124,6 +124,11 @@ export function createExtrasStore(getGlobalDb) {
         .run(sessionKey, kind, JSON.stringify(data), Date.now());
     },
 
+    /** Session keys that have an extra of `kind` (e.g. the onboarding chats SessionLens shows). */
+    listThreadExtraKeys(kind) {
+      return db().prepare('SELECT session_key FROM thread_extras WHERE kind = ?').all(kind).map(r => r.session_key);
+    },
+
     deleteThreadExtras(sessionKey) {
       if (!sessionKey) return;
       db().prepare('DELETE FROM thread_extras WHERE session_key = ?').run(sessionKey);

@@ -17,6 +17,11 @@
 // Team chat working sessions (server/team.js) are hidden too, but their run events are
 // forwarded: the room shows each agent's reply streaming.
 //
+// Onboarding chats: an agent created from ClawChats with `agents.create { onboarding: true }` (gateway 2026.11.5+)
+// greets and asks for its role in its main session `agent:<id>:main`, which is otherwise hidden. The lens learns
+// that key from the create reply and shows it as a chat (kept in thread_extras, kind `onboarding`, so it survives
+// restarts and goes when the session or the agent is deleted). Other main sessions stay hidden.
+//
 // Spawned children (sessions_spawn: hidden `agent:<id>:subagent:<id>` runs and `visible: true`
 // dashboard sessions) are visible when their parent chain reaches a visible chat; the browser
 // nests them under it (Control UI session tree). Their rows carry `ccParentKey`, the parent the
@@ -28,6 +33,7 @@ const UTILITY_MARK = '__clawchats_';
 const MAIN_SESSION_KEY = /^agent:[^:]+:main$/;
 const SUBAGENT_KEY = /^agent:[^:]+:subagent:[^:]+$/;
 const MAX_CHILD_DEPTH = 8;
+const ONBOARDING = 'onboarding';
 
 // Session row fields the browser needs. Anything else stays on the connector side.
 export const ROW_FIELDS = new Set([
@@ -155,12 +161,28 @@ export class SessionLens {
     // Chats a browser opened with sessions.messages.subscribe (Control UI: one per selected
     // chat). session.message is forwarded only for these. subscriptionId -> session key.
     this.watching = new Map();
+    this.onboarding = new Set(); // onboarding chats (agent main sessions) created from ClawChats
+    try { for (const k of this.extras?.listThreadExtraKeys?.(ONBOARDING) || []) this.onboarding.add(k); }
+    catch (e) { this.log.warn?.(`[lens] onboarding chats: ${e.message}`); }
+  }
+
+  /** agents.create replied with an onboarding chat: show it from now on. */
+  addOnboardingChat(key) {
+    if (typeof key !== 'string' || !MAIN_SESSION_KEY.test(key) || this.onboarding.has(key)) return;
+    this.onboarding.add(key);
+    try { this.extras?.setThreadExtra?.(key, ONBOARDING, { at: Date.now() }); }
+    catch (e) { this.log.warn?.(`[lens] onboarding chat: ${e.message}`); }
+  }
+
+  _dropOnboardingChats(match) {
+    for (const key of [...this.onboarding]) if (match(key)) this.onboarding.delete(key); // extras go with the session (deleteThreadExtras)
   }
 
   // ── Visibility ──────────────────────────────────────────────────────
 
   /** Learn from a (possibly partial) row; returns whether the session is visible. */
   observe(key, row) {
+    if (this.onboarding.has(key)) return true;
     if (!isChildCandidateKey(key)) return false;
     const verdict = SUBAGENT_KEY.test(key) ? true : rowVerdict(row);
     if (verdict === true) {
@@ -180,6 +202,7 @@ export class SessionLens {
   }
 
   _isTopLevel(key) {
+    if (this.onboarding.has(key)) return true;
     return isCandidateKey(key) && !this.hidden.has(key) && !this.team?.isWorkKey(key);
   }
 
@@ -258,6 +281,9 @@ export class SessionLens {
     }
     // Before the visibility check: a deleted session's bookmarks go even if the lens had it hidden.
     if (payload.reason === 'delete' && this.extras) this.extras.deleteThreadExtras?.(key);
+    const wasOnboarding = payload.reason === 'delete' && this.onboarding.has(key);
+    if (wasOnboarding) this._dropOnboardingChats(k => k === key);
+    if (wasOnboarding) return { type: 'event', event: 'sessions.changed', payload: trimEvent(payload) };
     if (!this.observe(key, payload.session || payload)) return null;
     const out = trimEvent(payload);
     if (payload.reason !== 'delete') this._withParent(key, out.session || out);
@@ -307,6 +333,8 @@ export class SessionLens {
       case 'sessions.search':
       case 'sessions.groups.rename':
       case 'sessions.groups.delete':
+      case 'agents.create':
+      case 'agents.delete':
         this.pending.set(id, { method, params });
         return frame;
       default:
@@ -342,6 +370,16 @@ export class SessionLens {
         try { this.extras?.deleteProjectStyle(req.params?.name); }
         catch (e) { this.log.warn?.(`[lens] style delete: ${e.message}`); }
         return msg;
+      case 'agents.create':
+        this.addOnboardingChat(p.onboarding?.sessionKey);
+        return msg;
+      case 'agents.delete': {
+        const prefix = `agent:${p.agentId || req.params?.agentId}:`;
+        const gone = [...this.onboarding].filter(k => k.startsWith(prefix));
+        this._dropOnboardingChats(k => k.startsWith(prefix));
+        for (const k of gone) try { this.extras?.deleteThreadExtras?.(k); } catch (e) { this.log.warn?.(`[lens] onboarding drop: ${e.message}`); }
+        return msg;
+      }
       default:
         return msg;
     }
