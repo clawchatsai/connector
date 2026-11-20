@@ -9,6 +9,7 @@ import { GATEWAY_WS_URL, AUTH_TOKEN, discoverWorkspaceDir } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
 import { withGatewayRetry } from './util/gateway-retry.js';
+import { createChatAbort } from './util/chat-abort.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload, handleWorkspaceCreate, handleWorkspaceMove, handleWorkspaceCopy } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
@@ -83,15 +84,17 @@ export function createApp(config = {}) {
   // The connector's own requests wait out a gateway that is still starting (2026.11.4+ refuses writes with a retryable
   // UNAVAILABLE; util/gateway-retry.js). Frames a browser relays don't pass here: the frontend retries those.
   const gwRequest = withGatewayRetry((m, p, t) => gatewayClient.request(m, p, t));
+  // Stop for the connector's own runs, fenced to the run's session where the gateway supports it (util/chat-abort.js).
+  const chatAbort = createChatAbort(gwRequest, { hello: () => gatewayClient.hello });
   // Gateway sharing (server/peer/): other people's agents in team chats, and ours in theirs. The
   // plugin host (src/index.ts) supplies the signal server link and the peer transport (config.peer).
   const peerKey = loadOrCreatePeerKey(DATA_DIR);
   const sharing = config.peer ? new SharingManager({
-    getDb: () => globalDbCache.get(), request: gwRequest, key: peerKey, broadcast,
+    getDb: () => globalDbCache.get(), request: gwRequest, chatAbort, key: peerKey, broadcast,
     gatewayId: config.peer.gatewayId, signal: config.peer.signal, openPeer: config.peer.openPeer,
   }) : null;
   // Team chats: several agents in one thread (server/team.js).
-  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, broadcast, titler: createTitler(config.llm), remote: sharing });
+  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, chatAbort, broadcast, titler: createTitler(config.llm), remote: sharing });
   gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
   gatewayClient.onApprovalEvent = msg => sharing?.onApprovalEvent(msg);
   gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); };

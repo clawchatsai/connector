@@ -17,6 +17,7 @@ import crypto from 'node:crypto';
 import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
 import { redactSecrets } from '../util/redact.js';
+import { createChatAbort } from '../util/chat-abort.js';
 import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent, isGuestAgent, restrictionsPending } from './guest-agent.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
@@ -24,6 +25,15 @@ const TURN_TIMEOUT_MS = 10 * 60_000;
 export const EMPTY_REPLY_ERROR = /empty response|did not produce a visible reply/i;
 const DEFAULT_DAILY_CAP = 50;
 const MAX_CONCURRENT_TURNS = 2;   // per share: the daily cap alone would allow 50 parallel 10-minute runs
+// Owner side: finished guest turns, so a resend after a dropped link gets the result instead of a new run.
+const RECENT_TURN_MS = 10 * 60_000;
+const RECENT_TURNS_MAX = 200;
+// Requester side: waits before sending a turn again after its link dropped (one resend per entry).
+const RESEND_BACKOFF_MS = [2_000, 5_000];
+// Owner side: a turn its gateway's restart cut off. 2026.11.x resumes it a few seconds after it's back (a "Gateway
+// restarted" turn of its own, under another run id); this long for that to start, polled this often.
+const RECOVERY_WAIT_MS = 30_000;
+const RECOVERY_POLL_MS = 2_000;
 const ACCESS_MODES = { restricted: 'read-only', trusted: 'guarded' };
 /**
  * Requests one contact's gateway may make of this one over the sharing link: [burst, per ms] token
@@ -51,6 +61,8 @@ const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team ch
 const ACTING_FOR_NOTE = (name, byPerson) => `(Shared session: in your owner's team chat, you are answering ${byPerson ? name : `${name}'s agent`}, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 
 const today = () => new Date().toISOString().slice(0, 10);
+/** A guest turn's emit with secrets redacted from streamed text (see _guestTurn). */
+const redacting = emit => emit && ((event, data) => emit(event, event === 'delta' ? redactSecrets(data) : data));
 /** A name that came from the other side, safe to show and to use as a chat label (no brackets, newlines, controls). */
 const cleanName = (v, max = 40) => String(v || '').replace(/[\u0000-\u001f\u007f-\u009f\[\]]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 const firstName = p => cleanName(String(p?.name || p?.email || 'Someone').split(/[\s@]/)[0], 30) || 'Someone';
@@ -73,16 +85,19 @@ export class SharingManager {
    * @param {(shareId: string) => Promise<{ dc, dtls }>} o.openPeer  open a peer DataChannel (requester)
    * @param {(data: string) => void} o.broadcast  frame to this gateway's browsers
    */
-  constructor({ getDb, request, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console }) {
-    Object.assign(this, { getDb, request, key, gatewayId, signal, openPeer, broadcast, log });
+  constructor({ getDb, request, chatAbort = null, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console, resendBackoffMs = RESEND_BACKOFF_MS, recovery = { waitMs: RECOVERY_WAIT_MS, pollMs: RECOVERY_POLL_MS } }) {
+    Object.assign(this, { getDb, request, key, gatewayId, signal, openPeer, broadcast, log, resendBackoffMs, recovery });
+    this.chatAbort = chatAbort || createChatAbort((m, p, t) => this.request(m, p, t)); // Stop, fenced where supported
     this._shares = [];            // latest share-list from the signal server
     this.serverEnabled = false;   // the signal server sends a share-list only to accounts with sharing on
     this._links = new Map();      // shareId -> PeerLink (requester side, one per share)
     this._linking = new Map();    // shareId -> Promise<PeerLink>
     this._served = new Set();     // owner-side PeerLinks
     this._runs = new Map();       // runId -> { resolve, timer, text } (owner-side guest runs)
-    // Owner-side guest turns, keyed by an id made here (never the requester's): { shareId, clientTurnId, sessionKey, runId, aborted }
+    // Owner-side guest turns, keyed by an id made here (never the requester's):
+    // { shareId, clientTurnId, same, sessionKey, runId, sessionId, aborted, emit, result }
     this._turns = new Map();
+    this._finished = new Map();   // `${shareId}|${clientTurnId}` -> { same, result | error, at } (RECENT_TURN_MS)
     this._buckets = new Map();    // `${gateway}|${kind}` -> { tokens, at } (PEER_RATES)
     this._ready = false;
   }
@@ -272,7 +287,7 @@ export class SharingManager {
 
   _abortTurn(t) {
     t.aborted = true;
-    if (t.runId) this.request('chat.abort', { sessionKey: t.sessionKey, runId: t.runId }).catch(() => {});
+    if (t.runId) this.chatAbort.abort({ sessionKey: t.sessionKey, runId: t.runId, sessionId: t.sessionId }).catch(() => {});
   }
 
   /** Remember an agent created here as a guest version (ClawChats → Sharing). */
@@ -584,40 +599,80 @@ export class SharingManager {
     if (!agent) throw Object.assign(new Error('That agent is not shared'), { code: 'not_shared' });
     const roomId = String(p.roomId || '').slice(0, 200);
     if (!roomId || typeof p.message !== 'string' || !p.message.trim()) throw Object.assign(new Error('Bad turn'), { code: 'bad_request' });
-    if (this._usage(shareId) >= grant.dailyCap) throw Object.assign(new Error(`Daily limit reached (${grant.dailyCap} replies)`), { code: 'cap' });
-    // The requester's turn id only names the turn for its Stop; the turn itself is tracked under an id made here,
-    // so reusing one can't hide a turn from the limit or from "Stop sharing".
+    // The requester's turn id only names the turn (for its Stop, and for a resend after its link dropped); the turn
+    // itself is tracked under an id made here, so reusing one can't hide a turn from the limit or from "Stop sharing".
     const clientTurnId = typeof p.turnId === 'string' && p.turnId ? p.turnId.slice(0, 200) : null;
+    const same = JSON.stringify([agent.id, roomId, p.message]); // what a resend repeats exactly
+    const recentKey = clientTurnId && `${shareId}|${clientTurnId}`;
+    if (clientTurnId) {
+      const live = [...this._turns.values()].find(t => t.shareId === shareId && t.clientTurnId === clientTurnId);
+      const done = !live && this._recentTurn(recentKey);
+      if ((live || done) && (live || done).same !== same) throw Object.assign(new Error('That turn was already sent with another message'), { code: 'bad_request' });
+      // A resend: no new run, and it isn't counted again.
+      if (live) return this._reattach(live, emit);
+      if (done?.error) throw Object.assign(new Error(done.error.message), { code: done.error.code, partial: done.error.partial });
+      if (done) return { ...done.result };
+    }
+    if (this._usage(shareId) >= grant.dailyCap) throw Object.assign(new Error(`Daily limit reached (${grant.dailyCap} replies)`), { code: 'cap' });
     const running = [...this._turns.values()].filter(t => t.shareId === shareId);
-    if (clientTurnId && running.some(t => t.clientTurnId === clientTurnId)) throw Object.assign(new Error('That turn is already running'), { code: 'bad_request' });
     if (running.length >= MAX_CONCURRENT_TURNS) throw Object.assign(new Error('Too many replies at once; try again shortly'), { code: 'busy' });
     const turnKey = crypto.randomUUID();
-    this._turns.set(turnKey, { shareId, clientTurnId, sessionKey: null, runId: null, aborted: false }); // counts toward the limit from here on
+    // Everything the guest's agent says leaves this gateway (to the other person, or into a room they see). The
+    // gateway stopped masking secrets in tool output in 2026.10.10, so a credential an agent read can come out in
+    // its reply: redact it here (util/redact.js), in the streamed text, the final one and a failed turn's partial.
+    // `emit` is the link that asked last (a resend after a dropped link takes over the stream).
+    const turn = { shareId, clientTurnId, same, sessionKey: null, runId: null, sessionId: null, aborted: false, emit: redacting(emit), result: null };
+    this._turns.set(turnKey, turn); // counts toward the limit from here on
     // Counted before any await, so parallel turns can't both pass the cap.
     this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
     this._changed(); // the owner's Sharing view shows today's count
-    try {
-      // Everything the guest's agent says leaves this gateway (to the other person, or into a room they see). The
-      // gateway stopped masking secrets in tool output in 2026.10.10, so a credential an agent read can come out in
-      // its reply: redact it here (util/redact.js), in the streamed text, the final one and a failed turn's partial.
-      const safeEmit = emit && ((event, data) => emit(event, event === 'delta' ? redactSecrets(data) : data));
-      const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, safeEmit, this._turns.get(turnKey));
-      if (typeof r?.text === 'string') r.text = redactSecrets(r.text);
-      // What this gateway's agent said for that gateway's room: its copy of the room may show it as ours (team.js).
-      if (!p.inOwnerRoom && r?.text) try { this.onGuestReply?.(grant.requesterGatewayId, roomId, shareId, agent.id, r.text); } catch { /* best effort */ }
-      return r;
-    }
-    catch (e) {
-      if (typeof e?.partial === 'string') e.partial = redactSecrets(e.partial);
-      // A reply that failed without saying anything doesn't use up the day's replies. A timeout still
-      // counts: it ran for the full turn timeout.
-      if (!e.partial && !/timed out/i.test(e.message)) {
-        this._db().prepare('UPDATE peer_usage SET turns = MAX(0, turns - 1) WHERE share_id = ? AND day = ?').run(shareId, today());
-        this._changed();
+    turn.result = (async () => {
+      try {
+        const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, (event, data) => turn.emit?.(event, data), turn);
+        if (typeof r?.text === 'string') r.text = redactSecrets(r.text);
+        // What this gateway's agent said for that gateway's room: its copy of the room may show it as ours (team.js).
+        if (!p.inOwnerRoom && r?.text) try { this.onGuestReply?.(grant.requesterGatewayId, roomId, shareId, agent.id, r.text); } catch { /* best effort */ }
+        if (recentKey) this._rememberTurn(recentKey, { same, result: { ...r } });
+        return r;
       }
-      throw e;
+      catch (e) {
+        if (typeof e?.partial === 'string') e.partial = redactSecrets(e.partial);
+        // A reply that failed without saying anything doesn't use up the day's replies. A timeout still
+        // counts: it ran for the full turn timeout.
+        if (!e.partial && !/timed out/i.test(e.message)) {
+          this._db().prepare('UPDATE peer_usage SET turns = MAX(0, turns - 1) WHERE share_id = ? AND day = ?').run(shareId, today());
+          this._changed();
+        }
+        if (recentKey) this._rememberTurn(recentKey, { same, error: { message: e.message, code: e.code, partial: e.partial } });
+        throw e;
+      }
+      finally { this._turns.delete(turnKey); }
+    })();
+    return turn.result;
+  }
+
+  /** A resend of a turn still running here (its link dropped): the new link gets the text so far, then the same result. */
+  _reattach(turn, emit) {
+    turn.emit = redacting(emit);
+    const run = turn.runId && this._runs.get(turn.runId);
+    if (run?.text) turn.emit?.('delta', run.text); // deltas are cumulative
+    if (run?.waiting) turn.emit?.('status', { waiting: 'approval', what: run.waiting.what, expiresAtMs: run.waiting.expiresAtMs });
+    return turn.result;
+  }
+
+  _recentTurn(key) {
+    const e = this._finished.get(key);
+    return e && Date.now() - e.at < RECENT_TURN_MS ? e : null;
+  }
+
+  /** Keep a finished turn's result (already redacted) for a while, oldest dropped first. */
+  _rememberTurn(key, entry) {
+    this._finished.delete(key);
+    this._finished.set(key, { ...entry, at: Date.now() });
+    for (const [k, e] of this._finished) {
+      if (this._finished.size <= RECENT_TURNS_MAX && Date.now() - e.at < RECENT_TURN_MS) break;
+      this._finished.delete(k);
     }
-    finally { this._turns.delete(turnKey); }
   }
 
   async _runGuestTurn(shareId, grant, agent, roomId, p, emit, turn) {
@@ -636,7 +691,11 @@ export class SharingManager {
     const mcpServers = Object.fromEntries(Object.keys(cfg?.parsed?.mcp?.servers || {}).sort().map(n => [n, false]));
     const toolOverrides = { webSearch: false, ...(Object.keys(mcpServers).length ? { mcpServers } : {}) };
     const sessionKey = await this._guestSession(shareId, roomId, agent.id, { name, roomTitle: String(p.roomTitle || 'team chat').slice(0, 80), permissionMode, toolOverrides });
-    const runId = `peer-${crypto.randomUUID()}`;
+    // Made from the requester's turn id when there is one: a resend (after a dropped link, or after this connector
+    // restarted) reuses the idempotency key, so the gateway answers with the first run instead of starting another.
+    const runId = turn.clientTurnId
+      ? `peer-${crypto.createHash('sha256').update(`${shareId}|${turn.clientTurnId}`).digest('hex').slice(0, 32)}`
+      : `peer-${crypto.randomUUID()}`;
     const done = new Promise(resolve => {
       const timer = setTimeout(() => { this._runs.delete(runId); resolve({ state: 'error', errorMessage: 'timed out' }); }, TURN_TIMEOUT_MS + 30_000);
       timer.unref?.();
@@ -646,13 +705,34 @@ export class SharingManager {
     try {
       if (!this._grant(shareId)) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' }); // revoked while setting up
       if (turn.aborted) return { state: 'aborted', text: '' }; // stopped while setting up
-      await this.request('chat.send', {
-        sessionKey, message: defangLocalPaths(`${p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name)}\n\n${p.message}`), deliver: false, idempotencyKey: runId,
+      // A resend this connector has no record of (it restarted): if the turn's input is already in the session, the
+      // transcript decides, not the ack. 2026.9.7 forgets its chat.send dedupe on a gateway restart and would start a
+      // run with no new input (a reply to nothing). Only this connector reloaded, so its run is still going: the send
+      // below is answered "in_flight" and the run's events finish the turn.
+      const sent = defangLocalPaths(`${p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name)}\n\n${p.message}`);
+      if (turn.clientTurnId) {
+        const earlier = await this._replyTo(sessionKey, runId);
+        if (earlier && earlier.input.trim() !== sent.trim()) throw Object.assign(new Error('That turn was already sent with another message'), { code: 'bad_request' });
+        const s = earlier && await this.request('sessions.describe', { key: sessionKey }, 5000).then(r => r?.session || null, () => null);
+        const ownRunGoing = s?.hasActiveRun !== false && (!Array.isArray(s?.activeRunIds) || s.activeRunIds.includes(runId));
+        if (earlier && !ownRunGoing) return this._afterRestart(sessionKey, runId, turn);
+      }
+      const ack = await this.request('chat.send', {
+        sessionKey, message: sent, deliver: false, idempotencyKey: runId,
         timeoutMs: TURN_TIMEOUT_MS, suppressCommandInterpretation: true,
         expectedPermissionMode: permissionMode, expectedToolOverrides: toolOverrides,
-      }, 30_000);
+      }, 30_000).catch(e => {
+        // The same key with another message (2026.11.5+): the requester has to resend the identical one.
+        if (e?.details?.reason === 'chat-request-conflict') throw Object.assign(new Error('That turn was already sent with another message'), { code: 'bad_request' });
+        throw e;
+      });
+      // The session the run started in: a later Stop is fenced to it.
+      this.chatAbort.sessionIdOf(sessionKey).then(id => { turn.sessionId = id; });
       // Stopped or revoked while the send was on its way (the abort may have reached the gateway before the run).
       if (turn.aborted || !this._grant(shareId)) this._abortTurn(turn);
+      // The gateway already has this input and nothing here tracked it (a resend after a restart): its reply is, or
+      // will be, in the session. "in_flight" means it is still going: its events arrive as for a new run.
+      if (ack?.status === 'ok') return this._afterRestart(sessionKey, runId, turn);
       const r = await done;
       if (r.state === 'final') return { state: 'final', text: r.message ? messageText(r.message) : await this._lastReply(sessionKey) };
       if (r.state === 'aborted') return { state: 'aborted', text: r.text || '' };
@@ -703,12 +783,66 @@ export class SharingManager {
     return key;
   }
 
+  /** The input sent under `runId` and the reply to it, if that input is in the session: { input, text } (text '' when none), else null. */
+  async _replyTo(sessionKey, runId) {
+    const h = await this.request('chat.history', { sessionKey, limit: 200 }, 30_000).catch(() => null);
+    const msgs = h?.messages || [];
+    const at = msgs.findIndex(m => m.role === 'user' && m.__openclaw?.idempotencyKey === `${runId}:user`);
+    if (at < 0) return null;
+    let reply = null;
+    for (const m of msgs.slice(at + 1)) {
+      if (m.role === 'user' && m.provenance?.kind === 'internal_system') continue; // the gateway's own "restarted, continue" turn
+      if (m.role === 'user') break;
+      if (m.role === 'assistant' && messageText(m).trim()) reply = m;
+    }
+    return { input: await this._fullText(sessionKey, msgs[at]), text: reply ? await this._fullText(sessionKey, reply) : '' };
+  }
+
+  /**
+   * A turn whose input is in the session but which no run here is following (this connector or its gateway restarted):
+   * wait for whatever runs there to finish (on 2026.11.x the gateway resumes a run its restart cut off, under another
+   * run id, a few seconds after it's back), then answer with the reply. Stop and "Stop sharing" abort that run.
+   */
+  async _afterRestart(sessionKey, runId, turn) {
+    const started = Date.now();
+    const end = started + TURN_TIMEOUT_MS;
+    let ran = false;
+    for (;;) {
+      const s = await this.request('sessions.describe', { key: sessionKey }, 5000).then(r => r?.session || null, () => null);
+      if (s?.hasActiveRun) {
+        ran = true;
+        if (turn.aborted) {
+          const ids = Array.isArray(s.activeRunIds) ? s.activeRunIds : [];
+          if (ids.length) for (const id of ids) this.chatAbort.abort({ sessionKey, runId: id, sessionId: s.sessionId }).catch(() => {});
+          else this.request('chat.abort', { sessionKey }).catch(() => {});
+          return { state: 'aborted', text: '' };
+        }
+      } else {
+        if (turn.aborted) return { state: 'aborted', text: '' };
+        const r = await this._replyTo(sessionKey, runId);
+        if (r?.text) return { state: 'final', text: r.text };
+        if (ran || Date.now() - started >= this.recovery.waitMs) break;
+      }
+      if (Date.now() >= end) break;
+      await new Promise(r => setTimeout(r, this.recovery.pollMs));
+    }
+    throw Object.assign(new Error('The reply was interrupted'), { code: 'run_failed', partial: '' });
+  }
+
+  /** A history message's whole text: chat.history caps long ones (`__openclaw.truncated`, ~8 KB); chat.message.get doesn't. */
+  async _fullText(sessionKey, m) {
+    const text = messageText(m);
+    if (!m?.__openclaw?.truncated || !m.__openclaw.id) return text;
+    const r = await this.request('chat.message.get', { sessionKey, messageId: m.__openclaw.id, maxChars: 2_000_000 }, 30_000).catch(() => null);
+    return (r?.ok && r.message && messageText(r.message)) || text;
+  }
+
   async _lastReply(sessionKey) {
     const h = await this.request('chat.history', { sessionKey, limit: 20 }, 30_000).catch(() => null);
     const msgs = h?.messages || [];
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'user') return '';
-      if (msgs[i].role === 'assistant') { const t = messageText(msgs[i]); if (t.trim()) return t; }
+      if (msgs[i].role === 'assistant' && messageText(msgs[i]).trim()) return this._fullText(sessionKey, msgs[i]);
     }
     return '';
   }
@@ -830,18 +964,36 @@ export class SharingManager {
     return p;
   }
 
-  /** Run a turn on a shared agent. Returns { state, text }; throws with `.partial` on failure. */
-  async turn(agentId, { turnId, roomId, roomTitle, message }, { onDelta, onStatus } = {}) {
+  /**
+   * Run a turn on a shared agent. Returns { state, text }; throws with `.partial` on failure.
+   * A link that drops mid-turn is dialled again and the identical request sent again (at most twice, within the
+   * turn's timeout): the owner attaches it to the run still going there, or answers from the finished one, so the
+   * turn never runs twice. `stopped()`: the room was stopped, so it isn't sent again.
+   */
+  async turn(agentId, { turnId, roomId, roomTitle, message }, { onDelta, onStatus, stopped = () => false } = {}) {
     const id = SharingManager.parseRemoteId(agentId);
     if (!id) throw new Error('not a shared agent');
-    const link = await this._link(id.shareId);
-    return link.request('turn', { turnId, agentId: id.remoteId, roomId, roomTitle, message }, {
-      onEvent: (event, data) => {
-        if (event === 'delta' && typeof data === 'string') onDelta?.(data);
-        else if (event === 'status' && data && typeof data === 'object') onStatus?.(data);
-      },
-      timeoutMs: TURN_TIMEOUT_MS + 60_000,
-    });
+    const params = { turnId, agentId: id.remoteId, roomId, roomTitle, message };
+    const onEvent = (event, data) => {
+      if (event === 'delta' && typeof data === 'string') onDelta?.(data);
+      else if (event === 'status' && data && typeof data === 'object') onStatus?.(data);
+    };
+    const deadline = Date.now() + TURN_TIMEOUT_MS + 60_000;
+    for (let resend = 0; ; resend++) {
+      try {
+        const link = await this._link(id.shareId);
+        return await link.request('turn', params, { onEvent, timeoutMs: deadline - Date.now() });
+      } catch (e) {
+        // Only a dropped link (or, while resending, the link not back yet): local errors, without a code. Never
+        // something the other side answered (refused, cap, revoked...): those always carry one.
+        const dropped = !e.code && (e.message === 'peer link closed' || resend > 0);
+        const wait = this.resendBackoffMs[resend];
+        if (!dropped || !turnId || wait === undefined || stopped() || Date.now() + wait >= deadline) throw e;
+        this.log.info?.(`[sharing] turn ${turnId}: link to ${id.shareId} dropped, sending it again in ${wait / 1000} s`);
+        await new Promise(r => setTimeout(r, wait));
+        if (stopped()) throw e;
+      }
+    }
   }
 
   // ── Acting for someone else (team chats on this gateway) ──────────

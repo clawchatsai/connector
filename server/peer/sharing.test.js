@@ -42,9 +42,9 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, c
     return { ok: true };
   };
   const ownerDb = new Database(':memory:'), reqDb = new Database(':memory:');
-  owner = new SharingManager({ getDb: () => ownerDb, request: ownerRequest, key: kOwner, gatewayId: () => 'gwK', signal: m => ownerSignals.push(m), openPeer: async () => { throw new Error('owner never dials'); }, log: quiet });
+  owner = new SharingManager({ getDb: () => ownerDb, request: ownerRequest, recovery: { waitMs: 60, pollMs: 5 }, key: kOwner, gatewayId: () => 'gwK', signal: m => ownerSignals.push(m), openPeer: async () => { throw new Error('owner never dials'); }, log: quiet });
   const req = new SharingManager({
-    getDb: () => reqDb, request: async () => ({}), key: kReq, gatewayId: () => 'gwH', signal: m => reqSignals.push(m), log: quiet,
+    getDb: () => reqDb, request: async () => ({}), key: kReq, gatewayId: () => 'gwH', signal: m => reqSignals.push(m), log: quiet, resendBackoffMs: [5, 10],
     openPeer: async shareId => {
       const [a, b] = pair();
       owner.servePeer({ dc: b, dtls: { local: 'FK', remote: 'FH' }, shareId, requesterGatewayId: 'gwH' });
@@ -679,6 +679,7 @@ test('a guest can\'t reuse a turn id: the limit counts turns made here, and stop
   s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 20 });
   s.activate();
   const results = [];
+  // The same turn id for other rooms isn't a resend: refused, and it starts no run.
   for (let i = 0; i < 4; i++) results.push(s.req.turn('peer:sh1:jarvis', { turnId: 'same', roomId: `r${i}`, message: 'x' }).catch(e => e));
   results.push(s.req.turn('peer:sh1:jarvis', { turnId: 'other', roomId: 'r9', message: 'x' }).catch(e => e));
   await wait(30);
@@ -692,7 +693,7 @@ test('a guest can\'t reuse a turn id: the limit counts turns made here, and stop
   const aborted = new Set(s.ownerCalls.filter(c => c.method === 'chat.abort').map(c => c.params.runId));
   for (const runId of sends()) assert.ok(aborted.has(runId), `run ${runId} kept going after "Stop sharing"`);
   const done = await Promise.all(results);
-  assert.ok(done.filter(r => r instanceof Error).some(e => /already running/.test(e.message)), 'a reused turn id is refused');
+  assert.equal(done.filter(r => r instanceof Error && r.code === 'bad_request').length, 3, 'a reused turn id is refused');
 });
 
 test('stop sharing while a guest turn is being sent: it is aborted once it has started', async () => {
@@ -779,4 +780,283 @@ test('peer requests are rate limited per contact (turns, and everything else), w
   const other = await Promise.all(Array.from({ length: 130 }, () => link.request('agents', {}).then(() => 'ok', e => e.code)));
   assert.equal(other.filter(r => r === 'ok').length, 120);
   assert.ok(other.slice(120).every(r => r === 'rate_limited'));
+});
+
+test('a link that drops mid-turn: the turn is sent again and joins the run still going (one run, counted once)', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  const deltas = [];
+  const run = s.req.turn('peer:sh1:jarvis', { turnId: 'team-1', roomId: 'r', message: 'hi' }, { onDelta: t => deltas.push(t) });
+  await wait(20);
+  [...s.owner._served][0].close(); // the DataChannel drops
+  await wait(60);
+  const sends = s.ownerCalls.filter(c => c.method === 'chat.send');
+  assert.equal(sends.length, 1, 'the resend started no second run');
+  assert.equal(s.owner._served.size, 1, 'the requester dialled again');
+  assert.deepEqual(deltas, ['jar', 'jar'], 'the new link got the text so far');
+  s.owner.onGatewayEvent({ event: 'chat', payload: { runId: sends[0].params.idempotencyKey, state: 'final', message: { content: [{ type: 'text', text: 'done' }] } } });
+  assert.deepEqual(await run, { state: 'final', text: 'done' });
+  assert.equal(s.owner._usage('sh1'), 1, 'counted once');
+});
+
+test('a resend of a finished turn gets its result, with no new run; another message under that turn id is refused', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  const turn = { turnId: 'team-2', roomId: 'r', message: 'hi' };
+  const first = await s.req.turn('peer:sh1:jarvis', turn);
+  assert.deepEqual(await s.req.turn('peer:sh1:jarvis', turn), first);
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+  assert.equal(s.owner._usage('sh1'), 1);
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { ...turn, message: 'something else' }), e => e.code === 'bad_request');
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { ...turn, roomId: 'other' }), e => e.code === 'bad_request');
+});
+
+test('another message under a running turn id is refused, and the run goes on', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  const run = s.req.turn('peer:sh1:jarvis', { turnId: 'team-3', roomId: 'r', message: 'hi' });
+  await wait(20);
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'team-3', roomId: 'r', message: 'changed' }), e => e.code === 'bad_request');
+  await s.req.abort('peer:sh1:jarvis', 'team-3');
+  assert.deepEqual(await run, { state: 'aborted', text: 'jar' });
+});
+
+test('the run id comes from the share and the turn id, so a resend after a restart reuses the idempotency key', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'team-4', roomId: 'r', message: 'hi' });
+  await s.req.turn('peer:sh1:jarvis', { roomId: 'r', message: 'no turn id' });
+  const keys = s.ownerCalls.filter(c => c.method === 'chat.send').map(c => c.params.idempotencyKey);
+  const crypto = await import('node:crypto');
+  assert.equal(keys[0], `peer-${crypto.createHash('sha256').update('sh1|team-4').digest('hex').slice(0, 32)}`);
+  assert.match(keys[1], /^peer-[0-9a-f-]{36}$/, 'without a turn id it stays random');
+});
+
+test('the gateway says the key was used for other input (chat-request-conflict): bad_request', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => {
+    if (method === 'chat.send') throw Object.assign(new Error('This message ID was already used for different input.'), { gatewayCode: 'INVALID_REQUEST', details: { reason: 'chat-request-conflict' } });
+    return request(method, params);
+  };
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'team-5', roomId: 'r', message: 'hi' }), e => e.code === 'bad_request');
+  assert.equal(s.owner._usage('sh1'), 0, 'a refused turn is not counted');
+});
+
+test('after a restart the gateway answers the resend with "ok" (that run already ran): its reply is read from the session', async () => {
+  const s = setup();
+  let input = null; // in the session once sent
+  const sentText = () => input;
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => {
+    if (method === 'chat.send') { s.ownerCalls.push({ method, params }); input = params.message; return { runId: params.idempotencyKey, status: 'ok' }; }
+    if (method === 'chat.history') return { messages: input === null ? [] : [{ role: 'user', content: sentText(params), __openclaw: { idempotencyKey: `${[...s.owner._turns.values()][0]?.runId}:user` } }, { role: 'assistant', content: [{ type: 'text', text: 'the earlier reply' }] }] };
+    return request(method, params);
+  };
+  assert.deepEqual(await s.req.turn('peer:sh1:jarvis', { turnId: 'team-6', roomId: 'r', message: 'hi' }), { state: 'final', text: 'the earlier reply' });
+  assert.equal(s.owner._runs.size, 0);
+});
+
+test('a room stopped while its link was down: the turn is not sent again', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  let stopped = false;
+  const run = s.req.turn('peer:sh1:jarvis', { turnId: 'team-7', roomId: 'r', message: 'hi' }, { stopped: () => stopped }).catch(e => e);
+  await wait(20);
+  stopped = true;
+  [...s.owner._served][0].close();
+  assert.match((await run).message, /peer link closed/);
+  await wait(30);
+  assert.equal(s.owner._served.size, 0, 'no new link for it');
+  for (const t of s.owner._turns.values()) s.owner._abortTurn(t);
+});
+
+test('Stop after a reconnect still finds the turn, and is fenced to the session the run started in', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => (method === 'sessions.describe' ? { session: { key: params.key, sessionId: 'phys-1' } } : request(method, params));
+  const run = s.req.turn('peer:sh1:jarvis', { turnId: 'team-8', roomId: 'r', message: 'hi' });
+  await wait(20);
+  [...s.owner._served][0].close();
+  await wait(60);
+  await s.req.abort('peer:sh1:jarvis', 'team-8');
+  assert.deepEqual(await run, { state: 'aborted', text: 'jar' });
+  const abort = s.ownerCalls.find(c => c.method === 'chat.abort').params;
+  assert.equal(abort.sessionId, 'phys-1');
+  assert.equal(abort.runId, s.ownerCalls.find(c => c.method === 'chat.send').params.idempotencyKey);
+});
+
+/** The owner's gateway after a restart (2026.9.7): it forgot its dedupe, the session still has the turn's input. */
+async function restartedOwner(s, { reply, active = false, input = 'hi' }) {
+  // What the owner sends for that message (the guest note + the message), from a turn in another room.
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'warm-up', roomId: 'r0', message: input });
+  const sent = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.message;
+  s.ownerCalls.length = 0;
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => {
+    if (method === 'chat.history') {
+      const key = s.owner._turns.size && [...s.owner._turns.values()][0].runId;
+      return { messages: [
+        { role: 'user', content: 'an older turn', __openclaw: { idempotencyKey: 'peer-old:user' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'older reply' }] },
+        { role: 'user', content: sent, __openclaw: { idempotencyKey: `${key}:user` } },
+        ...(reply ? [{ role: 'assistant', content: [{ type: 'text', text: reply }] }] : []),
+      ] };
+    }
+    if (method === 'sessions.describe') return { session: { key: params.key, hasActiveRun: active } };
+    return request(method, params);
+  };
+}
+
+test('a resend after the owner restarted: the turn already ran there, so its reply is returned and nothing runs again', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  await restartedOwner(s, { reply: 'the reply it gave' });
+  assert.deepEqual(await s.req.turn('peer:sh1:jarvis', { turnId: 'team-9', roomId: 'r', message: 'hi' }), { state: 'final', text: 'the reply it gave' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0, 'no reply to nothing');
+});
+
+test('a resend after only the connector reloaded: the run is still going, so the send joins it and waits for it', async () => {
+  const s = setup({ reply: () => 'finished' });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await restartedOwner(s, { reply: null, active: true });
+  assert.deepEqual(await s.req.turn('peer:sh1:jarvis', { turnId: 'team-10', roomId: 'r', message: 'hi' }), { state: 'final', text: 'finished' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+});
+
+test('a resend of a turn its restart cut off (input there, no reply, nothing running): failed, not counted', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
+  s.activate();
+  await restartedOwner(s, { reply: null });
+  s.owner._db().prepare('DELETE FROM peer_usage').run();
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'team-11', roomId: 'r', message: 'hi' }), e => e.code === 'run_failed' && /interrupted/.test(e.message));
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
+  assert.equal(s.owner._usage('sh1'), 0);
+});
+
+test('a resend after the owner restarted with another message under that turn id: refused, nothing runs', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await restartedOwner(s, { reply: 'the reply it gave' });
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'team-12', roomId: 'r', message: 'something else' }), e => e.code === 'bad_request');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
+});
+
+test('history caps long messages: the input check and the reply read the whole message (chat.message.get)', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  const long = 'x'.repeat(9000);
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'warm-up', roomId: 'r0', message: long });
+  const sent = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.message;
+  s.ownerCalls.length = 0;
+  const full = { u1: sent, a1: `${'y'.repeat(9000)} the end` };
+  const cut = t => [{ type: 'text', text: `${t.slice(0, 8000)}\n...(truncated)...` }];
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => {
+    if (method === 'chat.history') {
+      const key = [...s.owner._turns.values()][0].runId;
+      return { messages: [
+        { role: 'user', content: cut(full.u1), __openclaw: { id: 'u1', idempotencyKey: `${key}:user`, truncated: true } },
+        { role: 'assistant', content: cut(full.a1), __openclaw: { id: 'a1', truncated: true } },
+      ] };
+    }
+    if (method === 'chat.message.get') return { ok: true, message: { role: 'x', content: [{ type: 'text', text: full[params.messageId] }] } };
+    if (method === 'sessions.describe') return { session: { key: params.key, hasActiveRun: false } };
+    return request(method, params);
+  };
+  const r = await s.req.turn('peer:sh1:jarvis', { turnId: 'team-13', roomId: 'r', message: long });
+  assert.equal(r.text, full.a1, 'the whole reply, not the capped one');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
+});
+
+test('a resend of a running turn rejoins it even when the share is at its cap or busy; its catch-up text is redacted', async () => {
+  const s = setup({ reply: () => null });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 2 });
+  s.activate();
+  const deltas = [];
+  const a = s.req.turn('peer:sh1:jarvis', { turnId: 'a', roomId: 'r1', message: 'x' }, { onDelta: t => deltas.push(t) });
+  const b = s.req.turn('peer:sh1:jarvis', { turnId: 'b', roomId: 'r2', message: 'x' }).catch(e => e);
+  await wait(20);
+  const runA = s.ownerCalls.find(c => c.method === 'chat.send' && /^peer-/.test(c.params.idempotencyKey)).params.idempotencyKey;
+  s.owner.onGatewayEvent({ event: 'chat', payload: { runId: runA, state: 'delta', message: { content: [{ type: 'text', text: 'key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789' }] } } });
+  assert.equal(s.owner._usage('sh1'), 2, 'at the cap');
+  [...s.owner._served][0].close();
+  await wait(60);
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 2, 'no new run');
+  assert.ok(deltas.length >= 2 && !/abcdefghijklmnop/.test(deltas.at(-1)), `catch-up delta redacted: ${deltas.at(-1)}`);
+  await s.req.abort('peer:sh1:jarvis', 'a'); await s.req.abort('peer:sh1:jarvis', 'b');
+  assert.equal((await a).state, 'aborted');
+  await b;
+});
+
+test('finished turns are kept at most 200, oldest dropped first', () => {
+  const s = setup();
+  for (let i = 0; i < 205; i++) s.owner._rememberTurn(`sh1|t${i}`, { same: 'x', result: { state: 'final', text: String(i) } });
+  assert.equal(s.owner._finished.size, 200);
+  assert.equal(s.owner._recentTurn('sh1|t4'), null);
+  assert.equal(s.owner._recentTurn('sh1|t5').result.text, '5');
+});
+
+/** The owner's gateway restarted mid-run and resumes it (2026.11.x): a run of its own starts after a few polls. */
+async function recoveringOwner(s, { finish = true } = {}) {
+  await s.req.turn('peer:sh1:jarvis', { turnId: 'warm-up', roomId: 'r0', message: 'hi' });
+  const sent = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.message;
+  s.ownerCalls.length = 0;
+  let polls = 0;
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => {
+    const key = [...s.owner._turns.values()][0]?.runId;
+    if (method === 'sessions.describe') {
+      s.ownerCalls.push({ method });
+      polls++;
+      const running = polls >= 3 && (!finish || polls < 6);
+      return { session: { key: params.key, sessionId: 'phys-2', hasActiveRun: running, activeRunIds: running ? ['recovery-run'] : [] } };
+    }
+    if (method === 'chat.history') return { messages: [
+      { role: 'user', content: sent, __openclaw: { idempotencyKey: `${key}:user` } },
+      ...(polls >= 6 && finish ? [
+        { role: 'user', content: 'The Gateway restarted while you were working. Resume your work…', provenance: { kind: 'internal_system', sourceTool: 'restart' } },
+        { role: 'assistant', content: [{ type: 'text', text: 'the resumed reply' }] },
+      ] : []),
+    ] };
+    return request(method, params);
+  };
+}
+
+test("a turn the owner's gateway restart cut off: the gateway's own resumed run is waited for, and its reply returned", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await recoveringOwner(s);
+  assert.deepEqual(await s.req.turn('peer:sh1:jarvis', { turnId: 'team-14', roomId: 'r', message: 'hi' }), { state: 'final', text: 'the resumed reply' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0, 'not sent again');
+});
+
+test('Stop while the gateway resumes a turn: the resumed run is aborted, fenced, and the turn ends aborted', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  await recoveringOwner(s, { finish: false });
+  const run = s.req.turn('peer:sh1:jarvis', { turnId: 'team-15', roomId: 'r', message: 'hi' });
+  await wait(40);
+  await s.req.abort('peer:sh1:jarvis', 'team-15');
+  assert.deepEqual(await run, { state: 'aborted', text: '' });
+  const abort = s.ownerCalls.find(c => c.method === 'chat.abort' && c.params.runId === 'recovery-run')?.params;
+  assert.ok(abort, 'the resumed run was aborted');
 });

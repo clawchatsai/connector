@@ -4,6 +4,7 @@ import { Database } from './bootstrap/native.js';
 import { createTeamStore } from './store/team-store.js';
 import { TeamCoordinator, parseMentions, namedIn, splitLabel, entryId } from './team.js';
 import { SessionLens } from './session-lens.js';
+import { createChatAbort } from './util/chat-abort.js';
 
 const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'Dev' } }, { id: 'atlas', identity: { name: 'Atlas' } }];
 
@@ -1201,4 +1202,36 @@ test("other people's lines (and our agents' answers for them) are quoted to an a
   const guest = h.team._prompt(self, [self], fresh, 'addressed');
   assert.doesNotMatch(guest, /Only your owner's messages/);
   assert.match(guest, /\(another person in this chat/);
+});
+
+test('stop is fenced to the session the run started in (where the gateway takes sessionId)', async () => {
+  const pending = [];
+  const h = harness(agent => new Promise(resolve => pending.push({ agent, resolve })));
+  const request = h.team.request;
+  h.team.chatAbort = createChatAbort(async (m, p) => (m === 'sessions.describe' ? { session: { key: p.key, sessionId: 'phys-1' } } : request(m, p)));
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@dev one', userLabel: 'H' });
+  for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+  await h.team.stop(roomKey);
+  const abort = h.calls.find(c => c.method === 'chat.abort').params;
+  assert.equal(abort.sessionId, 'phys-1');
+  assert.equal(abort.runId, h.calls.find(c => c.method === 'chat.send').params.idempotencyKey);
+  pending[0].resolve(null);
+  await h.settle();
+});
+
+test("a shared agent's turn gets the room's stopped(), so a dropped link isn't resent after Stop", async () => {
+  let opts;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil', shareId: 'sh1' }],
+    ownerOf: () => 'gwK',
+    turn: async (agentId, p, o) => { opts = o; return { state: 'final', text: 'hi' }; },
+    abort: async () => {},
+  };
+  const h = harness(() => 'ok', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await h.team.send(roomKey, { text: '@Jarvis hello', userLabel: 'H' });
+  await h.settle();
+  assert.equal(typeof opts?.stopped, 'function');
+  assert.equal(opts.stopped(), false);
 });

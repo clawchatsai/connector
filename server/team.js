@@ -15,6 +15,7 @@
 
 import crypto from 'node:crypto';
 import { defangLocalPaths, EMPTY_REPLY_ERROR } from './peer/sharing.js';
+import { createChatAbort } from './util/chat-abort.js';
 
 // An agent passes with our own token, a visible reply to the gateway. Not NO_REPLY: since 2026.10.1 a user-triggered
 // turn must produce a reply, so NO_REPLY ends a claude-cli run with "CLI backend returned an empty response." (no
@@ -113,9 +114,10 @@ export class TeamCoordinator {
    * @param {(method: string, params: object, timeoutMs?: number) => Promise<any>} opts.request  gateway RPC
    * @param {(data: string) => void} opts.broadcast  frame to all browsers
    */
-  constructor({ store, request, broadcast, titler = null, remote = null, logger = console }) {
+  constructor({ store, request, chatAbort = null, broadcast, titler = null, remote = null, logger = console }) {
     this.store = store;
     this.request = request;
+    this.chatAbort = chatAbort || createChatAbort((m, p, t) => this.request(m, p, t)); // chat.abort, fenced to the run's session where supported (util/chat-abort.js)
     this.broadcast = broadcast;
     this.remote = remote; // other people's agents (peer/sharing.js): remoteAgents(), turn(), abort()
     this.titler = titler; // main-model title fallback (controllers/title.js createTitler)
@@ -548,7 +550,7 @@ export class TeamCoordinator {
       ? this.remote?.abortLocalFor(agentId, r.actingFor, r.runId).catch(e => this.log.warn?.(`[team] abort: ${e.message}`))
       : r.remote
         ? this.remote?.abort(agentId, r.runId).catch(e => this.log.warn?.(`[team] remote abort: ${e.message}`))
-        : this.request('chat.abort', { sessionKey: r.workKey, runId: r.runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`)))));
+        : this.chatAbort.abort({ sessionKey: r.workKey, runId: r.runId, sessionId: r.sessionId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`)))));
     this._status(roomKey);
   }
 
@@ -688,14 +690,17 @@ export class TeamCoordinator {
     const runId = `team-${crypto.randomUUID()}`;
     const live = this._live(roomKey);
     const done = this._waitRun(runId);
-    live.running.set(agentId, { workKey, runId });
+    const running = { workKey, runId, sessionId: null };
+    live.running.set(agentId, running);
     this._status(roomKey);
     let result;
     try {
       await this.request('chat.send', { sessionKey: workKey, message, deliver: false, idempotencyKey: runId }, 30_000);
+      // The session the run started in: a later Stop is fenced to it.
+      this.chatAbort.sessionIdOf(workKey).then(id => { running.sessionId = id; });
       // Stop pressed while the send was on its way (or being retried while the gateway starts): its abort reached the
       // gateway before the run existed and was a no-op (an unknown runId aborts nothing), so the run is stopped now.
-      if (stopped()) this.request('chat.abort', { sessionKey: workKey, runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`));
+      if (stopped()) this.chatAbort.abort({ sessionKey: workKey, runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`));
       this._setSeen(roomKey, agentId, OWNER_LANE, fresh);
       result = await done;
     } finally {
@@ -751,6 +756,7 @@ export class TeamCoordinator {
       this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
       result = await this.remote.turn(agentId, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier) },
         {
+          stopped, // a turn whose link dropped is sent again, unless the room was stopped meanwhile
           onDelta: text => { partial = text; delta(text); },
           onStatus: s => waiting(s?.waiting === 'approval' ? { owner, what: String(s.what || 'something').slice(0, 80), expiresAtMs: Number(s.expiresAtMs) || null } : null),
         });
