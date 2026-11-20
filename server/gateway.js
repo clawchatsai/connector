@@ -100,7 +100,7 @@ export class GatewayClient {
     this.ws = new WS(this.gatewayWsUrl);
     this.ws.on('open', () => { console.log('Gateway WebSocket connected'); this.reconnectAttempts = 0; });
     this.ws.on('message', data => this.handleGatewayMessage(data.toString()));
-    this.ws.on('close', () => { console.log('Gateway WebSocket closed'); this.connected = false; this._failPendingRpcs('gateway disconnected'); this.lens?.reset(); this.broadcastGatewayStatus(false); if (!this._closed) this.scheduleReconnect(); });
+    this.ws.on('close', () => { console.log('Gateway WebSocket closed'); this.connected = false; this._failPendingRpcs('gateway disconnected'); this.lens?.reset(); this.onDisconnected?.(); this.broadcastGatewayStatus(false); if (!this._closed) this.scheduleReconnect(); });
     this.ws.on('error', err => console.error('Gateway WebSocket error:', err.message));
   }
 

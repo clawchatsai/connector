@@ -19,27 +19,32 @@ export function normalizeTitle(raw) {
 }
 
 /**
- * Direct completion where the main model's provider has a direct transport; CLI and harness
- * runtimes (claude-cli, codex, …) only run in isolated agent-runtime mode.
+ * A host-run completion (api.runtime.llm.complete): direct where the model's provider has a direct
+ * transport; CLI and harness runtimes (claude-cli, codex, …) only run in isolated agent-runtime mode.
+ * `model` pins a model (needs plugins.entries.connector.llm.allowModelOverride); omitted = the host's default.
  * @param {{ complete?: (params: object) => Promise<{ text?: string }> }} llm  api.runtime.llm
+ * @param {{ systemPrompt: string, purpose: string, maxTokens?: number }} o
  */
-function createCompletion(llm) {
-  return async function complete(message) {
-    const base = { messages: [{ role: 'user', content: message }], systemPrompt: TITLE_PROMPT, purpose: 'clawchats.title', maxTokens: 64 };
+export function createCompletion(llm, { systemPrompt, purpose, maxTokens }) {
+  return async function complete(message, { model } = {}) {
+    const base = { messages: [{ role: 'user', content: message }], systemPrompt, purpose, maxTokens, ...(model ? { model } : {}) };
     try {
       return await llm.complete(base);
     } catch (err) {
       // Not a transport problem: isolated mode fails the same way. LLM_RUNTIME_LIFECYCLE (2026.11.5+): the plugin or
       // model runtime is reloading; the host says to retry from a fresh plugin operation, not inside this one.
-      if (['LLM_COMPLETION_NOT_AUTHORIZED', 'LLM_RUNTIME_LIFECYCLE', 'LLM_COMPLETION_ABORTED'].includes(err?.code)) throw err;
+      // 2026.11.6 reports a retired runtime (plugin reload) by message only.
+      if (['LLM_COMPLETION_NOT_AUTHORIZED', 'LLM_RUNTIME_LIFECYCLE', 'LLM_COMPLETION_ABORTED'].includes(err?.code) || /runtime is no longer active/i.test(err?.message || '')) throw err;
       return await llm.complete({ ...base, maxTokens: undefined, execution: { mode: 'isolated-agent-runtime', timeoutMs: TIMEOUT_MS } });
     }
   };
 }
 
+const titleCompletion = llm => createCompletion(llm, { systemPrompt: TITLE_PROMPT, purpose: 'clawchats.title', maxTokens: 64 });
+
 /** message → title or null (null also when the host has no plugin model completion). */
 export function createTitler(llm) {
-  const complete = createCompletion(llm);
+  const complete = titleCompletion(llm);
   return async message => {
     if (typeof llm?.complete !== 'function' || typeof message !== 'string' || !message.trim()) return null;
     return normalizeTitle((await complete(Array.from(message.trim()).slice(0, SOURCE_MAX_CHARS).join('')))?.text);
@@ -50,7 +55,7 @@ export function createTitler(llm) {
  * @param {{ complete?: (params: object) => Promise<{ text?: string }> }} llm  api.runtime.llm
  */
 export function createTitleHandler(llm) {
-  const complete = createCompletion(llm);
+  const complete = titleCompletion(llm);
 
   return async function handleTitle(req, res) {
     if (typeof llm?.complete !== 'function') return sendError(res, 501, 'This OpenClaw version has no plugin model completion');

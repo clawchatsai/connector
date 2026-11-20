@@ -20,6 +20,8 @@ import { handleAgents } from './controllers/agents.js';
 import { createTitleHandler, createTitler } from './controllers/title.js';
 import { createSettingsHandlers } from './controllers/settings.js';
 import { createShareHandlers } from './controllers/shares.js';
+import { createSearchHandlers, createInboundTextFetcher } from './controllers/search.js';
+import { createTagHandlers } from './controllers/tags.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
 import { createTeamStore } from './store/team-store.js';
@@ -28,6 +30,11 @@ import { TeamCoordinator } from './team.js';
 import { SharingManager } from './peer/sharing.js';
 import { loadOrCreatePeerKey } from './peer/keys.js';
 import { createGuestAgent } from './peer/guest-agent.js';
+import { SearchStore } from './search/store.js';
+import { SearchIndexer } from './search/indexer.js';
+import { createTagStore } from './tags/store.js';
+import { Tagger } from './tags/tagger.js';
+import { readLegacyThreadSummaries } from './store/legacy-threads.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -53,7 +60,7 @@ export function createApp(config = {}) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
   let namesTimer = null;
-  function closeAll() { clearInterval(namesTimer); sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
+  function closeAll() { clearInterval(namesTimer); tagger?.close(); searchIndexer?.close(); searchStore?.close(); sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -98,10 +105,40 @@ export function createApp(config = {}) {
   const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, chatAbort, broadcast, titler: createTitler(config.llm), remote: sharing });
   // Exec Allows the gateway lost after a session change (OpenClaw 2026.9.7+; server/approval-retry.js).
   const lostAllows = new LostAllowRetry({ request: gwRequest });
-  gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
-  gatewayClient.onApprovalEvent = msg => { sharing?.onApprovalEvent(msg); lostAllows.onApprovalEvent(msg); };
-  gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); };
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
+  // Chat search: the connector's own full-text index of every chat (server/search/). Derived data in its
+  // own file; if it can't open (no FTS5, unreadable file) search falls back to the gateway's in the browser.
+  let searchStore = null, searchIndexer = null;
+  try {
+    searchStore = openSearchStore(path.join(DATA_DIR, 'search.db'));
+    searchIndexer = new SearchIndexer({
+      store: searchStore, request: gwRequest, lens: gatewayClient.lens, team,
+      fetchComment: createInboundTextFetcher({ gatewayWsUrl: gatewayUrl, gatewayToken }),
+      notify: frame => broadcast(JSON.stringify(frame)),
+    });
+    searchIndexer.start();
+  } catch (e) { console.error(`[search] index disabled: ${e.message}`); searchStore?.close(); searchStore = null; searchIndexer = null; }
+  const search = createSearchHandlers({ store: searchStore, indexer: searchIndexer });
+  // Chat tags and summaries (server/tags/): stored in global.db, read from and copied into the search index.
+  const tagStore = createTagStore(() => globalDbCache.get());
+  let tagger = null;
+  if (searchIndexer) {
+    try {
+      tagger = new Tagger({
+        tags: tagStore, search: searchStore, indexer: searchIndexer, llm: config.llm,
+        legacy: () => readLegacyThreadSummaries(DATA_DIR), notify: frame => broadcast(JSON.stringify(frame)),
+      });
+      tagger.start();
+    } catch (e) { console.error(`[tags] disabled: ${e.message}`); tagger?.close(); tagger = null; }
+  }
+  const tagRoutes = createTagHandlers({ tags: tagStore, tagger, search: searchStore });
+  gatewayClient.onEvent = msg => {
+    team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg);
+    if (msg.event === 'sessions.changed') { try { searchIndexer?.onSessionsChanged(msg.payload); } catch (e) { console.warn(`[search] change: ${e.message}`); } }
+  };
+  gatewayClient.onApprovalEvent = msg => { sharing?.onApprovalEvent(msg); lostAllows.onApprovalEvent(msg); };
+  gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); searchIndexer?.onConnected(); };
+  gatewayClient.onDisconnected = () => searchIndexer?.onDisconnected();
   // Renamed agents: shares re-issued with the new names, copies of rooms here told (peer/sharing.js, team.js).
   const quiet = what => e => { if (!/not connected|closed/i.test(e.message)) console.warn(`[${what}] names: ${e.message}`); };
   namesTimer = setInterval(() => {
@@ -223,6 +260,19 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime() });
       if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
       if (method === 'POST' && urlPath === '/api/title') return await handleTitle(req, res);
+
+      // Chat search (controllers/search.js)
+      if (method === 'GET' && urlPath === '/api/search') return search.handleSearch(req, res, query);
+      if (method === 'GET' && urlPath === '/api/search/status') return search.handleStatus(req, res, query);
+      if (method === 'POST' && urlPath === '/api/search/rebuild') return await search.handleRebuild(req, res);
+
+      // Chat tags (controllers/tags.js)
+      if (method === 'GET' && urlPath === '/api/tags') return tagRoutes.handleList(req, res);
+      if (method === 'PATCH' && urlPath === '/api/tags/chat') return await tagRoutes.handleEdit(req, res);
+      if (method === 'POST' && urlPath === '/api/tags/retag') return await tagRoutes.handleRetag(req, res);
+      if (method === 'POST' && urlPath === '/api/tags/rename') return await tagRoutes.handleRename(req, res);
+      if (method === 'POST' && urlPath === '/api/tags/delete') return await tagRoutes.handleDelete(req, res);
+      if (method === 'POST' && urlPath === '/api/tags/settings') return await tagRoutes.handleSettings(req, res);
 
       // ClawChats-only extras (see EXTRAS.md)
       if (method === 'GET' && urlPath === '/api/extras/project-styles') {
@@ -441,6 +491,17 @@ export function createApp(config = {}) {
     debugLogger,
     dataDir: DATA_DIR,
   };
+}
+
+/** The search index; an unreadable file is moved aside and rebuilt (it only holds derived data). */
+function openSearchStore(file) {
+  try { return new SearchStore(file); }
+  catch (e) {
+    if (!fs.existsSync(file)) throw e;
+    console.warn(`[search] ${file} unreadable (${e.message}); starting a new index`);
+    for (const suffix of ['', '-wal', '-shm']) { try { fs.renameSync(file + suffix, `${file}${suffix}.broken`); } catch { /* absent */ } }
+    return new SearchStore(file);
+  }
 }
 
 // Standalone mode (node server/index.js or via isDirectRun check in bundle)
