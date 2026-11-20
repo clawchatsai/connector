@@ -5,6 +5,7 @@
 // Every device gets its own encrypted message (web-push.js); the signal server only signs VAPID tokens (vapid.js).
 // Tags: `chat-<sessionKey>` per chat (the in-tab desktop notification uses the same, frontend/ui/notifications.js),
 // `approval-<id>`, `question-<id>`, `cron-<jobId>`. A later push with the same tag replaces the earlier one.
+import fs from 'node:fs';
 import { postPush, pushAudience, isApplePush, encryptPayload, topicFor } from './web-push.js';
 
 export const APPROVAL_ESCALATE_MS = 2 * 60_000;
@@ -65,12 +66,13 @@ export class PushNotifier {
    * @param {() => string} [o.gatewayId]
    * @param {() => string} [o.gatewayName]
    */
-  constructor({ store, presence, vapid, lens, request, gatewayId = () => '', gatewayName = () => '', post = postPush, escalateMs = APPROVAL_ESCALATE_MS, now = Date.now, log = console, timers = globalThis }) {
-    Object.assign(this, { store, presence, vapid, lens, request, gatewayId, gatewayName, post, escalateMs, now, log, timers });
+  constructor({ store, presence, vapid, lens, request, gatewayId = () => '', gatewayName = () => '', post = postPush, escalateMs = APPROVAL_ESCALATE_MS, now = Date.now, log = console, timers = globalThis, stateFile = null }) {
+    Object.assign(this, { store, presence, vapid, lens, request, gatewayId, gatewayName, post, escalateMs, now, log, timers, stateFile });
     this.rows = new Map();       // session key -> { title, unread, incognito }
     this.replies = new Map();    // session key -> { count, lastBuzzAt } since the chat was last read
     this.pending = new Map();    // `approval-<id>` / `question-<id>` -> { kind, item, pushed: Set<deviceId>, timers }
     this._agents = null;
+    this._loadState();
   }
 
   // ── What the connector learns about chats (SessionLens rows and events) ──
@@ -206,11 +208,41 @@ export class PushNotifier {
   /** An approval or question waiting on the owner: pushed now when away; approvals also after 2 minutes regardless. */
   _track(tag, slot, pref, item, escalate) {
     if (this.pending.get(tag) !== slot) return; // resolved while its names loaded
-    const e = Object.assign(slot, { pref, item });
-    e.timers.push(this.timers.setTimeout(() => this._run(this._settle(tag, 'Expired')), Math.max(0, item.expiresAtMs - this.now())));
-    if (escalate) e.timers.push(this.timers.setTimeout(() => { if (this.pending.get(tag) === e) this._run(this._pushPending(tag, e, { escalated: true })); }, this.escalateMs));
-    for (const t of e.timers) t?.unref?.();
+    const e = Object.assign(slot, { pref, item, escalateAt: escalate ? this.now() + this.escalateMs : null });
+    this._arm(tag, e);
+    this._saveState();
     if (!this.presence.isPresent()) return this._pushPending(tag, e);
+  }
+
+  /** Expiry and (approvals) escalation timers of a pending entry. */
+  _arm(tag, e) {
+    e.timers.push(this.timers.setTimeout(() => this._run(this._settle(tag, 'Expired')), Math.max(0, e.item.expiresAtMs - this.now())));
+    if (e.escalateAt != null) e.timers.push(this.timers.setTimeout(() => { if (this.pending.get(tag) === e) this._run(this._pushPending(tag, e, { escalated: true })); }, Math.max(0, e.escalateAt - this.now())));
+    for (const t of e.timers) t?.unref?.();
+  }
+
+  // Pending approvals/questions and the devices already told survive a connector restart (plugin reloads hand running
+  // turns over): the new process neither pushes them again nor loses their Handled/Expired replacement or escalation.
+  _saveState() {
+    if (!this.stateFile) return;
+    const pending = [...this.pending].filter(([, e]) => e.item).map(([tag, e]) => ({ tag, pref: e.pref, item: e.item, pushed: [...e.pushed], escalateAt: e.escalateAt }));
+    try {
+      const tmp = `${this.stateFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ pending }), { mode: 0o600 });
+      fs.renameSync(tmp, this.stateFile);
+    } catch (err) { this.log.warn?.(`[push] could not save pending state: ${err.message}`); }
+  }
+
+  _loadState() {
+    if (!this.stateFile) return;
+    let saved;
+    try { saved = JSON.parse(fs.readFileSync(this.stateFile, 'utf8')); } catch { return; }
+    for (const p of Array.isArray(saved?.pending) ? saved.pending : []) {
+      if (!p?.tag || !p.item || !(p.item.expiresAtMs > this.now())) continue;
+      const e = { pref: p.pref, item: p.item, pushed: new Set(p.pushed || []), timers: [], escalateAt: p.escalateAt ?? null };
+      this.pending.set(p.tag, e);
+      this._arm(p.tag, e);
+    }
   }
 
   async _pushPending(tag, e, { escalated = false } = {}) {
@@ -219,6 +251,7 @@ export class PushNotifier {
     try {
       const sent = await this._deliver(e.pref, { ...e.item, escalated }, { skip: id => e.pushed.has(id) });
       for (const id of sent) e.pushed.add(id);
+      if (sent.length) this._saveState();
     } finally { e.sending = false; }
   }
 
@@ -229,6 +262,7 @@ export class PushNotifier {
     this.pending.delete(tag);
     if (!e.item) return;
     for (const t of e.timers) this.timers.clearTimeout(t);
+    this._saveState();
     if (!e.pushed.size) return;
     const { item } = e;
     await this._deliver(e.pref, {

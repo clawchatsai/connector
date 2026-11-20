@@ -41,7 +41,7 @@ export function createPush({ dataDir, lens, request, gatewayId, requestVapid, lo
   const store = new PushStore(path.join(dataDir, 'push-subscriptions.json'));
   const presence = new Presence({ idleMs: dev.idleMs });
   const vapid = new VapidTokens({ fetchToken });
-  const notifier = new PushNotifier({ store, presence, vapid, lens, request, gatewayId, gatewayName: () => os.hostname(), escalateMs: dev.escalateMs, log });
+  const notifier = new PushNotifier({ store, presence, vapid, lens, request, gatewayId, gatewayName: () => os.hostname(), escalateMs: dev.escalateMs, log, stateFile: path.join(dataDir, 'push-pending.json') });
   return {
     store, presence, notifier,
     /** The applicationServerKey browsers subscribe with when it isn't the signal server's (test override), else null. */

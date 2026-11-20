@@ -13,19 +13,20 @@ const FCM = 'https://fcm.googleapis.com/fcm/send/';
 const APPLE = 'https://web.push.apple.com/';
 
 /** Fake clock + timers, a store in a temp dir, a push service that records (and decrypts) what it gets. */
-function harness({ statuses = [], escalateMs = 120_000 } = {}) {
-  let now = 1_000_000;
+/** `restartOf`: a new connector process over the same data dir and devices (the previous harness). */
+function harness({ statuses = [], escalateMs = 120_000, restartOf = null } = {}) {
+  let now = restartOf ? restartOf.now() : 1_000_000;
   const timers = [];
   const clock = {
     setTimeout: (fn, ms) => { const t = { at: now + ms, fn, done: false }; timers.push(t); return t; },
     clearTimeout: t => { if (t) t.done = true; },
   };
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-'));
+  const dir = restartOf?.dir || fs.mkdtempSync(path.join(os.tmpdir(), 'push-'));
   const store = new PushStore(path.join(dir, 'push-subscriptions.json'));
   const presence = new Presence({ now: () => now });
   const vapidCalls = [];
   const vapid = new VapidTokens({ now: () => now, fetchToken: async aud => { vapidCalls.push(aud); return { jwt: 'jwt', exp: now / 1000 + 43200, publicKey: 'PUB' }; } });
-  const subs = new Map(); // endpoint -> fake subscription
+  const subs = restartOf?.subs || new Map(); // endpoint -> fake subscription
   const sent = [];
   const post = async (endpoint, body, opts) => {
     const s = subs.get(endpoint);
@@ -34,7 +35,7 @@ function harness({ statuses = [], escalateMs = 120_000 } = {}) {
   };
   const topLevel = new Set(['agent:main:dashboard:a', 'agent:main:dashboard:b']);
   const n = new PushNotifier({
-    store, presence, vapid, post, escalateMs, now: () => now, timers: clock, log: { info() {}, warn() {} },
+    store, presence, vapid, post, escalateMs, now: () => now, timers: clock, log: { info() {}, warn() {} }, stateFile: path.join(dir, 'push-pending.json'),
     lens: { isTopLevel: k => topLevel.has(k) },
     request: async m => (m === 'agents.list' ? { agents: [{ id: 'main', identity: { name: 'Jarvis' } }] } : null),
     gatewayId: () => 'gw_1', gatewayName: () => 'homebox',
@@ -54,7 +55,7 @@ function harness({ statuses = [], escalateMs = 120_000 } = {}) {
   const approval = async (event, payload) => { n.onApprovalEvent({ type: 'event', event, payload }); for (let i = 0; i < 5; i++) await flush(); };
   const final = (key, text, extra = {}) => event('chat', { sessionKey: key, state: 'final', runId: 'r', message: { role: 'assistant', content: [{ type: 'text', text }] }, ...extra });
   const present = (on = true) => { presence.update('c1', { visible: on, focused: on, idleMs: 0 }); n.presenceChanged(); };
-  return { n, store, presence, sent, vapidCalls, device, advance, event, approval, final, present, now: () => now };
+  return { n, store, presence, sent, vapidCalls, device, advance, event, approval, final, present, now: () => now, dir, subs };
 }
 
 test('markdown is stripped and the reply is the text after the last tool call', () => {
@@ -289,14 +290,39 @@ test('one approval is one push per device: repeated events, presence flapping, e
   for (let i = 0; i < 3; i++) { h.present(true); await h.advance(10_000); h.present(false); await h.advance(10_000); }
   await h.advance(130_000); // past the escalation
   assert.deepEqual(h.sent.filter(s => s.payload.kind === 'approval').map(s => s.endpoint).sort(), [`${FCM}desk`, `${APPLE}iphone`].sort());
-  // A restarted connector starts empty and the gateway announces an approval only when it is created
-  // (approval-shared.ts): a resolve or presence change for it pushes nothing.
-  const restarted = harness();
-  restarted.device(`${FCM}desk`);
-  await restarted.approval('exec.approval.resolved', { id: 'ap1', decision: 'allow-once' });
-  restarted.present(false);
-  await restarted.advance(200_000);
-  assert.equal(restarted.sent.length, 0);
+  // A restarted connector (plugin reloads hand running turns over) picks the pending approval up from push-pending.json:
+  // a replayed request pushes nothing, the escalation doesn't fire again, and the resolve still replaces it on Android.
+  h.n.presence.update('c1', { visible: true, idleMs: 0 }); // the first process's last word: present
+  const r = harness({ restartOf: h });
+  await r.approval('exec.approval.requested', execApproval('ap1'));
+  r.present(false);
+  await r.advance(200_000);
+  assert.equal(r.sent.length, 0);
+  await r.approval('exec.approval.resolved', { id: 'ap1', decision: 'allow-once' });
+  assert.deepEqual(r.sent.map(s => [s.endpoint, s.payload.kind]), [[`${FCM}desk`, 'approval-done']]);
+  assert.equal(fs.statSync(path.join(h.dir, 'push-pending.json')).mode & 0o777, 0o600);
+  // settled: a later restart has nothing pending
+  assert.equal(harness({ restartOf: r }).n.pending.size, 0);
+});
+
+test('restart: an approval not yet pushed (owner was present) still escalates on time; expired ones are dropped', async () => {
+  const h = harness({ escalateMs: 120_000 });
+  h.device(`${FCM}desk`);
+  h.present(true);
+  await h.approval('exec.approval.requested', execApproval('ap1'));
+  await h.approval('exec.approval.requested', execApproval('ap2', { expiresAtMs: h.now() + 60_000 }));
+  await h.advance(50_000);
+  assert.equal(h.sent.length, 0);
+  const r = harness({ restartOf: h, escalateMs: 120_000 });
+  r.present(true);
+  await r.advance(69_000);
+  assert.equal(r.sent.length, 0); // 119 s since the request
+  await r.advance(2_000);
+  assert.deepEqual(r.sent.map(s => s.payload.tag), ['approval-ap1']); // ap2 expired unpushed, ap1 escalated once
+  const later = harness({ restartOf: r });
+  assert.deepEqual([...later.n.pending.keys()], ['approval-ap1']);
+  await later.advance(130_000);
+  assert.equal(later.sent.length, 0);
 });
 
 test('no answer from the push service: one retry at most, same Topic, without renotify', async () => {
