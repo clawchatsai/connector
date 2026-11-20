@@ -29,7 +29,7 @@ test('a child of an unresolved parent stays hidden, even for partial events', ()
 
 test('visible change is trimmed; catalog events pass', () => {
   const { l } = lens();
-  const f = l.sessionsChanged({ sessionKey: CHAT, reason: 'patch', ts: 5, label: 'Hi', category: 'Default', participants: [1, 2], swarm: {}, session: { key: CHAT, label: 'Hi', owner: {}, thinkingOptions: [] } });
+  const f = l.sessionsChanged({ sessionKey: CHAT, reason: 'patch', ts: 5, label: 'Hi', category: 'Default', participants: [1, 2], swarm: {}, session: { key: CHAT, label: 'Hi', facets: {}, thinkingOptions: [] } });
   assert.deepEqual(f.payload, { sessionKey: CHAT, reason: 'patch', ts: 5, label: 'Hi', category: 'Default', session: { key: CHAT, label: 'Hi' } });
   assert.equal(l.sessionsChanged({ sessionKey: DISCORD, reason: 'send', channel: 'discord' }), null);
   assert.deepEqual(l.sessionsChanged({ reason: 'groups', ts: 1 }).payload, { reason: 'groups', ts: 1 });
@@ -52,7 +52,7 @@ test('browser sessions.list gets defaults and a filtered, trimmed response', () 
   const res = l.response({ type: 'res', id: 'r1', ok: true, payload: {
     ts: 1, count: 4, totalCount: 4, hasMore: false, nextOffset: null, owners: [{}],
     sessions: [
-      { key: CHAT, label: 'a', owner: {}, classification: 'direct' },
+      { key: CHAT, label: 'a', facets: {}, classification: 'direct' },
       { key: LEGACY, label: 'b', classification: 'direct' },
       { key: CHILD, parentSessionKey: CHAT, classification: 'direct' },
       { key: DISCORD, classification: 'channel' },
@@ -145,6 +145,12 @@ test('seedWithRetry retries a failed roster', async () => {
 
 test('trimRow keeps only allow-listed fields', () => {
   assert.deepEqual(trimRow({ key: 'k', unread: true, participants: [], thinkingOptions: [] }), { key: 'k', unread: true });
+});
+
+test('trimRow keeps the Dashboards page author fields', () => {
+  const createdActor = { kind: 'agent', id: 'main', label: 'Main' };
+  const owner = { actor: { kind: 'user', id: 'u1', label: 'Houman' } };
+  assert.deepEqual(trimRow({ key: 'k', createdActor, owner, participants: [] }), { key: 'k', createdActor, owner });
 });
 
 test('trimRow keeps the Subagents panel fields (waiting on own runs, live headline)', () => {
@@ -245,7 +251,7 @@ test('spawned children of a visible chat are visible, nested via ccParentKey', (
   const { l } = lens();
   l.observe(CHAT, { key: CHAT, kind: 'direct', createdVia: 'operator', parentSessionKey: 'agent:main:main', spawnDepth: 0 });
   // hidden run (subagent key)
-  const f = l.sessionsChanged({ sessionKey: RUN, reason: 'create', session: { key: RUN, kind: 'direct', spawnedBy: CHAT, parentSessionKey: CHAT, spawnDepth: 1, label: 'Review', owner: {} } });
+  const f = l.sessionsChanged({ sessionKey: RUN, reason: 'create', session: { key: RUN, kind: 'direct', spawnedBy: CHAT, parentSessionKey: CHAT, spawnDepth: 1, label: 'Review', facets: {} } });
   assert.deepEqual(f.payload.session, { key: RUN, kind: 'direct', label: 'Review', ccParentKey: CHAT });
   // later partial events keep the link
   assert.equal(l.sessionsChanged({ sessionKey: RUN, phase: 'message', ts: 2 }).payload.ccParentKey, CHAT);

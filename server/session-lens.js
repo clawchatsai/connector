@@ -48,6 +48,8 @@ export const ROW_FIELDS = new Set([
   'startedAt', 'runtimeMs', 'ccParentKey',
   // Subagents panel: a run waiting on its own runs, and the run's live headline.
   'hasActiveSubagentRun', 'observerDigest',
+  // Dashboards page: a card's author (Control UI pages/dashboards dashboardAuthor).
+  'createdActor', 'owner',
 ]);
 
 // `sessions.changed` envelope fields (snapshot fields are spread next to these).
