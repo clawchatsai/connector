@@ -47,6 +47,9 @@ npm run build
 # The plugin imports ../server/index.js (source dir), not a bundle.
 rsync -a --delete --exclude='*.test.js' server/ "$D/server/"
 cp dist/*.js "$D/dist/"
+# Peers read this connector's version from package.json (server/peer/version.js; 0.3.0+ refuse older peers), so the
+# installed copy must carry the deployed one.
+cp package.json "$D/package.json"
 DIRTY=clean
 [ -z "$(git status --porcelain -- server src)" ] || DIRTY=dirty
 printf '%s\n%s\n%s\n%s\n' "$BRANCH" "$SHA" "$(date -Is) from $(pwd)" "$DIRTY" > "$MARKER"
