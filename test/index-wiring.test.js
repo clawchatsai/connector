@@ -27,3 +27,10 @@ test('the four words of a key: the same vector as the browser\'s tests/unit/devi
   assert.equal(publicKeyWords(PUB), 'rearview-punk-donut-paralegal');
   assert.equal(publicKeyFingerprint(PUB), 'f135-f615-eca6-1060-782b');
 });
+
+test('presence reports are read only on a signed-in channel, and a closed channel counts as away', () => {
+  const authed = /function processAuthenticatedMessage\([\s\S]*?\n\}/.exec(src)?.[0] || '';
+  assert.match(authed, /case 'presence':\s*\n\s*app\?\.push\?\.updatePresence\(connectionId, msg\)/);
+  assert.equal(src.match(/case 'presence'/g).length, 1);
+  assert.match(src, /webrtcPeer\.on\('datachannel-closed'[\s\S]*?app\?\.push\?\.removePresence\(connectionId\)/);
+});

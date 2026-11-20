@@ -72,6 +72,11 @@ interface AppInstance {
     handleClientDisconnect: (ws: unknown) => void;
   };
   dataDir: string;
+  /** Push notifications (server/push/): presence reports from signed-in browsers. */
+  push?: {
+    updatePresence: (connectionId: string, msg: Record<string, unknown>) => void;
+    removePresence: (connectionId: string) => void;
+  };
   /** Gateway sharing (server/peer/sharing.js); null when the host gave no peer transport. */
   sharing: {
     setShares: (shares: unknown[]) => void;
@@ -170,6 +175,31 @@ function openPeerLink(shareId: string): Promise<{ dc: DataChannelLike; dtls: { l
     peerOpens.set(shareId, { resolve, reject, timer });
     signaling!.send({ type: 'peer-connect-request', shareId });
   });
+}
+
+// Push notifications: VAPID tokens the signal server signs for one push service (server/push/vapid.js caches them).
+const VAPID_TIMEOUT_MS = 15_000;
+const vapidRequests = new Map<string, { resolve: (v: { jwt: string; exp: number; publicKey: string }) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+let vapidSeq = 0;
+
+function requestVapid(audience: string): Promise<{ jwt: string; exp: number; publicKey: string }> {
+  if (!signaling?.isConnected) return Promise.reject(new Error('Not connected to ClawChats'));
+  const reqId = `v${++vapidSeq}`;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { vapidRequests.delete(reqId); reject(new Error('signal server did not answer')); }, VAPID_TIMEOUT_MS);
+    timer.unref?.();
+    vapidRequests.set(reqId, { resolve, reject, timer });
+    signaling!.send({ type: 'push-vapid-request', reqId, audience });
+  });
+}
+
+function settleVapid(msg: Record<string, unknown>): void {
+  const p = vapidRequests.get(String(msg['reqId']));
+  if (!p) return;
+  vapidRequests.delete(String(msg['reqId']));
+  clearTimeout(p.timer);
+  if (msg['type'] === 'push-vapid') p.resolve({ jwt: String(msg['jwt']), exp: Number(msg['exp']), publicKey: String(msg['publicKey']) });
+  else p.reject(new Error(`signal server refused a VAPID token (${String(msg['reason'] || 'unknown')})`));
 }
 
 function settlePeerOpen(shareId: string, outcome: { dc: DataChannelLike; dtls: { local: string; remote: string } } | Error): void {
@@ -484,6 +514,7 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
       signal: (msg: Record<string, unknown>) => signaling?.send(msg),
       openPeer: (shareId: string) => openPeerLink(shareId),
     },
+    push: { requestVapid },
     openaiApiKey:  (() => {
       // Resolve OpenAI API key: openclaw config → env var
       try {
@@ -542,6 +573,8 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
     });
     if (saved) ctx.logger.info(`[clawchats] saved gateway id ${id} (this install had none; it logged in by user id)`);
   });
+
+  signaling.on('push-vapid', (msg: Record<string, unknown>) => settleVapid(msg));
 
   signaling.on('connected', () => {
     ctx.logger.info('Connected to signaling server');
@@ -621,6 +654,7 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
   webrtcPeer.on('datachannel-closed', (connectionId: string) => {
     ctx.logger.info(`Browser disconnected: ${connectionId}`);
     connectedClients.delete(connectionId);
+    app?.push?.removePresence(connectionId); // a closed window is away
     for (const tunnel of desktopTunnels.get(connectionId) ?? []) tunnel.close();
     desktopTunnels.delete(connectionId);
     signaling?.reportConnectionCount(webrtcPeer?.activeCount ?? 0);
@@ -743,6 +777,7 @@ function setupDataChannelHandler(
 ): void {
   dc.onClosed(() => {
     connectedClients.delete(connectionId);
+    app?.push?.removePresence(connectionId);
     rpcReqChunks.dropConnection(connectionId);
     gatewayMsgChunks.dropConnection(connectionId);
     app?.debugLogger.handleClientDisconnect(dc);
@@ -856,6 +891,11 @@ function processAuthenticatedMessage(
 
     case 'ping':
       dc.send(JSON.stringify({ type: 'pong' }));
+      break;
+
+    // Is the owner at this window? (push notifications wait while they are: server/push/presence.js)
+    case 'presence':
+      app?.push?.updatePresence(connectionId, msg);
       break;
 
     case 'clawchats':

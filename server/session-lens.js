@@ -186,6 +186,7 @@ export class SessionLens {
   observe(key, row) {
     if (this.onboarding.has(key)) return true;
     if (!isChildCandidateKey(key)) return false;
+    if (this.onRow) { try { this.onRow(key, row); } catch (e) { this.log.warn?.(`[lens] row observer: ${e.message}`); } }
     const verdict = SUBAGENT_KEY.test(key) ? true : rowVerdict(row);
     if (verdict === true) {
       this.hidden.add(key);
@@ -202,6 +203,9 @@ export class SessionLens {
   isVisible(key) {
     return this._isTopLevel(key) || !!this.parentOf(key);
   }
+
+  /** A chat of its own in the sidebar (not a nested child, team work session or utility session). */
+  isTopLevel(key) { return this._isTopLevel(key); }
 
   _isTopLevel(key) {
     if (this.onboarding.has(key)) return true;

@@ -23,10 +23,12 @@ import { createSettingsHandlers } from './controllers/settings.js';
 import { createShareHandlers } from './controllers/shares.js';
 import { createSearchHandlers, createInboundTextFetcher } from './controllers/search.js';
 import { createTagHandlers } from './controllers/tags.js';
+import { createPushHandlers } from './controllers/push.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
 import { createTeamStore } from './store/team-store.js';
 import { SessionLens } from './session-lens.js';
+import { createPush } from './push/index.js';
 import { TeamCoordinator } from './team.js';
 import { SharingManager } from './peer/sharing.js';
 import { loadOrCreatePeerKey } from './peer/keys.js';
@@ -110,6 +112,19 @@ export function createApp(config = {}) {
   // Exec Allows the gateway lost after a session change (OpenClaw 2026.9.7+; server/approval-retry.js).
   const lostAllows = new LostAllowRetry({ request: gwRequest });
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
+  // Push notifications to the owner's devices (server/push/). While a device wants approval pushes, the
+  // approval-client connection stays up with no tab open, so approvals wait for an answer from the phone.
+  const push = createPush({ dataDir: DATA_DIR, lens: gatewayClient.lens, request: gwRequest, gatewayId: () => config.peer?.gatewayId?.() || '', requestVapid: config.push?.requestVapid });
+  gatewayClient.lens.onRow = (key, row) => push.notifier.noteRow(key, row);
+  let releasePushApprovals = null;
+  const syncPushApprovals = () => {
+    const want = push.store.list().some(d => d.prefs.approvals);
+    if (want && !releasePushApprovals) { releasePushApprovals = true; gatewayClient.holdApprovals().then(release => { if (releasePushApprovals === true) releasePushApprovals = release; else release(); }); }
+    else if (!want && releasePushApprovals) { if (typeof releasePushApprovals === 'function') releasePushApprovals(); releasePushApprovals = null; }
+  };
+  push.store.onChange = syncPushApprovals;
+  syncPushApprovals();
+  const handlePush = createPushHandlers(push);
   // Chat search: the connector's own full-text index of every chat (server/search/). Derived data in its
   // own file; if it can't open (no FTS5, unreadable file) search falls back to the gateway's in the browser.
   let searchStore = null, searchIndexer = null;
@@ -138,9 +153,13 @@ export function createApp(config = {}) {
   const tagRoutes = createTagHandlers({ tags: tagStore, tagger, search: searchStore });
   gatewayClient.onEvent = msg => {
     team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg);
+    try { push.notifier.onGatewayEvent(msg); } catch (e) { console.warn(`[push] event: ${e.message}`); }
     if (msg.event === 'sessions.changed') { try { searchIndexer?.onSessionsChanged(msg.payload); } catch (e) { console.warn(`[search] change: ${e.message}`); } }
   };
-  gatewayClient.onApprovalEvent = msg => { sharing?.onApprovalEvent(msg); lostAllows.onApprovalEvent(msg); };
+  gatewayClient.onApprovalEvent = msg => {
+    sharing?.onApprovalEvent(msg); lostAllows.onApprovalEvent(msg);
+    try { push.notifier.onApprovalEvent(msg); } catch (e) { console.warn(`[push] approval: ${e.message}`); }
+  };
   gatewayClient.onConnected = () => {
     sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); searchIndexer?.onConnected();
     // A previous connector stopped mid-round or mid-Allow (a plugin reload hands running turns over to this one).
@@ -270,6 +289,9 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime() });
       if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
       if (method === 'POST' && urlPath === '/api/title') return await handleTitle(req, res);
+
+      // Push notifications (controllers/push.js)
+      if (await handlePush(req, res, method, urlPath)) return;
 
       // Chat search (controllers/search.js)
       if (method === 'GET' && urlPath === '/api/search') return search.handleSearch(req, res, query);
@@ -530,6 +552,7 @@ export function createApp(config = {}) {
     team,
     sharing,
     peerKey,
+    push,
     setupBrowserWs,
     debugLogger,
     dataDir: DATA_DIR,

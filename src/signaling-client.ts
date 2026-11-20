@@ -344,6 +344,12 @@ export class SignalingClient extends EventEmitter {
         break;
       }
 
+      // A VAPID token for push notifications (requestVapid in index.ts)
+      case 'push-vapid':
+      case 'push-vapid-error':
+        this.emit('push-vapid', msg);
+        break;
+
       default: {
         // Unknown messages are silently ignored to allow forward compatibility
         break;
