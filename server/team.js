@@ -9,14 +9,19 @@
 //
 // Routing follows the gateway's broadcast group threads (docs/channels/broadcast-groups.md):
 // @mentioned agents answer; with no mention every agent gets the message but is told to answer
-// NO_REPLY unless it's for them (ClawChats choice); `@all` makes everyone answer. Follow-up rounds
+// PASS_TOKEN unless it's for them (ClawChats choice); `@all` makes everyone answer. Follow-up rounds
 // (the room's "discuss" toggle) go to agents that replied or were named, with the siblings'
 // replies, until everyone passes or the round/turn caps are hit. Round state is in memory only.
 
 import crypto from 'node:crypto';
-import { defangLocalPaths } from './peer/sharing.js';
+import { defangLocalPaths, EMPTY_REPLY_ERROR } from './peer/sharing.js';
 
-export const SILENT = /^\s*NO_REPLY\s*$/i;
+// An agent passes with our own token, a visible reply to the gateway. Not NO_REPLY: since 2026.10.1 a user-triggered
+// turn must produce a reply, so NO_REPLY ends a claude-cli run with "CLI backend returned an empty response." (no
+// final) and makes an API-model run re-prompt "NO_REPLY is not allowed", which posts filler. NO_REPLY still counts
+// (older prompts, peers on older connectors).
+export const PASS_TOKEN = 'NOTHING_TO_ADD';
+export const SILENT = /^\s*[`*]*(?:NOTHING_TO_ADD|NO_REPLY)[`*.]*\s*$/i;
 /** Room entry for an agent asked directly whose run was stopped before it said anything. */
 const STOPPED_EARLY = '*[stopped before replying]*';
 // Sessions ("lanes") an agent can answer a room from (team-store team_entries.via / team_lanes):
@@ -688,6 +693,9 @@ export class TeamCoordinator {
     let result;
     try {
       await this.request('chat.send', { sessionKey: workKey, message, deliver: false, idempotencyKey: runId }, 30_000);
+      // Stop pressed while the send was on its way (or being retried while the gateway starts): its abort reached the
+      // gateway before the run existed and was a no-op (an unknown runId aborts nothing), so the run is stopped now.
+      if (stopped()) this.request('chat.abort', { sessionKey: workKey, runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`));
       this._setSeen(roomKey, agentId, OWNER_LANE, fresh);
       result = await done;
     } finally {
@@ -709,6 +717,7 @@ export class TeamCoordinator {
         else this._recoverAfterAbort(roomKey, self, workKey, { marker: mode === 'addressed' });
         return { agentId, text: null };
       }
+      if (mode !== 'addressed' && !partial && EMPTY_REPLY_ERROR.test(result.errorMessage || '')) return { agentId, text: null }; // it passed
       throw Object.assign(new Error(result.errorMessage || 'run failed'), { partial });
     }
     const text = clean(result.message ? messageText(result.message) : await this._lastReply(workKey));
@@ -888,8 +897,8 @@ export class TeamCoordinator {
     const untrusted = owner && fresh.some(e => e.remote || e.person || e.forOther);
     const instruction = {
       addressed: 'The latest message is addressed to you. Reply to the team chat.',
-      open: 'The latest message is not addressed to anyone in particular. Reply only if it is clearly meant for you or you have something distinct to add; otherwise reply with exactly NO_REPLY.',
-      followup: 'Other participants just replied (above). Reply only if you have something new to add or were asked something; otherwise reply with exactly NO_REPLY. Do not just agree or repeat what was said.',
+      open: `The latest message is not addressed to anyone in particular. Reply only if it is clearly meant for you or you have something distinct to add; otherwise reply with exactly ${PASS_TOKEN} and nothing else.`,
+      followup: `Other participants just replied (above). Reply only if you have something new to add or were asked something; otherwise reply with exactly ${PASS_TOKEN} and nothing else. Do not just agree or repeat what was said.`,
     }[mode];
     return [
       `[Team chat] You are ${self.name}. Other agents here: ${others.join(', ') || 'none'}. Your reply is posted to the team chat as ${self.name}; address someone with @name.`,

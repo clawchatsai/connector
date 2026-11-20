@@ -13,6 +13,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { WebSocket } from 'ws';
 import { loadOrCreateDeviceIdentity, buildDeviceAuth } from './bootstrap/identity.js';
 import { parseSessionKey } from './util/helpers.js';
+import { SCOPES } from './gateway.js';
 
 const PLACEHOLDER_TITLES = new Set(['New chat', '']);
 
@@ -38,7 +39,10 @@ export async function withGateway({ url, token, identityPath }, fn) {
       let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
       if (msg.type === 'event' && msg.event === 'connect.challenge') {
         const identity = loadOrCreateDeviceIdentity(identityPath);
-        const scopes = ['operator.read'];
+        // The connector's own scopes (it's the same paired device). operator.read alone lists every session on a default
+        // gateway, but from 2026.11.5 a gateway with `gateway.roles` set shows a non-admin client none: the export would
+        // then take every chat for missing and write duplicates.
+        const scopes = SCOPES;
         const device = buildDeviceAuth(identity, { clientId: 'gateway-client', clientMode: 'backend', role: 'operator', scopes, token, nonce: msg.payload?.nonce || '' });
         ws.send(JSON.stringify({ type: 'req', id: 'connect', method: 'connect', params: { minProtocol: 3, maxProtocol: 4, client: { id: 'gateway-client', version: '0.1.0', platform: 'node', mode: 'backend' }, role: 'operator', scopes, device, auth: { token } } }));
         return;

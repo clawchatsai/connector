@@ -55,15 +55,48 @@ export function hasGuestRestrictions(tools) {
 export async function ensureGuestRestrictions(request, agentId) {
   const cfg = await request('config.get', {});
   if (hasGuestRestrictions(cfg?.parsed?.agents?.entries?.[agentId]?.tools)) return false;
-  await request('config.patch', {
-    raw: JSON.stringify({ agents: { entries: { [agentId]: { tools: GUEST_TOOLS } } } }),
-    ...(cfg?.hash ? { baseHash: cfg.hash } : {}),
-    // The gateway only lets a patch shrink an array named exactly (a parent path doesn't count),
-    // e.g. dropping view_image/pdf from an older guest's alsoAllow.
-    replacePaths: ['', '.alsoAllow', '.deny'].map(p => `agents.entries.${agentId}.tools${p}`),
-    note: `ClawChats sharing: guest restrictions for ${agentId}`,
-  }, 60_000);
+  try {
+    await request('config.patch', {
+      raw: JSON.stringify({ agents: { entries: { [agentId]: { tools: GUEST_TOOLS } } } }),
+      ...(cfg?.hash ? { baseHash: cfg.hash } : {}),
+      // The gateway only lets a patch shrink an array named exactly (a parent path doesn't count),
+      // e.g. dropping view_image/pdf from an older guest's alsoAllow.
+      replacePaths: ['', '.alsoAllow', '.deny'].map(p => `agents.entries.${agentId}.tools${p}`),
+      note: `ClawChats sharing: guest restrictions for ${agentId}`,
+    }, 60_000);
+  } catch (e) {
+    if (!persistedButNotApplied(e, agentId)) throw e;
+    // 2026.11.4+: the patch was saved but the running gateway didn't apply it yet (a plugin deferred the reload, or a
+    // restart is pending). Sharing it now is fine once it applies: until then the turn check (restrictionsPending)
+    // keeps the guest from being served on the old tool policy.
+    unappliedGuests.add(agentId);
+  }
   return true;
+}
+
+/** Guests whose restrictions were saved but not yet applied by the running gateway (see ensureGuestRestrictions). */
+export const unappliedGuests = new Set();
+
+/**
+ * Whether a guest's saved restrictions still aren't the running gateway's. Only for a guest ensureGuestRestrictions
+ * had to leave unapplied: config.get's configRevisionHash (saved) differs from appliedConfigHash (running) until the
+ * reload lands (the check the gateway's own CLI uses). Missing hashes (older gateways) count as applied.
+ */
+export function restrictionsPending(cfg, agentId) {
+  if (!unappliedGuests.has(agentId)) return false;
+  const saved = cfg?.configRevisionHash, applied = cfg?.appliedConfigHash;
+  if (typeof saved !== 'string' || typeof applied !== 'string' || saved === applied) { unappliedGuests.delete(agentId); return false; }
+  return true;
+}
+
+/**
+ * Whether a failed config.patch had saved its change anyway (2026.11.4+: UNAVAILABLE with details.persistedConfig).
+ * When the error carries the saved config (not on every path), it must show this guest's restrictions.
+ */
+export function persistedButNotApplied(e, agentId) {
+  const saved = e?.gatewayCode === 'UNAVAILABLE' && e.details?.persistedConfig;
+  if (!saved || typeof saved !== 'object') return false;
+  return saved.config === undefined || hasGuestRestrictions(saved.config?.agents?.entries?.[agentId]?.tools);
 }
 
 /** A new agent is only usable once the gateway's config reload picked it up. */

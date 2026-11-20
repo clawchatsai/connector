@@ -341,7 +341,7 @@ async function ensureNativeModules(ctx: PluginServiceContext): Promise<void> {
   if (!ndcRoot) {
     throw new Error(
       `the WebRTC library (node-datachannel) is missing from this install. ` +
-      `Reinstall the plugin: openclaw plugins install @clawchatsai/connector --force`,
+      `Reinstall the plugin: openclaw plugins install npm:@clawchatsai/connector --force`,
     );
   }
   const targetPath = path.join(ndcRoot, 'build', 'Release', 'node_datachannel.node');

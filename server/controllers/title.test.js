@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { createTitleHandler, normalizeTitle, TITLE_PROMPT } from './title.js';
+import { createTitleHandler, createTitler, normalizeTitle, TITLE_PROMPT } from './title.js';
 
 function call(handler, body) {
   const req = Readable.from([Buffer.from(JSON.stringify(body))]);
@@ -43,4 +43,11 @@ test('authorization failures are not retried; bad input is rejected', async () =
   assert.equal(n, 1);
   assert.equal((await call(handler, { message: '  ' })).status, 400);
   assert.equal((await call(createTitleHandler(undefined), { message: 'x' })).status, 501);
+});
+
+test('a runtime reload (2026.11.5+ LLM_RUNTIME_LIFECYCLE) is not retried in isolated mode', async () => {
+  let n = 0;
+  const titler = createTitler({ complete: async () => { n++; throw Object.assign(new Error('reloading'), { code: 'LLM_RUNTIME_LIFECYCLE' }); } });
+  await assert.rejects(titler('plan the offsite'), /reloading/);
+  assert.equal(n, 1);
 });

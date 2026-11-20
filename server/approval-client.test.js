@@ -41,7 +41,7 @@ test('no browser: no approval-client connection; main connection never declares 
   c.connect();
   await wait(200);
   assert.equal(gw.conns.length, 1);
-  assert.deepEqual(gw.conns[0].params.caps, ['tool-events']);
+  assert.deepEqual(gw.conns[0].params.caps, ['tool-events', 'chat-queue-status']);
   assert.equal(gw.approvalConns().length, 0);
   c.close();
   await new Promise(r => gw.wss.close(r));

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createGuestAgent, GUEST_TOOLS, GUEST_TOOLS_DENY, hasGuestRestrictions } from './guest-agent.js';
+import { createGuestAgent, ensureGuestRestrictions, restrictionsPending, unappliedGuests, GUEST_TOOLS, GUEST_TOOLS_DENY, hasGuestRestrictions } from './guest-agent.js';
 
 function fakeGateway() {
   const agents = [{ id: 'jarvis', identity: { name: 'Jarvis', emoji: '🤖' }, model: { primary: 'anthropic/claude-x' }, workspace: '/home/k/.openclaw/workspace' }];
@@ -101,4 +101,53 @@ test('a guest the gateway shows under the original\'s name is still found (and h
   assert.equal(findGuestAgent(agents, 'capy', new Set(['capy-guest']))?.id, 'capy-guest');
   assert.equal(findGuestAgent([agents[0], agents[2]], 'capy', new Set(['capy-guest-2']))?.id, 'capy-guest-2');
   assert.ok(isGuestAgent(agents[1], new Set(['capy-guest'])) && !isGuestAgent(agents[0], new Set(['capy-guest'])));
+});
+
+/** What a 2026.11.4+ gateway answers when config.patch saved the change but the running gateway didn't apply it. */
+const persistedError = (config, extra = {}) => Object.assign(new Error('config.patch persisted but was not applied to the active Gateway (plugin-reload-deferred)'), {
+  gatewayCode: 'UNAVAILABLE', details: { persistedConfig: { hash: 'h2', ...(config ? { config } : {}) } }, ...extra,
+});
+
+test('config.get -> config.patch round trip: baseHash from config.get, exact-path replacePaths (as the 11.6 handler requires)', async () => {
+  const calls = [];
+  await ensureGuestRestrictions(async (m, p) => {
+    calls.push([m, p]);
+    return m === 'config.get' ? { hash: 'abc', parsed: { agents: { entries: { g: { tools: { profile: 'full' } } } } } } : { ok: true };
+  }, 'g');
+  assert.equal(calls[1][1].baseHash, 'abc');
+  assert.deepEqual(calls[1][1].replacePaths, ['agents.entries.g.tools', 'agents.entries.g.tools.alsoAllow', 'agents.entries.g.tools.deny']);
+  assert.deepEqual(JSON.parse(calls[1][1].raw), { agents: { entries: { g: { tools: GUEST_TOOLS } } } });
+  // Without a hash (a gateway that doesn't send one) the patch still goes out, hash-free.
+  const noHash = [];
+  await ensureGuestRestrictions(async (m, p) => { noHash.push([m, p]); return m === 'config.get' ? { parsed: {} } : { ok: true }; }, 'g');
+  assert.equal('baseHash' in noHash[1][1], false);
+});
+
+test('a config.patch that persisted but was not applied counts as written; the guest is not served until it applies', async () => {
+  unappliedGuests.clear();
+  const patched = async config => ensureGuestRestrictions(async m => {
+    if (m === 'config.get') return { hash: 'h1', parsed: {} };
+    throw persistedError(config);
+  }, 'g1');
+  // The saved config the error carries shows the restrictions (or isn't included): accepted.
+  assert.equal(await patched({ agents: { entries: { g1: { tools: GUEST_TOOLS } } } }), true);
+  assert.equal(await patched(undefined), true);
+  // Until the running config catches up, the turn check says "pending"; afterwards it clears.
+  assert.equal(restrictionsPending({ configRevisionHash: 'saved', appliedConfigHash: 'older' }, 'g1'), true);
+  assert.equal(restrictionsPending({ configRevisionHash: 'saved', appliedConfigHash: 'saved' }, 'g1'), false);
+  assert.equal(restrictionsPending({ configRevisionHash: 'saved', appliedConfigHash: 'older' }, 'g1'), false); // forgotten once applied
+  // A guest that never failed to apply isn't gated, and neither is a gateway without the hashes (9.7).
+  assert.equal(restrictionsPending({ configRevisionHash: 'a', appliedConfigHash: 'b' }, 'other'), false);
+  await patched(undefined);
+  assert.equal(restrictionsPending({ hash: 'x' }, 'g1'), false);
+});
+
+test('a failed config.patch is still a failure unless it saved this guest\'s restrictions', async () => {
+  const run = error => ensureGuestRestrictions(async m => { if (m === 'config.get') return { hash: 'h', parsed: {} }; throw error; }, 'g2');
+  await assert.rejects(run(new Error('config base hash required')), /base hash/);
+  await assert.rejects(run(Object.assign(new Error('x'), { gatewayCode: 'INVALID_REQUEST', details: { persistedConfig: {} } })), /x/);
+  await assert.rejects(run(Object.assign(new Error('busy'), { gatewayCode: 'UNAVAILABLE' })), /busy/); // nothing was saved
+  // The saved config shows the agent without the restrictions: not what we wrote.
+  await assert.rejects(run(persistedError({ agents: { entries: { g2: { tools: { profile: 'full' } } } } })), /persisted/);
+  await assert.rejects(run(persistedError({ agents: { entries: {} } })), /persisted/);
 });

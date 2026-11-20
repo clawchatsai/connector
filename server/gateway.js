@@ -5,9 +5,24 @@ import { ApprovalClient } from './approval-client.js';
 
 // Per-session run/transcript events; hidden sessions' ones are dropped by the lens.
 const RUN_EVENTS = new Set(['chat', 'agent', 'session.tool', 'session.operation', 'session.observer']);
-const SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.questions'];
+export const SCOPES = ['operator.read', 'operator.write', 'operator.admin', 'operator.approvals', 'operator.questions'];
 // After the last browser leaves, the approval-client connection stays this long (P2P reconnects, reloads).
 const APPROVAL_CLIENT_GRACE_MS = 10_000;
+
+/**
+ * The Error for a failed gateway response. The error shape's machine-readable fields stay on it (gatewayCode,
+ * retryable, retryAfterMs, details; 2026.11.4+ sets them on startup refusals and persisted-but-unapplied config writes)
+ * so callers can tell "try again" from "failed". Not `code`: that name is the peer protocol's (peer/link.js).
+ */
+export function gatewayError(error, fallback) {
+  const err = new Error(error?.message || fallback);
+  if (!error || typeof error !== 'object') return err;
+  if (typeof error.code === 'string') err.gatewayCode = error.code;
+  if (typeof error.retryable === 'boolean') err.retryable = error.retryable;
+  if (typeof error.retryAfterMs === 'number') err.retryAfterMs = error.retryAfterMs;
+  if (error.details !== undefined) err.details = error.details;
+  return err;
+}
 
 export class GatewayClient {
   constructor({ dataDir, debugLogger, gatewayWsUrl, authToken, approvalClientGraceMs = APPROVAL_CLIENT_GRACE_MS }) {
@@ -85,7 +100,7 @@ export class GatewayClient {
       this._rpc.delete(msg.id);
       clearTimeout(pending.timer);
       if (msg.ok) pending.resolve(msg.payload);
-      else pending.reject(new Error(msg.error?.message || `${pending.method} failed`));
+      else pending.reject(gatewayError(msg.error, `${pending.method} failed`));
       return;
     }
 
@@ -99,7 +114,10 @@ export class GatewayClient {
     if (msg.type === 'event' && this.onEvent) { try { this.onEvent(msg); } catch (e) { console.error('[gateway] event observer:', e.message); } }
 
     if (msg.type === 'event' && msg.event === 'connect.challenge') {
-      this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: this._connectParams(msg.payload?.nonce || '', ['tool-events']) }));
+      // chat-queue-status (2026.11.6+; older gateways ignore unknown caps): a queued send is shown from pendingInputs,
+      // as in the Control UI. Without it the gateway sends the "queued" notice as a chat delta carrying text, which
+      // browsers would render as reply text and team chat would keep as a stopped turn's partial reply.
+      this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: this._connectParams(msg.payload?.nonce || '', ['tool-events', 'chat-queue-status']) }));
       return;
     }
     if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); this.sync?.onConnected(); this.onConnected?.(); this.request('sessions.subscribe', {}).catch(e => console.warn(`[lens] sessions.subscribe failed: ${e.message}`)); this.lens?.seedWithRetry(); }

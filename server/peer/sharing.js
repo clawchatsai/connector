@@ -16,9 +16,12 @@
 import crypto from 'node:crypto';
 import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
-import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent, isGuestAgent } from './guest-agent.js';
+import { redactSecrets } from '../util/redact.js';
+import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent, isGuestAgent, restrictionsPending } from './guest-agent.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
+/** The gateway's "the run gave no visible reply" failure (2026.10.1+: a passed turn, see team.js PASS_TOKEN). */
+export const EMPTY_REPLY_ERROR = /empty response|did not produce a visible reply/i;
 const DEFAULT_DAILY_CAP = 50;
 const MAX_CONCURRENT_TURNS = 2;   // per share: the daily cap alone would allow 50 parallel 10-minute runs
 const ACCESS_MODES = { restricted: 'read-only', trusted: 'guarded' };
@@ -594,12 +597,18 @@ export class SharingManager {
     this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
     this._changed(); // the owner's Sharing view shows today's count
     try {
-      const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, emit, this._turns.get(turnKey));
+      // Everything the guest's agent says leaves this gateway (to the other person, or into a room they see). The
+      // gateway stopped masking secrets in tool output in 2026.10.10, so a credential an agent read can come out in
+      // its reply: redact it here (util/redact.js), in the streamed text, the final one and a failed turn's partial.
+      const safeEmit = emit && ((event, data) => emit(event, event === 'delta' ? redactSecrets(data) : data));
+      const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, safeEmit, this._turns.get(turnKey));
+      if (typeof r?.text === 'string') r.text = redactSecrets(r.text);
       // What this gateway's agent said for that gateway's room: its copy of the room may show it as ours (team.js).
       if (!p.inOwnerRoom && r?.text) try { this.onGuestReply?.(grant.requesterGatewayId, roomId, shareId, agent.id, r.text); } catch { /* best effort */ }
       return r;
     }
     catch (e) {
+      if (typeof e?.partial === 'string') e.partial = redactSecrets(e.partial);
       // A reply that failed without saying anything doesn't use up the day's replies. A timeout still
       // counts: it ran for the full turn timeout.
       if (!e.partial && !/timed out/i.test(e.message)) {
@@ -615,7 +624,7 @@ export class SharingManager {
     const cfg = await this.request('config.get', {}, 30_000);
     // A guest version whose restrictions were edited away (e.g. in the Control UI) isn't served.
     const isGuest = this._db().prepare('SELECT 1 FROM peer_guest_agents WHERE agent_id = ?').get(agent.id);
-    if (isGuest && !hasGuestRestrictions(cfg?.parsed?.agents?.entries?.[agent.id]?.tools)) {
+    if (isGuest && (!hasGuestRestrictions(cfg?.parsed?.agents?.entries?.[agent.id]?.tools) || restrictionsPending(cfg, agent.id))) {
       this.log.warn?.(`[sharing] ${agent.id} lost its guest restrictions: refusing turn for ${shareId}`);
       throw Object.assign(new Error(`${agent.name} isn't available right now`), { code: 'unavailable' });
     }
@@ -647,6 +656,9 @@ export class SharingManager {
       const r = await done;
       if (r.state === 'final') return { state: 'final', text: r.message ? messageText(r.message) : await this._lastReply(sessionKey) };
       if (r.state === 'aborted') return { state: 'aborted', text: r.text || '' };
+      // A host on an older connector still asks for NO_REPLY: on 2026.10.1+ that ends the run with an empty-reply
+      // error and no final. Report it as an empty reply; the host treats that as a pass.
+      if (!r.text && EMPTY_REPLY_ERROR.test(r.errorMessage || '')) return { state: 'final', text: '' };
       throw Object.assign(new Error(r.errorMessage || 'The agent run failed'), { code: 'run_failed', partial: r.text || '' });
     } finally {
       const run = this._runs.get(runId);

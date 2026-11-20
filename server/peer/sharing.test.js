@@ -6,7 +6,7 @@ import path from 'node:path';
 import { Database } from '../bootstrap/native.js';
 import { SharingManager, defangLocalPaths } from './sharing.js';
 import { loadOrCreatePeerKey, fingerprint } from './keys.js';
-import { GUEST_TOOLS } from './guest-agent.js';
+import { GUEST_TOOLS, unappliedGuests } from './guest-agent.js';
 
 const quiet = { warn() {}, info() {} };
 const keyIn = () => loadOrCreatePeerKey(fs.mkdtempSync(path.join(os.tmpdir(), 'pk-')));
@@ -22,7 +22,7 @@ function pair() {
 }
 
 /** Owner (Kamil, gateway gwK) shares with requester (Houman, gateway gwH). */
-function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, config = {} } = {}) {
+function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, config = {}, cfgExtra = {} } = {}) {
   const kOwner = keyIn(), kReq = keyIn();
   const ownerCalls = [], ownerSignals = [], reqSignals = [];
   let owner;
@@ -37,7 +37,7 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, c
       });
       return { runId: params.idempotencyKey, status: 'started' };
     }
-    if (method === 'config.get') return { hash: 'h', parsed: config };
+    if (method === 'config.get') return { hash: 'h', parsed: config, ...cfgExtra };
     if (method === 'chat.abort') { setImmediate(() => owner.onGatewayEvent({ event: 'chat', payload: { runId: params.runId, state: 'aborted' } })); return { ok: true }; }
     return { ok: true };
   };
@@ -338,6 +338,42 @@ test('a guest agent whose restrictions were removed is not served', async () => 
   config.agents.entries['jarvis-guest'].tools = { deny: ['message'] }; // edited in the Control UI
   await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+});
+
+test('a guest whose saved restrictions the running gateway has not applied yet is not served until it has', async () => {
+  const config = { agents: { entries: { 'jarvis-guest': { tools: GUEST_TOOLS } } } };
+  const cfgExtra = { configRevisionHash: 'saved', appliedConfigHash: 'older' };
+  const s = setup({ config, cfgExtra });
+  s.owner.markGuestAgent('jarvis-guest');
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  s.activate();
+  unappliedGuests.add('jarvis-guest'); // ensureGuestRestrictions saw "persisted but not applied" (2026.11.4+)
+  await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
+  cfgExtra.appliedConfigHash = 'saved'; // the reload landed
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'r', message: 'hi' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+});
+
+test('credentials in what a guest agent says are redacted: streamed text, the final reply, and the copy kept for the room', async () => {
+  const key = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789';
+  const s = setup({ reply: () => `Found it: ANTHROPIC_API_KEY=${key} and the host is db.internal` });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'restricted', dailyCap: 5 });
+  s.activate();
+  const seen = [];
+  s.owner.onGuestReply = (...args) => seen.push(args.at(-1));
+  const deltas = [];
+  // Stream a leaked key as well: the first delta carries the text so far.
+  const request = s.owner.request;
+  s.owner.request = async (method, params) => {
+    if (method === 'chat.send') s.owner.onGatewayEvent({ event: 'chat', payload: { runId: params.idempotencyKey, state: 'delta', message: { content: [{ type: 'text', text: 'token ghp_abcdefghijklmnopqrstuvwxyz0123' }] } } });
+    return request(method, params);
+  };
+  const r = await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'read the env' }, { onDelta: d => deltas.push(d) });
+  assert.equal(r.text, 'Found it: ANTHROPIC_API_KEY=[REDACTED] and the host is db.internal');
+  assert.ok(!JSON.stringify(deltas).includes('ghp_') && !JSON.stringify(deltas).includes(key));
+  assert.ok(deltas.some(d => d.includes('[REDACTED]')));
+  assert.deepEqual(seen, [r.text]); // onGuestReply (the requester's copy of the room) got the redacted text too
 });
 
 test('on connect, guests made earlier get the current restrictions; up-to-date and deleted ones are left alone', async () => {

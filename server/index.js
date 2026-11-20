@@ -8,6 +8,7 @@ import { Database } from './bootstrap/native.js';
 import { GATEWAY_WS_URL, AUTH_TOKEN, discoverWorkspaceDir } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
+import { withGatewayRetry } from './util/gateway-retry.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload, handleWorkspaceCreate, handleWorkspaceMove, handleWorkspaceCopy } from './controllers/filesystem.js';
 import { handleTranscribe } from './controllers/transcribe.js';
 import { createGatewayMediaHandler } from './controllers/gateway-media.js';
@@ -79,7 +80,9 @@ export function createApp(config = {}) {
   const extras = createExtrasStore(() => globalDbCache.get());
   try { const n = extras.seedFromWorkspaces(getWorkspaces()); if (n) console.log(`[extras] seeded ${n} project style(s) from workspaces.json`); }
   catch (e) { console.error('[extras] style seed failed:', e.message); }
-  const gwRequest = (m, p, t) => gatewayClient.request(m, p, t);
+  // The connector's own requests wait out a gateway that is still starting (2026.11.4+ refuses writes with a retryable
+  // UNAVAILABLE; util/gateway-retry.js). Frames a browser relays don't pass here: the frontend retries those.
+  const gwRequest = withGatewayRetry((m, p, t) => gatewayClient.request(m, p, t));
   // Gateway sharing (server/peer/): other people's agents in team chats, and ours in theirs. The
   // plugin host (src/index.ts) supplies the signal server link and the peer transport (config.peer).
   const peerKey = loadOrCreatePeerKey(DATA_DIR);

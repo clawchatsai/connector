@@ -29,7 +29,9 @@ function createCompletion(llm) {
     try {
       return await llm.complete(base);
     } catch (err) {
-      if (err?.code === 'LLM_COMPLETION_NOT_AUTHORIZED') throw err;
+      // Not a transport problem: isolated mode fails the same way. LLM_RUNTIME_LIFECYCLE (2026.11.5+): the plugin or
+      // model runtime is reloading; the host says to retry from a fresh plugin operation, not inside this one.
+      if (['LLM_COMPLETION_NOT_AUTHORIZED', 'LLM_RUNTIME_LIFECYCLE', 'LLM_COMPLETION_ABORTED'].includes(err?.code)) throw err;
       return await llm.complete({ ...base, maxTokens: undefined, execution: { mode: 'isolated-agent-runtime', timeoutMs: TIMEOUT_MS } });
     }
   };

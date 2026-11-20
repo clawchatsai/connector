@@ -8,7 +8,7 @@ import { SessionLens } from './session-lens.js';
 const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'Dev' } }, { id: 'atlas', identity: { name: 'Atlas' } }];
 
 /** Fake gateway. `reply(agentId, prompt)` returns the agent's reply text, null (abort) or a promise. */
-function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS } = {}) {
+function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS, beforeSend = null } = {}) {
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
   const labels = new Map(); // session key -> label
@@ -36,13 +36,16 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
       }
       case 'chat.history': return { messages: (sessions.get(params.sessionKey) || []).slice(-(params.limit || 80)) };
       case 'chat.send': {
+        if (beforeSend) await beforeSend(params);
         sessions.get(params.sessionKey).push({ role: 'user', content: params.message, timestamp: ++clock, __m: { id: `u${++seq}` } });
         const agentId = /^agent:([^:]+):/.exec(params.sessionKey)[1];
         const runId = params.idempotencyKey;
         Promise.resolve(reply(agentId, params.message)).then(text => {
-          if (text && typeof text === 'object') { // { partial, state }: streamed some text, then aborted/error
-            team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: 'delta', message: { role: 'assistant', content: [{ type: 'text', text: text.partial }] } } });
-            team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: 'delta', deltaText: ' more' } });
+          if (text && typeof text === 'object') { // { partial, state }: streamed some text (none without partial), then aborted/error
+            if (text.partial) {
+              team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: 'delta', message: { role: 'assistant', content: [{ type: 'text', text: text.partial }] } } });
+              team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: 'delta', deltaText: ' more' } });
+            }
             team.onGatewayEvent({ type: 'event', event: 'chat', payload: { runId, sessionKey: params.sessionKey, state: text.state, errorMessage: text.error } });
             return;
           }
@@ -262,6 +265,47 @@ test('stop: a partial reply is posted marked stopped; a reply that finished anyw
   assert.ok(room.includes('[Dev]\n\nhalf an more\n\n*[stopped]*'));
   assert.ok(room.includes('[Atlas]\n\natlas finished anyway'));
   assert.equal(h.calls.filter(c => c.method === 'chat.send').length, 2); // no follow-up round after Stop
+});
+
+test('stop while the send is still going out (gateway starting): the abort that beat the run is repeated once it lands', async () => {
+  let release;
+  const gate = new Promise(r => { release = r; });
+  let finish;
+  const h = harness(() => new Promise(resolve => { finish = resolve; }), { beforeSend: () => gate });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@dev go', userLabel: 'H' });
+  for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+  await h.team.stop(roomKey);
+  const aborts = () => h.calls.filter(c => c.method === 'chat.abort');
+  assert.equal(aborts().length, 1); // Stop's own: the run doesn't exist yet, so the gateway ignores it
+  release();
+  for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+  assert.equal(aborts().length, 2);
+  assert.deepEqual(aborts()[1].params, aborts()[0].params); // the same run, aborted again
+  finish(null);
+  await h.settle();
+});
+
+test('passing: the prompt asks for our token; token, NO_REPLY and the 10.1+ empty-reply error all stay out of the room', async () => {
+  const EMPTY = { state: 'error', error: 'CLI backend returned an empty response.' };
+  const prompts = [];
+  const h = harness((agent, prompt) => {
+    prompts.push(prompt);
+    return { dev: 'dev answer', atlas: 'NOTHING_TO_ADD', main: EMPTY, ops: 'NO_REPLY' }[agent];
+  }, { agents: [...AGENTS, { id: 'ops', identity: { name: 'Ops' } }] });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas', 'main', 'ops'] });
+  await h.team.send(roomKey, { text: 'anyone?', userLabel: 'H' });
+  await h.settle();
+  assert.ok(prompts.every(p => /reply with exactly NOTHING_TO_ADD and nothing else/.test(p) && !/NO_REPLY/.test(p)));
+  assert.deepEqual(h.room(roomKey), ['[H]\n\nanyone?', '[Dev]\n\ndev answer']);
+});
+
+test('an empty-reply error on a turn addressed to the agent is still shown as a failure', async () => {
+  const h = harness(agent => agent === 'dev' ? { state: 'error', error: 'CLI backend returned an empty response.' } : 'x');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@dev hi', userLabel: 'H' });
+  await h.settle();
+  assert.match(h.room(roomKey).at(-1), /^\[Dev\]\n\n⚠️ \*Couldn't finish this reply: CLI backend returned an empty response\.\*$/);
 });
 
 test('a failed turn shows in the room with its partial text', async () => {
