@@ -24,7 +24,7 @@ import { SignalingClient } from './signaling-client.js';
 // when OpenClaw installs with --ignore-scripts.
 import type { DataChannelLike, PeerChannelInfo } from './webrtc-peer.js';
 type WebRTCPeerManagerType = import('./webrtc-peer.js').WebRTCPeerManager;
-import { dispatchRpc, type RpcRequest } from './shim.js';
+import { dispatchRpc, rpcResponseBody, type RpcRequest } from './shim.js';
 
 import { attachBrowserChannel, revokeStaleChannels, loadAuthState, type DtlsFingerprints } from './auth-handler.js';
 import { readConfig, writeConfig, updateConfig, readAuthConfig, removeBackupCode, writeFileAtomic, addDevice, touchDevice } from './config-store.js';
@@ -925,24 +925,7 @@ async function handleRpcMessage(
   try {
     const response = await dispatchRpc(rpcReq, app.handleRequest as (req: unknown, res: unknown) => void | Promise<void>);
 
-    // For binary content types (images, audio, etc.), wrap as _binary envelope
-    // so the browser transport can reconstruct a proper Blob with correct MIME type
-    const contentType = response.headers['content-type'] || '';
-    const isBinaryResponse = /^(image|audio|video|application\/octet-stream|application\/pdf)/.test(contentType);
-
-    let responseBody: unknown;
-    if (isBinaryResponse && response.rawBody) {
-      // Encode raw bytes as base64 in a _binary envelope.
-      // The transport layer on the browser side already handles this format,
-      // reconstructing a proper Blob with the correct MIME type.
-      responseBody = {
-        _binary: true,
-        contentType,
-        data: response.rawBody.toString('base64'),
-      };
-    } else {
-      responseBody = response.body;
-    }
+    const responseBody = rpcResponseBody(response);
 
     const responseMsg = {
       type: 'rpc-res',
