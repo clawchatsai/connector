@@ -34,17 +34,22 @@ The signaling server only facilitates the handshake. After step 4, it is out of 
 Requires OpenClaw 2026.9.7 or newer on the machine that runs your gateway.
 
 ```bash
-openclaw plugins install npm:@clawchatsai/connector
+openclaw gateway stop && openclaw plugins install npm:@clawchatsai/connector --force --accept-capabilities && openclaw gateway start
 ```
 
-Keep the `npm:` prefix: since OpenClaw 2026.11, a package name without a prefix is looked up only on
-ClawHub, and the install fails with "Package not found on ClawHub".
+This stops the gateway for a moment, installs the plugin, and starts the gateway again with it loaded.
+Stopping first avoids the install failing with a gateway ownership or lock error, which happens for
+example when OpenClaw was updated but the running gateway is still the old version.
 
-The gateway loads the plugin right away; no restart is needed. OpenClaw warns that the package is
-outside ClawHub review — answer `y` to continue (pass `--force` in scripts).
+- `--force` confirms the npm source, which is outside ClawHub review.
+- `--accept-capabilities` approves the capabilities the plugin declares (review them with
+  `openclaw plugins inspect connector`).
+- Keep the `npm:` prefix: since OpenClaw 2026.11, a package name without a prefix is looked up only
+  on ClawHub, and the install fails with "Package not found on ClawHub".
 
-Install while your gateway is running. If it is not, OpenClaw installs locally instead and asks you to
-re-run the same command with `--accept-capabilities` after reviewing what the plugin declares.
+If your gateway runs in a container where stopping it also stops the container, run the install
+without the stop and start: `openclaw plugins install npm:@clawchatsai/connector --force`. A running
+gateway loads the plugin right away.
 
 Then connect it to your ClawChats account:
 
