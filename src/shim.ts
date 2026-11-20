@@ -23,7 +23,7 @@ export interface RpcResponse {
   status: number;
   headers: Record<string, string>;
   body: string;
-  rawBody?: Buffer;  // Preserved for binary responses (images, audio, etc.)
+  rawBody?: Buffer;  // Preserved for binary responses (see rpcResponseBody)
 }
 
 type HandleRequestFn = (req: FakeReq, res: FakeRes) => void | Promise<void>;
@@ -167,6 +167,31 @@ function tryJsonParse(buf: Buffer): string {
   } catch {
     return buf.toString('base64');
   }
+}
+
+// Content types sent over the DataChannel as a UTF-8 string; everything else is base64-wrapped.
+// An allowlist, not a binary list: an unknown type (zip, docx, kmz, …) decoded as UTF-8 turns every
+// byte >= 0x80 into U+FFFD. image/svg+xml stays binary: the browser builds typed Blobs from it.
+const TEXT_CONTENT_TYPE = /^(text\/|application\/(json|xml|javascript|x-www-form-urlencoded|yaml)$|application\/[^/]+\+(json|xml)$)/;
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true });
+
+export function isTextContentType(contentType: string): boolean {
+  return TEXT_CONTENT_TYPE.test(contentType.split(';')[0].trim().toLowerCase());
+}
+
+/**
+ * The rpc-res body for a response: the text as-is, or a `{ _binary, contentType, data }` envelope
+ * (base64) that the browser transport turns back into a Blob. Text goes as text only when its bytes
+ * are valid UTF-8, so a Latin-1 CSV still arrives byte-exact. No body or no content type: text.
+ */
+export function rpcResponseBody(response: RpcResponse): unknown {
+  const contentType = response.headers['content-type'] || '';
+  const raw = response.rawBody;
+  if (!contentType || !raw?.length) return response.body;
+  if (isTextContentType(contentType)) {
+    try { strictUtf8.decode(raw); return response.body; } catch { /* not UTF-8: send the bytes */ }
+  }
+  return { _binary: true, contentType, data: raw.toString('base64') };
 }
 
 /**
