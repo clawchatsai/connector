@@ -284,7 +284,7 @@ export class PushNotifier {
     let json = JSON.stringify(payload);
     if (json.length > MAX_PAYLOAD) json = JSON.stringify(shrink(payload));
     const topic = topicFor(n.tag);
-    let refreshed = false, shrunk = false;
+    let refreshed = false, shrunk = false, unanswered = 0;
     for (let attempt = 0; ; attempt++) {
       let token;
       try { token = await this.vapid.get(audience); }
@@ -298,7 +298,10 @@ export class PushNotifier {
       }
       if (res.status === 413 && !shrunk) { shrunk = true; json = JSON.stringify(shrink(payload)); continue; }
       if ((res.status === 401 || res.status === 403) && !refreshed) { refreshed = true; this.vapid.drop(audience); continue; }
-      const retryable = res.status === 0 || res.status === 429 || res.status >= 500;
+      // No answer (timeout, reset): the push service may have taken it. One more try at most, same Topic (replaces
+      // it if still queued) and without renotify (if both arrive, the second replaces the first under the same tag).
+      if (res.status === 0 && unanswered++ === 0 && payload.renotify) json = JSON.stringify({ ...JSON.parse(json), renotify: false });
+      const retryable = (res.status === 0 && unanswered === 1) || res.status === 429 || res.status >= 500;
       const delay = res.retryAfterMs ?? 1000 * 2 ** attempt;
       if (!retryable || attempt + 1 >= RETRIES || delay > Math.min(MAX_RETRY_DELAY_MS, n.ttl * 1000)) {
         this.log.warn?.(`[push] delivery to "${device.deviceLabel}" failed (${res.status || 'network error'})`);

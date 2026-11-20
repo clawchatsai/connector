@@ -279,3 +279,42 @@ test('push service answers: 410 removes the device, 413 shrinks, 429 retries aft
   assert.equal(h4.vapidCalls.length, 2);
   assert.equal(h4.sent.length, 2);
 });
+
+test('one approval is one push per device: repeated events, presence flapping, escalation, a restarted connector', async () => {
+  const h = harness();
+  h.device(`${FCM}desk`);
+  h.device(`${APPLE}iphone`, { mobile: true });
+  await h.approval('exec.approval.requested', execApproval('ap1'));
+  await h.approval('exec.approval.requested', execApproval('ap1')); // the same event again
+  for (let i = 0; i < 3; i++) { h.present(true); await h.advance(10_000); h.present(false); await h.advance(10_000); }
+  await h.advance(130_000); // past the escalation
+  assert.deepEqual(h.sent.filter(s => s.payload.kind === 'approval').map(s => s.endpoint).sort(), [`${FCM}desk`, `${APPLE}iphone`].sort());
+  // A restarted connector starts empty and the gateway announces an approval only when it is created
+  // (approval-shared.ts): a resolve or presence change for it pushes nothing.
+  const restarted = harness();
+  restarted.device(`${FCM}desk`);
+  await restarted.approval('exec.approval.resolved', { id: 'ap1', decision: 'allow-once' });
+  restarted.present(false);
+  await restarted.advance(200_000);
+  assert.equal(restarted.sent.length, 0);
+});
+
+test('no answer from the push service: one retry at most, same Topic, without renotify', async () => {
+  const h = harness({ statuses: [{ status: 0 }, { status: 0 }, { status: 201 }] });
+  h.device(`${FCM}desk`);
+  h.approval('exec.approval.requested', execApproval('ap1'));
+  for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
+  await h.advance(1000);
+  await h.advance(10_000);
+  assert.equal(h.sent.length, 2); // the first try and one retry; the third status is never asked for
+  assert.equal(h.sent[0].payload.renotify, true);
+  assert.equal(h.sent[1].payload.renotify, false);
+  assert.equal(h.sent[0].opts.topic, h.sent[1].opts.topic);
+  // a 5xx still gets its retries
+  const h2 = harness({ statuses: [{ status: 503 }, { status: 503 }, { status: 201 }] });
+  h2.device(`${FCM}desk`);
+  h2.approval('exec.approval.requested', execApproval('ap2'));
+  for (let i = 0; i < 5; i++) await new Promise(r => setImmediate(r));
+  await h2.advance(1000); await h2.advance(2000);
+  assert.equal(h2.sent.length, 3);
+});
