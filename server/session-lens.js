@@ -378,6 +378,11 @@ export class SessionLens {
         const gone = [...this.onboarding].filter(k => k.startsWith(prefix));
         this._dropOnboardingChats(k => k.startsWith(prefix));
         for (const k of gone) try { this.extras?.deleteThreadExtras?.(k); } catch (e) { this.log.warn?.(`[lens] onboarding drop: ${e.message}`); }
+        // The gateway's own session delete can arrive after this reply, when the lens no longer forwards the key:
+        // tell browsers now (after the reply), so the chat leaves every sidebar whatever the order.
+        if (gone.length) setTimeout(() => {
+          for (const k of gone) this.broadcast(JSON.stringify({ type: 'event', event: 'sessions.changed', payload: { sessionKey: k, reason: 'delete' } }));
+        }, 0);
         return msg;
       }
       default:

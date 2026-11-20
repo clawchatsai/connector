@@ -295,7 +295,7 @@ test('a patched session tells the team coordinator (a renamed room reaches its c
   assert.deepEqual(patched, [CHAT]);
 });
 
-test('onboarding chat: an agent created from ClawChats shows its main session; other main sessions stay hidden', () => {
+test('onboarding chat: an agent created from ClawChats shows its main session; other main sessions stay hidden', async () => {
   const store = new Map();
   const extras = {
     listThreadExtraKeys: kind => [...store].filter(([, v]) => v.kind === kind).map(([k]) => k),
@@ -319,12 +319,14 @@ test('onboarding chat: an agent created from ClawChats shows its main session; o
   l.response({ type: 'res', id: 'c3', ok: false, error: { message: 'model unavailable' } });
   assert.deepEqual([...l.onboarding], [MAIN]);
   // It survives a restart (kept in extras) and goes with the agent.
-  const again = lens(extras).l;
+  const { l: again, sent: againSent } = lens(extras);
   assert.ok(again.isVisible(MAIN));
   again.outbound(JSON.stringify({ type: 'req', id: 'd1', method: 'agents.delete', params: { agentId: 'bot-1', deleteFiles: true } }));
   again.response({ type: 'res', id: 'd1', ok: true, payload: { ok: true, agentId: 'bot-1', removedBindings: 0 } });
   assert.equal(again.isVisible(MAIN), false);
   assert.equal(store.size, 0);
+  await new Promise(r => setTimeout(r, 5));
+  assert.deepEqual(againSent.at(-1), { type: 'event', event: 'sessions.changed', payload: { sessionKey: MAIN, reason: 'delete' } });
   // Deleting the session itself also forgets it, and the browser hears about the delete.
   l.addOnboardingChat('agent:bot-2:main');
   const f = l.sessionsChanged({ sessionKey: 'agent:bot-2:main', reason: 'delete' });
