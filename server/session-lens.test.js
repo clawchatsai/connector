@@ -147,6 +147,24 @@ test('trimRow keeps only allow-listed fields', () => {
   assert.deepEqual(trimRow({ key: 'k', unread: true, participants: [], thinkingOptions: [] }), { key: 'k', unread: true });
 });
 
+test('trimRow keeps the Subagents panel fields (waiting on own runs, live headline)', () => {
+  const digest = { runId: 'r1', headline: 'Reading files', revision: 3 };
+  assert.deepEqual(trimRow({ key: 'k', hasActiveSubagentRun: true, observerDigest: digest, spawnDepth: 1 }),
+    { key: 'k', hasActiveSubagentRun: true, observerDigest: digest });
+});
+
+test('a hidden run under a chat reaches the browser with its panel fields and parent', () => {
+  const { l } = lens();
+  l.observe(CHAT, { key: CHAT, kind: 'direct' });
+  const run = 'agent:main:subagent:w1';
+  const out = l.sessionsChanged({ sessionKey: run, reason: 'patch', session: { key: run, kind: 'direct', spawnedBy: CHAT,
+    status: 'running', hasActiveRun: true, activeRunIds: ['r1'], hasActiveSubagentRun: true, observerDigest: { runId: 'r1', headline: 'Grep' }, startedAt: 5 } });
+  assert.equal(out.payload.session.ccParentKey, CHAT);
+  assert.equal(out.payload.session.hasActiveSubagentRun, true);
+  assert.deepEqual(out.payload.session.observerDigest, { runId: 'r1', headline: 'Grep' });
+  assert.equal(out.payload.session.startedAt, 5);
+});
+
 test('chat.history passes through untouched (gateway enforces maxBytes)', () => {
   const { l } = lens();
   const f = JSON.stringify({ type: 'req', id: 'h', method: 'chat.history', params: { sessionKey: CHAT, limit: 80, maxBytes: 262144 } });
