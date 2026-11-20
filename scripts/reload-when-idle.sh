@@ -1,7 +1,14 @@
 #!/bin/bash
-# Reload the installed connector only when the gateway is idle: no chat run in flight (a queued reload
-# holds new runs behind a long one) and no approval or question waiting (a reload strands them).
-# Run it detached from a chat turn:  systemd-run --user --collect <repo>/scripts/reload-when-idle.sh
+# Reload the installed connector once that is safe. Run it detached from a chat turn:
+#   systemd-run --user --collect <repo>/scripts/reload-when-idle.sh
+#
+# A reload waits for whatever holds the connector, and while it waits new runs gateway-wide wait behind it.
+# - Hosts where the connector hands running turns over (OpenClaw 2026.11.5+, manifest reload.turnHandover): running
+#   turns move to the new connector at their next model step, so the reload doesn't wait for them. It still waits for
+#   approvals and questions: their turn sits inside a tool call until they're answered, with every new run queued
+#   behind it. If the reload fails anyway (a long tool call outlasted its 60 s drain, or the connector the gateway
+#   loaded predates reload.turnHandover), it falls back to waiting for idle.
+# - Otherwise (2026.9.7): wait until no chat run is in flight and nothing waits for approval or an answer.
 OC="$(command -v openclaw || echo "$HOME/.npm-global/bin/openclaw")"
 
 # Prints "<active runs> <pending approvals> <pending questions>"; 99 when the gateway can't be asked.
@@ -15,11 +22,23 @@ busy() {
   echo "${runs:-99} ${ap:-99} ${qs:-99}"   # empty = couldn't ask = not idle
 }
 
-if [ "$1" = "--status" ]; then busy; exit 0; fi
+# "yes" when the gateway hands this connector's running turns over on reload.
+handover() {
+  "$OC" plugins inspect connector --json 2>/dev/null | node -e 'try{const j=JSON.parse(require("fs").readFileSync(0));console.log(j.plugin?.turnHandover===true?"yes":"no")}catch{console.log("no")}'
+}
 
+if [ "$1" = "--status" ]; then busy; exit 0; fi
+if [ "$1" = "--handover" ]; then handover; exit 0; fi
+
+HANDOVER=$(handover)
 for i in $(seq 1 180); do   # up to ~30 min
   read -r runs approvals questions <<< "$(busy)"
-  if [ "$runs" = 0 ] && [ "$approvals" = 0 ] && [ "$questions" = 0 ]; then
+  if [ "$HANDOVER" = yes ] && [ "$approvals" = 0 ] && [ "$questions" = 0 ]; then
+    echo "$(date +%T): $runs run(s) in flight, nothing waiting for an answer: reloading (running turns hand over)"
+    "$OC" plugins reload connector && exit 0
+    echo "$(date +%T): reload didn't apply; waiting for idle instead"
+    HANDOVER=no
+  elif [ "$runs" = 0 ] && [ "$approvals" = 0 ] && [ "$questions" = 0 ]; then
     echo "idle at $(date +%T): reloading"
     exec "$OC" plugins reload connector --wait
   fi

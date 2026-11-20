@@ -16,6 +16,7 @@
 import crypto from 'node:crypto';
 import { defangLocalPaths, EMPTY_REPLY_ERROR } from './peer/sharing.js';
 import { createChatAbort } from './util/chat-abort.js';
+import { promptIndex, replyAfter } from './util/turn-reply.js';
 
 // An agent passes with our own token, a visible reply to the gateway. Not NO_REPLY: since 2026.10.1 a user-triggered
 // turn must produce a reply, so NO_REPLY ends a claude-cli run with "CLI backend returned an empty response." (no
@@ -131,6 +132,7 @@ export class TeamCoordinator {
     this._agents = null;       // { at, list }
     this._pushTimers = new Map(); // roomKey -> timer (live copies to the room's people)
     this._titles = new Map();  // roomKey -> the title last sent to the room's people
+    this._closed = false;      // close(): this connector is stopping; a running round leaves the rest to recover()
     // Team chats with people travel over the sharing links (peer/sharing.js _wireRooms).
     if (remote) {
       remote.onRoom = (method, params, fromGw) => this.onRoom(method, params, fromGw);
@@ -567,19 +569,27 @@ export class TeamCoordinator {
    * gateway's person. triggerId: its room entry (the first round answers it, not what was said after it).
    */
   _enqueue(roomKey, text, { fromPerson = null, replied = null, triggerId = null } = {}) {
+    this._chain(roomKey, stopped => this._runMessage(roomKey, text, stopped, { fromPerson, replied, triggerId }));
+  }
+
+  /** Run one message's work after the room's earlier ones. Its in-flight turns (team_inflight) go when it's done. */
+  _chain(roomKey, work) {
     const live = this._live(roomKey);
     const gen = live.gen; // Stop bumps the generation: everything queued before it is dropped
+    const stopped = () => this._closed || live.gen !== gen;
     live.queued++;
     this._status(roomKey);
     const prev = this._chains.get(roomKey) || Promise.resolve();
     const next = prev.then(async () => {
       live.queued--;
-      if (live.gen !== gen) return;
-      await this._runMessage(roomKey, text, () => live.gen !== gen, { fromPerson, replied, triggerId });
+      if (stopped()) return;
+      try { await work(stopped); }
+      finally { if (!this._closed) this.store.inflightClear(roomKey); }
     }).catch(e => {
+      if (this._closed) return;
       this.log.error?.(`[team] ${roomKey}: ${e.message}`);
       this._status(roomKey, e.message);
-    }).finally(() => { if (this._chains.get(roomKey) === next) this._chains.delete(roomKey); this._status(roomKey); });
+    }).finally(() => { if (this._chains.get(roomKey) === next) this._chains.delete(roomKey); if (!this._closed) this._status(roomKey); });
     this._chains.set(roomKey, next);
   }
 
@@ -596,7 +606,7 @@ export class TeamCoordinator {
     this._status(roomKey);
   }
 
-  async _runMessage(roomKey, text, stopped = () => false, { fromPerson = null, replied: firstReplies = null, triggerId = null } = {}) {
+  async _runMessage(roomKey, text, stopped = () => false, { fromPerson = null, replied: firstReplies = null, triggerId = null, fromRound = 2 } = {}) {
     const room = this.store.getRoom(roomKey);
     if (!room) return;
     if (room.host) return this._replicaRunOwn(room, text, stopped);
@@ -627,7 +637,7 @@ export class TeamCoordinator {
     if (firstReplies) {
       // A person's own agent replied (on their gateway): the follow-up rounds start from that reply.
       ({ targets, actingFor } = room.discuss ? this._nextRound(agents, firstReplies) : this._mentionRound(agents, firstReplies));
-      round = 2;
+      round = fromRound;
       mode = room.discuss ? 'followup' : 'addressed';
     }
     for (; round <= maxRounds && targets.length && turns < maxTurns && !stopped(); round++) {
@@ -642,7 +652,10 @@ export class TeamCoordinator {
       const history = upTo(await this._roomEntries(roomKey), round === 1 ? triggerId : null);
       const results = await Promise.all(targets.map(agentId =>
         this._turn(roomKey, agentId, agents, history, round === 1 ? mode : room.discuss ? 'followup' : 'addressed', stopped, actingFor.get(agentId) || null)
+          .then(r => this._turnDone(roomKey, agentId, r))
           .catch(async e => {
+            if (this._closed) return null; // stopping: the next connector finishes this turn (recover)
+            this._turnDone(roomKey, agentId, null);
             // Shown in the room, like a failed turn in a normal chat, not only as a passing toast.
             this.log.warn?.(`[team] ${agentId} in ${roomKey}: ${e.message}`);
             const self = agents.find(a => a.agentId === agentId) || { agentId, name: agentId };
@@ -743,6 +756,7 @@ export class TeamCoordinator {
     this._status(roomKey);
     let result;
     try {
+      this.store.inflightStart(roomKey, { agentId, round: live.round || 1, kind: 'own', runId, workKey, mode, turn: { tail: message.trim().slice(-120) }, post: { name: self.name, marker: mode === 'addressed' } });
       await this.request('chat.send', { sessionKey: workKey, message, deliver: false, idempotencyKey: runId }, 30_000);
       // The session the run started in: a later Stop is fenced to it.
       this.chatAbort.sessionIdOf(workKey).then(id => { running.sessionId = id; });
@@ -754,8 +768,9 @@ export class TeamCoordinator {
     } finally {
       this._cancelWait(runId);
       live.running.delete(agentId);
-      this._status(roomKey);
+      if (!this._closed) this._status(roomKey);
     }
+    if (result.state === 'closed') throw new Error('connector stopping');
     const clean = t => {
       const own = splitLabel((t || '').trim());
       return (own.label && norm(own.label) === norm(self.name) ? own.body : (t || '')).trim(); // agent copied the room format
@@ -803,7 +818,9 @@ export class TeamCoordinator {
     try {
       this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
       const round = live.round || 1;
-      result = await this.remote.turn(agentId, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier), trigger: round > 1 ? 'agent' : 'person', round },
+      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier), trigger: round > 1 ? 'agent' : 'person', round };
+      this.store.inflightStart(roomKey, { agentId, round, kind: 'remote', runId, mode, turn, post: { name: self.name, via: REMOTE_LANE, marker: mode === 'addressed' } });
+      result = await this.remote.turn(agentId, turn,
         {
           stopped, // a turn whose link dropped is sent again, unless the room was stopped meanwhile
           onDelta: text => { partial = text; delta(text); },
@@ -845,7 +862,9 @@ export class TeamCoordinator {
     let result, partial = '';
     try {
       this._setSeen(roomKey, agentId, lane, fresh);
-      result = await this.remote?.localTurnFor(agentId, actingFor, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier), round: live.round || 1 },
+      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier), round: live.round || 1 };
+      this.store.inflightStart(roomKey, { agentId, round: turn.round, kind: 'for', runId, mode, turn, post: { name: self.name, via: lane, actingFor, forName } });
+      result = await this.remote?.localTurnFor(agentId, actingFor, turn,
         { onDelta: text => { partial = text; delta(text); } });
     } catch (e) {
       throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
@@ -908,6 +927,7 @@ export class TeamCoordinator {
 
   /** Post an agent's message into the room (actingFor: whose request it answered, if not its owner's). */
   async _post(roomKey, self, text, { actingFor = null, via = OWNER_LANE } = {}) {
+    if (this._closed) throw new Error('connector stopping'); // the next connector posts it (recover)
     const room = this.store.getRoom(roomKey);
     if (room?.host) return this._replicaPostAgent(room, self, text); // a live copy: the host's room gets it (its owner's session)
     const res = await this.request('chat.inject', { sessionKey: roomKey, message: text, label: self.name.slice(0, 100) });
@@ -1033,6 +1053,128 @@ export class TeamCoordinator {
     if (w) { clearTimeout(w.timer); this._waiters.delete(runId); }
   }
 
+  /** A turn's reply is in the room (team_inflight): what the next round needs if this connector stops now. */
+  _turnDone(roomKey, agentId, r) {
+    if (!this._closed) this.store.inflightDone(roomKey, agentId, { text: r?.text || null, authority: r?.authority || null });
+    return r;
+  }
+
+  // ── Stopping mid-round (plugin reload, restart) ─────────────────────
+  // A reload hands running gateway turns to the new connector (manifest reload.turnHandover), but a round's state
+  // is in this one's memory. The agent turns it sent are in team_inflight: close() stops this connector touching
+  // rooms, and the next one's recover() finishes them (posting each reply once) and runs the rest of the round.
+
+  close() {
+    this._closed = true;
+    for (const [runId, w] of this._waiters) { clearTimeout(w.timer); w.resolve({ state: 'closed' }); this._waiters.delete(runId); }
+    for (const t of this._pushTimers.values()) clearTimeout(t);
+    this._pushTimers.clear();
+    clearTimeout(this._reconcileTimer);
+  }
+
+  /** Once per connector start, when the gateway is connected: finish the rounds a stopped connector left. */
+  recover() {
+    if (this._recovering) return this._recovering;
+    this._recovering = (async () => {
+      for (const [roomKey, rows] of this.store.inflightByRoom()) {
+        if (!this.store.getRoom(roomKey)) { this.store.inflightClear(roomKey); continue; }
+        this.log.log?.(`[team] ${roomKey}: finishing ${rows.filter(r => !r.done).length} turn(s) of round ${rows[0].round} left by the previous connector`);
+        this._chain(roomKey, stopped => this._resume(roomKey, rows, stopped));
+      }
+    })().catch(e => this.log.warn?.(`[team] recover: ${e.message}`));
+    return this._recovering;
+  }
+
+  async _resume(roomKey, rows, stopped) {
+    const room = this.store.getRoom(roomKey);
+    if (!room) return;
+    const live = this._live(roomKey);
+    const round = rows[0].round;
+    live.round = round;
+    const results = await Promise.all(rows.map(async row => {
+      if (row.done) return row.text ? { agentId: row.agentId, text: row.text, ...(row.authority ? { authority: row.authority } : {}) } : null;
+      return this._finishTurn(roomKey, row, live, stopped)
+        .then(r => this._turnDone(roomKey, row.agentId, r))
+        .catch(e => { if (!this._closed) this.log.warn?.(`[team] ${row.agentId} in ${roomKey}: ${e.message}`); return null; });
+    }));
+    const replied = results.filter(r => r?.text);
+    // A copy's rounds are its host's; here only its own agents' replies were owed.
+    if (room.host || !replied.length || stopped()) return;
+    await this._runMessage(roomKey, '', stopped, { replied, fromRound: round + 1 });
+  }
+
+  /** One turn the previous connector sent: its reply, posted to the room unless it already is. Same result as the turn. */
+  async _finishTurn(roomKey, row, live, stopped) {
+    const { agentId, runId, post } = row;
+    const self = { agentId, name: post.name || agentId };
+    let state = 'final', text = '';
+    if (row.kind === 'own') {
+      live.running.set(agentId, { workKey: row.workKey, runId, sessionId: null });
+      this._status(roomKey);
+      try { ({ state, text } = await this._ownRunResult(row, stopped)); }
+      finally { live.running.delete(agentId); this._status(roomKey); }
+      const own = splitLabel(text.trim());
+      text = (own.label && norm(own.label) === norm(self.name) ? own.body : text).trim();
+    } else {
+      if (!this.remote) return null;
+      // Shares come from the signal server a moment after start; until then every share looks ended.
+      for (const end = Date.now() + 30_000; !this.remote.serverEnabled && Date.now() < end && !stopped();) await new Promise(r => setTimeout(r, 250));
+      live.running.set(agentId, row.kind === 'remote' ? { remote: true, runId } : { actingFor: post.actingFor, runId });
+      this._status(roomKey);
+      let result;
+      // The same turn id: the other side answers with that turn's reply instead of running it again.
+      try { result = row.kind === 'remote' ? await this.remote.turn(agentId, row.turn, { stopped }) : await this.remote.localTurnFor(agentId, post.actingFor, row.turn); }
+      finally { live.running.delete(agentId); this._status(roomKey); }
+      if (!result) return null;
+      state = result.state === 'aborted' ? 'aborted' : 'final';
+      text = String(result.text || '').trim();
+    }
+    if (this._closed) return null;
+    const opts = { ...(post.forName ? { actingFor: post.forName } : {}), ...(post.via ? { via: post.via } : {}) };
+    if (state === 'aborted') {
+      const body = text && !SILENT.test(text) ? `${text}\n\n*[stopped]*` : post.marker ? STOPPED_EARLY : '';
+      if (body && !await this._postedSince(roomKey, body, row.startedAt)) await this._post(roomKey, self, body, opts);
+      return { agentId, text: null };
+    }
+    if (!text || SILENT.test(text)) return { agentId, text: null };
+    if (!await this._postedSince(roomKey, text, row.startedAt)) await this._post(roomKey, self, text, opts);
+    const authority = row.kind === 'remote' ? agentId : row.kind === 'for' ? post.actingFor : null;
+    return { agentId, text: stopped() ? null : text, ...(authority ? { authority } : {}) };
+  }
+
+  /**
+   * An own turn's run, followed from its working session (its events went to the previous connector): waits for the
+   * session to finish that run, then reads its reply. A send that never reached the gateway has no reply.
+   */
+  async _ownRunResult({ workKey, runId, startedAt, turn }, stopped, { pollMs = 2000 } = {}) {
+    const end = Date.now() + TURN_TIMEOUT_MS;
+    for (;;) {
+      const s = (await this.request('sessions.describe', { key: workKey }, 5000).catch(() => null))?.session;
+      const running = s?.hasActiveRun && (!Array.isArray(s.activeRunIds) || !s.activeRunIds.length || s.activeRunIds.includes(runId));
+      if (s && !running) break;
+      if (stopped()) return { state: 'aborted', text: '' };
+      if (Date.now() >= end) throw new Error('timed out');
+      await new Promise(r => setTimeout(r, pollMs).unref?.());
+    }
+    const msgs = (await this.request('chat.history', { sessionKey: workKey, limit: 40 }, 30_000))?.messages || [];
+    // Its prompt: by its idempotency key, else (a gateway that doesn't record it) the newest real user message, if it is
+    // this turn's. None means the send never reached the gateway.
+    let u = promptIndex(msgs, runId);
+    if (u < 0) {
+      u = msgs.findLastIndex(m => m.role === 'user' && m.provenance?.kind !== 'internal_system');
+      if (u >= 0 && !(Number(msgs[u].timestamp) >= startedAt - 5000 || (!!turn?.tail && messageText(msgs[u]).includes(turn.tail)))) u = -1;
+    }
+    if (u < 0) return { state: 'final', text: '' };
+    const reply = replyAfter(msgs, u);
+    return { state: reply?.stopReason === 'aborted' ? 'aborted' : 'final', text: reply ? messageText(reply) : '' };
+  }
+
+  /** Whether the room already shows this reply (posted just before the previous connector stopped). */
+  async _postedSince(roomKey, text, since) {
+    const want = text.trim();
+    return (await this._roomEntries(roomKey)).some(e => e.ts >= since - 5000 && splitLabel(e.text).body.trim() === want);
+  }
+
   // ── People in rooms (this gateway hosting) ─────────────────────────
   // specs/sharing-people.md: the room stays on the host's gateway; each person in it gets a live copy
   // on their own gateway (room.sync over the sharing link) and posts back through it (room.post).
@@ -1083,6 +1225,7 @@ export class TeamCoordinator {
 
   /** A line in the room's timeline ("Kamil joined"): the same on every screen, never shown to agents. */
   async _note(roomKey, text) {
+    if (this._closed) return;
     try {
       const res = await this.request('chat.inject', { sessionKey: roomKey, message: text, label: 'System' });
       if (res?.messageId) this.store.recordEntry(roomKey, res.messageId, { type: 'system' });
@@ -1461,7 +1604,8 @@ export class TeamCoordinator {
     if (!targets.length || stopped()) return;
     const history = upTo(await this._roomEntries(room.roomKey), echo?.id);
     await Promise.all(targets.map(id => this._turn(room.roomKey, id, all, history, mode, stopped)
-      .catch(e => this.log.warn?.(`[team] ${id} in copy ${room.roomKey}: ${e.message}`))));
+      .then(r => this._turnDone(room.roomKey, id, r))
+      .catch(e => { if (!this._closed) this.log.warn?.(`[team] ${id} in copy ${room.roomKey}: ${e.message}`); })));
   }
 
   /** One of this gateway's agents replied in a live copy: it goes to the host's room. */

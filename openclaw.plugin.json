@@ -6,6 +6,7 @@
   "activation": {
     "onStartup": true
   },
+  "reload": { "turnHandover": true },
   "configSchema": {
     "type": "object",
     "additionalProperties": true,

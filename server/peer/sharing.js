@@ -24,6 +24,7 @@ import { AUTONOMY, ACCESS, sessionMode, toolOverrides as contactOverrides, topic
 import { ensureContactCopy, retireCopy, reviewerModelFor } from './contact-copy.js';
 import { noteCandidates, resolvePicks, picksSignature, syncNotes, removeNotes, NOTES_DIR } from './notes-sync.js';
 import { peerOutdated, outdatedMessage, connectorVersion } from './version.js';
+import { promptIndex, replyAfter } from '../util/turn-reply.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 // A turn whose commands may ask the owner: as long as the gateway keeps an approval pending (30 min) plus the run.
@@ -34,8 +35,9 @@ const MAX_CONCURRENT_TURNS = 2;   // per share: the daily cap alone would allow 
 // Owner side: finished guest turns, so a resend after a dropped link gets the result instead of a new run.
 const RECENT_TURN_MS = 10 * 60_000;
 const RECENT_TURNS_MAX = 200;
-// Requester side: waits before sending a turn again after its link dropped (one resend per entry).
-const RESEND_BACKOFF_MS = [2_000, 5_000];
+// Requester side: waits before sending a turn again after its link dropped (one resend per entry). The last one covers
+// an owner whose connector reload took ~8 s to stop (2026.11.6, its gateway busy preparing the guest run).
+const RESEND_BACKOFF_MS = [2_000, 5_000, 10_000];
 // Owner side: a turn its gateway's restart cut off. 2026.11.x resumes it a few seconds after it's back (a "Gateway
 // restarted" turn of its own, under another run id); this long for that to start, polled this often.
 const RECOVERY_WAIT_MS = 30_000;
@@ -1229,14 +1231,9 @@ export class SharingManager {
   async _replyTo(sessionKey, runId) {
     const h = await this.request('chat.history', { sessionKey, limit: 200 }, 30_000).catch(() => null);
     const msgs = h?.messages || [];
-    const at = msgs.findIndex(m => m.role === 'user' && m.__openclaw?.idempotencyKey === `${runId}:user`);
+    const at = promptIndex(msgs, runId);
     if (at < 0) return null;
-    let reply = null;
-    for (const m of msgs.slice(at + 1)) {
-      if (m.role === 'user' && m.provenance?.kind === 'internal_system') continue; // the gateway's own "restarted, continue" turn
-      if (m.role === 'user') break;
-      if (m.role === 'assistant' && messageText(m).trim()) reply = m;
-    }
+    const reply = replyAfter(msgs, at);
     return { input: await this._fullText(sessionKey, msgs[at]), text: reply ? await this._fullText(sessionKey, reply) : '' };
   }
 

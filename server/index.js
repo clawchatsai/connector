@@ -62,7 +62,7 @@ export function createApp(config = {}) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 
   let namesTimer = null;
-  function closeAll() { clearInterval(namesTimer); tagger?.close(); searchIndexer?.close(); searchStore?.close(); sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
+  function closeAll() { clearInterval(namesTimer); tagger?.close(); searchIndexer?.close(); searchStore?.close(); team?.close(); sharing?.close(); gatewayClient?.close(); globalDbCache.close?.(); }
 
   // Global DB (custom emojis, cross-workspace data)
   let _globalDb = null;
@@ -140,7 +140,11 @@ export function createApp(config = {}) {
     if (msg.event === 'sessions.changed') { try { searchIndexer?.onSessionsChanged(msg.payload); } catch (e) { console.warn(`[search] change: ${e.message}`); } }
   };
   gatewayClient.onApprovalEvent = msg => { sharing?.onApprovalEvent(msg); lostAllows.onApprovalEvent(msg); };
-  gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); searchIndexer?.onConnected(); };
+  gatewayClient.onConnected = () => {
+    sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); searchIndexer?.onConnected();
+    // A previous connector stopped mid-round or mid-Allow (a plugin reload hands running turns over to this one).
+    team.recover(); lostAllows.recheckRecent();
+  };
   gatewayClient.onDisconnected = () => searchIndexer?.onDisconnected();
   // Renamed agents: shares re-issued with the new names, copies of rooms here told (peer/sharing.js, team.js).
   const quiet = what => e => { if (!/not connected|closed/i.test(e.message)) console.warn(`[${what}] names: ${e.message}`); };

@@ -9,11 +9,11 @@ import { createChatAbort } from './util/chat-abort.js';
 const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'Dev' } }, { id: 'atlas', identity: { name: 'Atlas' } }];
 
 /** Fake gateway. `reply(agentId, prompt)` returns the agent's reply text, null (abort) or a promise. */
-function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS, beforeSend = null } = {}) {
+function harness(reply, { preparedTitle = 'Team title', titler = null, remote = null, agents = AGENTS, beforeSend = null, keepReplies = false, clockStart = 1_000 } = {}) {
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
   const labels = new Map(); // session key -> label
-  let clock = 1_000, seq = 0;
+  let clock = clockStart, seq = 0;
   const events = [];
   let team;
   const request = async (method, params) => {
@@ -51,6 +51,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
             return;
           }
           const state = text === null ? 'aborted' : 'final';
+          if (keepReplies && text) sessions.get(params.sessionKey).push({ role: 'assistant', content: [{ type: 'text', text }], timestamp: ++clock, __m: { id: `a${++seq}` } });
           const payload = { runId, sessionKey: params.sessionKey, state };
           if (text && text !== 'NO_REPLY') payload.message = { role: 'assistant', content: [{ type: 'text', text }] };
           team.onGatewayEvent({ type: 'event', event: 'chat', payload });
@@ -66,7 +67,12 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
   team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, remote, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {} } });
   const room = key => (sessions.get(key) || []).map(m => m.content[0].text);
   const settle = async () => { for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r)); for (const c of team._chains.values()) await c; };
-  return { team, calls, room, settle, events, sessions, labels };
+  // The next connector after a reload: same database and gateway; gateway events now go to it.
+  const restart = () => {
+    team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, remote, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {}, log() {} } });
+    return team;
+  };
+  return { team, calls, room, settle, events, sessions, labels, restart, get current() { return team; } };
 }
 
 test('parsing helpers', () => {
@@ -129,6 +135,84 @@ test('@all makes everyone answer; discuss runs follow-up rounds until everyone p
   // round 2: both (each saw a sibling reply). Round 3: only atlas replied and named nobody,
   // so nobody is eligible (dev neither replied nor was named): 2 + 2 sends.
   assert.equal(h.calls.filter(c => c.method === 'chat.send').length, 4);
+});
+
+test('a connector stopped mid-round: the next one posts each running reply once and runs the rest of the round', async () => {
+  const pending = [];
+  let round2 = 0;
+  const h = harness((agent, prompt) => {
+    if (/just replied/.test(prompt)) { round2++; return agent === 'atlas' && round2 <= 2 ? 'atlas adds one thing' : 'NO_REPLY'; }
+    // Round 1 runs on past the reload: its replies land after the first connector stopped.
+    return new Promise(r => pending.push(() => r(`${agent} first`)));
+  }, { keepReplies: true, clockStart: Date.now() });
+  const old = h.team;
+  const { roomKey } = await old.createRoom({ agentIds: ['dev', 'atlas'] });
+  old.setDiscuss(roomKey, true);
+  await old.send(roomKey, { text: '@all go', userLabel: 'H' });
+  for (let i = 0; i < 50 && pending.length < 2; i++) await new Promise(r => setImmediate(r));
+  assert.equal(pending.length, 2, 'both agents are running');
+  old.close();
+  pending.forEach(f => f()); // the gateway finishes both runs; their events reach no one
+  await h.settle();
+  assert.deepEqual(h.room(roomKey), ['[H]\n\n@all go'], 'the stopped connector posts nothing');
+  const next = h.restart();
+  await next.recover();
+  for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r));
+  for (const c of next._chains.values()) await c;
+  assert.deepEqual(h.room(roomKey), ['[H]\n\n@all go', '[Dev]\n\ndev first', '[Atlas]\n\natlas first', '[Atlas]\n\natlas adds one thing']);
+  assert.equal(h.calls.filter(c => c.method === 'chat.send').length, 4, 'round 1 is not sent again; round 2 runs as it would have');
+  await next.recover(); // once per start
+  assert.equal(h.room(roomKey).length, 4);
+  assert.equal(next.store.inflightByRoom().size, 0, 'the journal is cleared when the message is done');
+});
+
+test('recovery does not post a reply the stopped connector already posted', async () => {
+  const h = harness(agent => `${agent} first`, { keepReplies: true, clockStart: Date.now() });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@all go', userLabel: 'H' });
+  await h.settle();
+  // As if the connector stopped right after posting Dev's reply: its turn is still in the journal, not done.
+  h.team.store.inflightStart(roomKey, { agentId: 'dev', round: 1, kind: 'own', runId: 'team-x', workKey: h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'dev').workKey, mode: 'addressed', post: { name: 'Dev' } });
+  const before = h.room(roomKey);
+  h.team.close();
+  const next = h.restart();
+  await next.recover();
+  for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r));
+  for (const c of next._chains.values()) await c;
+  assert.deepEqual(h.room(roomKey), before);
+});
+
+test('recovery of someone else\'s agent: waits for the shares, asks again with the same turn id, posts once', async () => {
+  const calls = [];
+  let release;
+  const remote = {
+    serverEnabled: true,
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (agentId, args) => {
+      calls.push({ agentId, turnId: args.turnId, serverEnabled: remote.serverEnabled });
+      if (calls.length === 1) { await new Promise(r => { release = r; }); return { state: 'final', text: 'too late' }; }
+      return { state: 'final', text: 'remote essay' }; // the owner answers a resend with the first run's reply
+    },
+    abort: async () => {},
+  };
+  const h = harness(() => 'NO_REPLY', { remote, clockStart: Date.now() });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await h.team.send(roomKey, { text: '@jarvis·kamil write it', userLabel: 'H' });
+  for (let i = 0; i < 30 && !release; i++) await new Promise(r => setImmediate(r));
+  h.team.close();
+  remote.serverEnabled = false; // the next connector hasn't heard from the signal server yet
+  const next = h.restart();
+  const done = next.recover();
+  setTimeout(() => { remote.serverEnabled = true; }, 300);
+  await done;
+  for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r));
+  for (const c of next._chains.values()) await c;
+  release(); // the stopped connector's own call ends: it posts nothing
+  await h.settle();
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].turnId, calls[0].turnId, 'same turn id: the owner answers with that turn');
+  assert.equal(calls[1].serverEnabled, true, 'asked only once the shares are in');
+  assert.deepEqual(h.room(roomKey).filter(t => /Jarvis/.test(t)), ['[Jarvis · Kamil]\n\nremote essay']);
 });
 
 test('without discuss there is exactly one round', async () => {

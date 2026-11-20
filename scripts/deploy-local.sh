@@ -50,6 +50,8 @@ cp dist/*.js "$D/dist/"
 # Peers read this connector's version from package.json (server/peer/version.js; 0.3.0+ refuse older peers), so the
 # installed copy must carry the deployed one.
 cp package.json "$D/package.json"
+# The manifest says how the gateway reloads the connector (reload.turnHandover); it applies from the reload after this.
+cp openclaw.plugin.json "$D/openclaw.plugin.json"
 DIRTY=clean
 [ -z "$(git status --porcelain -- server src)" ] || DIRTY=dirty
 printf '%s\n%s\n%s\n%s\n' "$BRANCH" "$SHA" "$(date -Is) from $(pwd)" "$DIRTY" > "$MARKER"
@@ -57,7 +59,11 @@ printf '%s\n%s\n%s\n%s\n' "$BRANCH" "$SHA" "$(date -Is) from $(pwd)" "$DIRTY" > 
 echo "✅ Deployed branch $BRANCH ($(git rev-parse --short HEAD)) to $D"
 read -r RUNS APPROVALS QUESTIONS <<< "$(scripts/reload-when-idle.sh --status)"
 if [ "$APPROVALS" != 0 ] || [ "$QUESTIONS" != 0 ]; then
-  echo "⚠️  Don't reload by hand now: $APPROVALS approval(s) and $QUESTIONS question(s) are waiting, and a reload strands them." >&2
+  echo "⚠️  Don't reload by hand now: $APPROVALS approval(s) and $QUESTIONS question(s) are waiting; a reload waits for them and holds every new run behind it." >&2
 fi
-echo "Next: reload once the gateway is idle (no run in flight, nothing waiting for approval). From inside a chat turn:"
+if [ "$(scripts/reload-when-idle.sh --handover)" = yes ]; then
+  echo "Next: reload. Running turns hand over to the new connector, so it only waits for approvals and questions. From inside a chat turn:"
+else
+  echo "Next: reload once the gateway is idle (no run in flight, nothing waiting for approval). From inside a chat turn:"
+fi
 echo "  systemd-run --user --collect $(pwd)/scripts/reload-when-idle.sh"

@@ -26,6 +26,12 @@
 //   team_lanes    seen_at for an agent's other sessions in a room ('guest:<who>'); its owner session
 //                 keeps team_members.seen_at. One agent can answer in several sessions, and each
 //                 must be given what it hasn't seen itself.
+//   team_inflight one row per agent turn of the message a room is answering now (one message at a time per room),
+//                 so a connector that stops mid-round (a plugin reload hands running turns to the next generation)
+//                 can finish it: kind 'own' (work_key, run_id = its chat.send key) | 'remote' | 'for' (turn_json: the
+//                 request, resent with the same turn id); post_json = how its reply is posted; done = 1 with text /
+//                 authority once the reply is in the room. A row is replaced by the agent's next round; the room's
+//                 rows go when the message is finished.
 
 const DISCUSS_ROUNDS = 3; // default; each room can set 1..MAX_ROUNDS
 const MAX_ROUNDS = 10;
@@ -69,6 +75,7 @@ export function createTeamStore(getGlobalDb) {
       if (!ec.has('via')) g.exec('ALTER TABLE team_entries ADD COLUMN via TEXT');
       g.exec(`CREATE TABLE IF NOT EXISTS team_lanes (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, lane TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY (room_key, agent_id, lane))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_mirror (room_key TEXT NOT NULL, host_entry_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY (room_key, host_entry_id))`);
+      g.exec(`CREATE TABLE IF NOT EXISTS team_inflight (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, round INTEGER NOT NULL, kind TEXT NOT NULL, run_id TEXT NOT NULL, work_key TEXT, mode TEXT, turn_json TEXT, post_json TEXT, started_at INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0, text TEXT, authority TEXT, PRIMARY KEY (room_key, agent_id))`);
       ready = true;
     }
     return g;
@@ -202,8 +209,37 @@ export function createTeamStore(getGlobalDb) {
       g.prepare('DELETE FROM team_people WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_mirror WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_lanes WHERE room_key = ?').run(roomKey);
+      g.prepare('DELETE FROM team_inflight WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_rooms WHERE room_key = ?').run(roomKey);
       return work;
+    },
+
+    /** An agent turn was sent (team_inflight): { agentId, round, kind, runId, workKey?, mode, turn?, post? }. */
+    inflightStart(roomKey, { agentId, round, kind, runId, workKey = null, mode = null, turn = null, post = null }) {
+      db().prepare('INSERT OR REPLACE INTO team_inflight (room_key, agent_id, round, kind, run_id, work_key, mode, turn_json, post_json, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(roomKey, agentId, round, kind, runId, workKey, mode, turn ? JSON.stringify(turn) : null, post ? JSON.stringify(post) : null, Date.now());
+    },
+
+    /** Its reply is in the room (or it had none): text / authority feed the next round. */
+    inflightDone(roomKey, agentId, { text = null, authority = null } = {}) {
+      db().prepare('UPDATE team_inflight SET done = 1, text = ?, authority = ? WHERE room_key = ? AND agent_id = ?').run(text, authority, roomKey, agentId);
+    },
+
+    inflightClear(roomKey) {
+      db().prepare('DELETE FROM team_inflight WHERE room_key = ?').run(roomKey);
+    },
+
+    /** Map roomKey -> rows of the round each room was in: [{ agentId, round, kind, runId, workKey, mode, turn, post, startedAt, done, text, authority }]. */
+    inflightByRoom() {
+      const out = new Map();
+      for (const r of db().prepare('SELECT * FROM team_inflight ORDER BY started_at').all()) {
+        const row = { agentId: r.agent_id, round: r.round, kind: r.kind, runId: r.run_id, workKey: r.work_key, mode: r.mode,
+          turn: r.turn_json ? JSON.parse(r.turn_json) : null, post: r.post_json ? JSON.parse(r.post_json) : {}, startedAt: r.started_at,
+          done: !!r.done, text: r.text, authority: r.authority };
+        out.set(r.room_key, [...(out.get(r.room_key) || []), row]);
+      }
+      for (const [k, rows] of out) { const round = Math.max(...rows.map(r => r.round)); out.set(k, rows.filter(r => r.round === round)); }
+      return out;
     },
 
     /** { roomKey, agentId } of a working session, or null. */

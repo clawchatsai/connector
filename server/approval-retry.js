@@ -51,6 +51,20 @@ export class LostAllowRetry {
     }
   }
 
+  /**
+   * On start: Allows from the last keepMs are checked again. A connector that stopped (a plugin reload) right after an
+   * Allow dropped its check; its rerun note has the same idempotency key, so the agent is asked at most once.
+   */
+  async recheckRecent() {
+    const items = (await this.request('approval.history', { limit: 50 }, 15_000).catch(() => null))?.items || [];
+    const since = this.now() - this.keepMs;
+    for (const i of items) {
+      if (i?.status !== 'allowed' || i.reason !== 'user' || !(i.resolvedAtMs >= since) || !i.id || this._seen.has(i.id)) continue;
+      this._seen.add(i.id);
+      this._check(i.id).catch(e => this.log.warn?.(`[approvals] lost allow check ${i.id}: ${e.message}`));
+    }
+  }
+
   /** An agent's rerun of a lost Allow gets the user's decision, once. */
   _rerun({ id, request: r = {} }) {
     this._prune();

@@ -151,3 +151,15 @@ test('a kept Allow expires', async () => {
   r.onApprovalEvent(rerun('a2'));
   assert.equal(sent('exec.approval.resolve').length, 0);
 });
+
+test('on start, a recent Allow the stopped connector was checking is checked again; old and non-user ones are not', async () => {
+  const now = Date.now();
+  const items = [historyItem({ resolvedAtMs: now - 5000 }), historyItem({ id: 'old', resolvedAtMs: now - 600_000 }), historyItem({ id: 'auto', reason: 'policy', resolvedAtMs: now })];
+  const { r, sent } = setup({ items });
+  await r.recheckRecent();
+  await settle();
+  assert.deepEqual(sent('chat.send').map(c => c.params.idempotencyKey), ['cc-lost-allow-a1']);
+  r.onApprovalEvent(allowed()); // its live event arriving late: not checked twice
+  await settle();
+  assert.equal(sent('chat.send').length, 1);
+});
