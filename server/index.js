@@ -485,6 +485,12 @@ export function createApp(config = {}) {
         try { return send(res, 200, await team.send(p.room, await parseBody(req))); }
         catch (e) { return sendError(res, 400, e.message); }
       }
+      if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/reactions'))) {
+        try {
+          const out = await team.react(p.room, await parseBody(req));
+          return out ? send(res, 200, out) : sendError(res, 404, 'Not a team chat');
+        } catch (e) { return sendError(res, 400, e.message); }
+      }
       if ((p = matchRoute(method, urlPath, 'POST /api/team/:room/unconvert'))) {
         try {
           const sourceKey = await team.unconvert(p.room);

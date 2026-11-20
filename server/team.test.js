@@ -1365,3 +1365,76 @@ test('rounds are capped by the strictest autonomy tier either way, and Notify on
   await settle();
   assert.deepEqual(turns.map(t => t.round), [1]);
 });
+
+test('reactions: the host\'s person reacts to room entries; agents hear about it on their next turn', async () => {
+  const prompts = [];
+  const h = harness((agent, prompt) => { prompts.push([agent, prompt]); return agent === 'dev' ? 'dev answer' : 'NOTHING_TO_ADD'; });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: 'first', userLabel: 'Houman' });
+  await h.settle();
+  const [, devId] = Object.keys(h.team.room(roomKey).authors);
+  const sends = h.calls.filter(c => c.method === 'chat.send').length;
+
+  const res = await h.team.react(roomKey, { messageId: devId, emoji: '👍' });
+  assert.deepEqual(res.reactions, [{ emoji: '👍', count: 1, identities: [{ id: 'self', label: 'Houman' }] }]);
+  await h.team.react(roomKey, { messageId: devId, emoji: '👍' }); // twice: no change, no second notice
+  assert.equal(h.events.filter(e => e.event === 'team-reactions').length, 1);
+  assert.deepEqual(h.team.room(roomKey).reactions, { [devId]: res.reactions });
+  assert.equal(h.team.room(roomKey).reactionSelf, 'self');
+  await h.settle();
+  assert.equal(h.calls.filter(c => c.method === 'chat.send').length, sends, 'a reaction never starts a turn');
+
+  await assert.rejects(h.team.react(roomKey, { messageId: devId, emoji: 'ok' }), /one emoji/);
+  await assert.rejects(h.team.react(roomKey, { messageId: 'nope', emoji: '👍' }), /can't receive reactions/);
+  assert.equal(await h.team.react('agent:x:dashboard:none', { messageId: devId, emoji: '👍' }), null);
+
+  prompts.length = 0;
+  await h.team.send(roomKey, { text: 'second', userLabel: 'Houman' });
+  await h.settle();
+  const dev = prompts.find(([a]) => a === 'dev')[1];
+  assert.match(dev, /Reactions since your last turn[^\n]*\n- Houman added 👍 on your message "dev answer"/);
+  assert.match(prompts.find(([a]) => a === 'atlas')[1], /- Houman added 👍 on Dev's message "dev answer"/);
+
+  // Taken back: an empty list, and the removal is the next news.
+  const off = await h.team.react(roomKey, { messageId: devId, emoji: '👍', remove: true });
+  assert.deepEqual(off.reactions, []);
+  assert.deepEqual(h.team.room(roomKey).reactions, {});
+  prompts.length = 0;
+  await h.team.send(roomKey, { text: 'third', userLabel: 'Houman' });
+  await h.settle();
+  const again = prompts.find(([a]) => a === 'dev')[1];
+  assert.match(again, /- Houman removed 👍 from your message/);
+});
+
+test('reactions in a shared room: a person reacts from their copy under their own name; everyone\'s copy follows', async () => {
+  const { H, K, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await H.team.send(roomKey, { text: 'hello all', userLabel: 'Houman' });
+  await settle();
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  await settle();
+  const copy = K.team.rooms().find(r => r.replica);
+  const hostEntry = Object.entries(H.team.room(roomKey).authors).find(([, a]) => a.type === 'user')[0];
+  const copyEntry = K.team.store.mirrorId(copy.roomKey, hostEntry, { toHost: false });
+  assert.ok(copyEntry);
+
+  // Kamil reacts in his copy: the host records it as Kamil's, and his copy has it at once.
+  const res = await K.team.react(copy.roomKey, { messageId: copyEntry, emoji: '🎉' });
+  assert.deepEqual(res.reactions, [{ emoji: '🎉', count: 1, identities: [{ id: 'gwK', label: 'Kamil' }] }]);
+  assert.deepEqual(H.team.room(roomKey).reactions[hostEntry], res.reactions);
+  assert.equal(K.team.room(copy.roomKey).reactionSelf, 'gwK');
+  assert.ok(H.events.some(e => e.event === 'team-reactions' && e.messageId === hostEntry));
+
+  // Houman reacts too: Kamil's copy gets it with the next push.
+  await H.team.react(roomKey, { messageId: hostEntry, emoji: '🎉' });
+  await settle();
+  assert.deepEqual(K.team.room(copy.roomKey).reactions[copyEntry], [{ emoji: '🎉', count: 2, identities: [{ id: 'gwK', label: 'Kamil' }, { id: 'gwH', label: 'Houman Satarian' }] }]);
+  assert.ok(K.events.some(e => e.event === 'team-reactions' && e.messageId === copyEntry && e.reactions[0].count === 2));
+
+  // All taken back on the host: the copy clears too.
+  await H.team.react(roomKey, { messageId: hostEntry, emoji: '🎉', remove: true });
+  await K.team.react(copy.roomKey, { messageId: copyEntry, emoji: '🎉', remove: true });
+  await settle();
+  assert.deepEqual(K.team.room(copy.roomKey).reactions, {});
+  assert.deepEqual(H.team.room(roomKey).reactions, {});
+});

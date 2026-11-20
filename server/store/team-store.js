@@ -76,6 +76,10 @@ export function createTeamStore(getGlobalDb) {
       g.exec(`CREATE TABLE IF NOT EXISTS team_lanes (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, lane TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY (room_key, agent_id, lane))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_mirror (room_key TEXT NOT NULL, host_entry_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY (room_key, host_entry_id))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_inflight (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, round INTEGER NOT NULL, kind TEXT NOT NULL, run_id TEXT NOT NULL, work_key TEXT, mode TEXT, turn_json TEXT, post_json TEXT, started_at INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0, text TEXT, authority TEXT, PRIMARY KEY (room_key, agent_id))`);
+      // Reactions on room entries (message_id: this gateway's entry id; a copy's are mirrored from the host's), and the
+      // additions/removals agents are told about on their next turn (team.js _reactionNotes).
+      g.exec(`CREATE TABLE IF NOT EXISTS team_reactions (room_key TEXT NOT NULL, message_id TEXT NOT NULL, emoji TEXT NOT NULL, person_id TEXT NOT NULL, name TEXT, created_at INTEGER NOT NULL, PRIMARY KEY (room_key, message_id, emoji, person_id))`);
+      g.exec(`CREATE TABLE IF NOT EXISTS team_reaction_log (room_key TEXT NOT NULL, message_id TEXT NOT NULL, emoji TEXT NOT NULL, name TEXT, action TEXT NOT NULL, created_at INTEGER NOT NULL)`);
       ready = true;
     }
     return g;
@@ -166,6 +170,89 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('INSERT OR REPLACE INTO team_mirror (room_key, host_entry_id, message_id) VALUES (?, ?, ?)').run(roomKey, hostEntryId, messageId);
     },
 
+    /** A copy's entry id → the host's (toHost: false: the other way); null when it isn't mirrored. */
+    mirrorId(roomKey, id, { toHost = true } = {}) {
+      const r = toHost
+        ? db().prepare('SELECT host_entry_id AS id FROM team_mirror WHERE room_key = ? AND message_id = ?').get(roomKey, id)
+        : db().prepare('SELECT message_id AS id FROM team_mirror WHERE room_key = ? AND host_entry_id = ?').get(roomKey, id);
+      return r?.id || null;
+    },
+
+    // ── Reactions on room entries ──
+
+    /** One person adds or removes one emoji on an entry; returns whether anything changed (logged for the agents). */
+    setReaction(roomKey, messageId, emoji, { personId, name }, remove = false) {
+      const g = db();
+      const now = Date.now();
+      const changed = remove
+        ? g.prepare('DELETE FROM team_reactions WHERE room_key = ? AND message_id = ? AND emoji = ? AND person_id = ?').run(roomKey, messageId, emoji, personId).changes > 0
+        : g.prepare('INSERT OR IGNORE INTO team_reactions (room_key, message_id, emoji, person_id, name, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(roomKey, messageId, emoji, personId, name || null, now).changes > 0;
+      if (changed) this._logReaction(roomKey, messageId, emoji, name, remove ? 'removed' : 'added', now);
+      return changed;
+    },
+
+    /**
+     * A copy takes the host's reactions on an entry as they are (summaries in the gateway's shape); the
+     * differences are logged for this side's agents. Returns whether anything changed.
+     */
+    replaceReactions(roomKey, messageId, summaries) {
+      const g = db();
+      const now = Date.now();
+      const want = new Map();
+      for (const s of summaries || []) for (const who of s.identities || []) want.set(`${s.emoji}\u0000${who.id}`, { emoji: s.emoji, personId: who.id, name: who.label || null });
+      const have = g.prepare('SELECT emoji, person_id, name FROM team_reactions WHERE room_key = ? AND message_id = ?').all(roomKey, messageId);
+      let changed = false;
+      for (const r of have) {
+        if (want.delete(`${r.emoji}\u0000${r.person_id}`)) continue;
+        g.prepare('DELETE FROM team_reactions WHERE room_key = ? AND message_id = ? AND emoji = ? AND person_id = ?').run(roomKey, messageId, r.emoji, r.person_id);
+        this._logReaction(roomKey, messageId, r.emoji, r.name, 'removed', now);
+        changed = true;
+      }
+      for (const r of want.values()) {
+        g.prepare('INSERT OR IGNORE INTO team_reactions (room_key, message_id, emoji, person_id, name, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(roomKey, messageId, r.emoji, r.personId, r.name, now);
+        this._logReaction(roomKey, messageId, r.emoji, r.name, 'added', now);
+        changed = true;
+      }
+      return changed;
+    },
+
+    /** { [messageId]: [{ emoji, count, identities: [{ id, label? }] }] } (session.reactions.list's shape), or one entry's list. */
+    reactions(roomKey, messageId = null, { since = 0 } = {}) {
+      const rows = messageId
+        ? db().prepare('SELECT * FROM team_reactions WHERE room_key = ? AND message_id = ? ORDER BY created_at, rowid').all(roomKey, messageId)
+        : since
+          // Only on entries from `since` on (a person added "from now on" never sees reactions on earlier ones).
+          ? db().prepare(`SELECT r.* FROM team_reactions r JOIN team_entries e ON e.room_key = r.room_key AND e.message_id = r.message_id
+              WHERE r.room_key = ? AND COALESCE(e.host_ts, e.created_at) >= ? ORDER BY r.created_at, r.rowid`).all(roomKey, since)
+          : db().prepare('SELECT * FROM team_reactions WHERE room_key = ? ORDER BY created_at, rowid').all(roomKey);
+      const out = {};
+      for (const r of rows) {
+        const list = (out[r.message_id] ??= []);
+        let s = list.find(x => x.emoji === r.emoji);
+        if (!s) list.push(s = { emoji: r.emoji, count: 0, identities: [] });
+        s.count++;
+        s.identities.push({ id: r.person_id, ...(r.name ? { label: r.name } : {}) });
+      }
+      return messageId ? out[messageId] || [] : out;
+    },
+
+    /** Whether an entry was written at `since` (ms) or later. */
+    entrySince(roomKey, messageId, since) {
+      return !!db().prepare('SELECT 1 FROM team_entries WHERE room_key = ? AND message_id = ? AND COALESCE(host_ts, created_at) >= ?').get(roomKey, messageId, since);
+    },
+
+    /** Reactions added or removed after `since` (ms), oldest first: { messageId, emoji, name, action, ts }. */
+    reactionLog(roomKey, since) {
+      return db().prepare('SELECT message_id, emoji, name, action, created_at FROM team_reaction_log WHERE room_key = ? AND created_at > ? ORDER BY created_at, rowid LIMIT 50').all(roomKey, since)
+        .map(r => ({ messageId: r.message_id, emoji: r.emoji, name: r.name, action: r.action, ts: r.created_at }));
+    },
+
+    _logReaction(roomKey, messageId, emoji, name, action, now) {
+      const g = db();
+      g.prepare('INSERT INTO team_reaction_log (room_key, message_id, emoji, name, action, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(roomKey, messageId, emoji, name || null, action, now);
+      g.prepare('DELETE FROM team_reaction_log WHERE room_key = ? AND created_at < ?').run(roomKey, now - 30 * 86_400_000); // agents that sat out a month don't need them
+    },
+
     /** Takes an agent out of the room; its working session stays hidden (reused if it's added back). */
     removeMember(roomKey, agentId) {
       db().prepare('UPDATE team_members SET removed = 1 WHERE room_key = ? AND agent_id = ?').run(roomKey, agentId);
@@ -210,6 +297,8 @@ export function createTeamStore(getGlobalDb) {
       g.prepare('DELETE FROM team_mirror WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_lanes WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_inflight WHERE room_key = ?').run(roomKey);
+      g.prepare('DELETE FROM team_reactions WHERE room_key = ?').run(roomKey);
+      g.prepare('DELETE FROM team_reaction_log WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_rooms WHERE room_key = ?').run(roomKey);
       return work;
     },

@@ -501,11 +501,11 @@ export class SharingManager {
   /**
    * Team chats with people (specs/sharing-people.md) travel over whichever link the two gateways
    * have, in either direction: the room host pushes its room to members (room.sync), members post,
-   * leave and ask for a fresh copy (room.post / room.leave / room.fetch). `onRoom` (TeamCoordinator)
+   * leave, react and ask for a fresh copy (room.post / room.leave / room.react / room.fetch). `onRoom` (TeamCoordinator)
    * decides; it gets the other side's gateway id, which the link authenticated.
    */
   _wireRooms(link, otherGatewayId, current = fn => fn) {
-    for (const method of ['room.sync', 'room.post', 'room.leave', 'room.fetch']) {
+    for (const method of ['room.sync', 'room.post', 'room.leave', 'room.fetch', 'room.react']) {
       link.handle(method, current(this._limited(otherGatewayId, method, async p => {
         if (!this.onRoom) throw Object.assign(new Error('team chats are not available'), { code: 'unavailable' });
         return this.onRoom(method, p || {}, otherGatewayId);
