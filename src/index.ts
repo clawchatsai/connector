@@ -475,6 +475,8 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
     authToken:    process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
     gatewayToken,  // For WS auth to local OpenClaw gateway
     llm:           api.runtime?.llm, // host-run completions (chat-title fallback, /api/title)
+    // Dashboard widgets: the gateway's sandbox listener (/api/gw-board reads its proxy shell there).
+    sandboxPort:   ((gwCfg?.['mcp'] as Record<string, unknown> | undefined)?.['apps'] as Record<string, unknown> | undefined)?.['sandboxPort'],
     // Gateway sharing: the server side signs grants and runs guest turns; the host provides the
     // signal server link and the WebRTC transport.
     peer: {
