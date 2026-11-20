@@ -260,8 +260,9 @@ export class PushNotifier {
     const devices = this.store.list().filter(d => d.prefs[pref] && !skip(d.id) && only(d.id) && (apple || !isApplePush(d.endpoint)));
     if (!devices.length) return [];
     const unread = this.unreadCount();
-    const reached = await Promise.all(devices.map(d => this._sendTo(d, this._payload(d, n, unread), n).then(ok => ok && d.id)));
-    return reached.filter(Boolean);
+    const reached = (await Promise.all(devices.map(d => this._sendTo(d, this._payload(d, n, unread), n).then(ok => ok && d.id)))).filter(Boolean);
+    this.log.info?.(`[push] ${n.kind} → ${reached.length}/${devices.length} device(s)`); // no content, no endpoints
+    return reached;
   }
 
   _payload(device, n, unread) {

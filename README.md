@@ -87,6 +87,8 @@ server/                   # Local backend server (Node.js, plain ESM)
     identity.js           # ed25519 device signing for OpenClaw ≥2.15
   controllers/            # HTTP route handlers (files, workspace, gateway media, transcribe, settings)
   util/                   # HTTP helpers, multipart parser, context builder, misc
+  push/                   # Push notifications to the owner's devices: RFC 8291 encryption + VAPID (web-push.js),
+                          # subscriptions (store.js), presence, VAPID tokens from the signal server (vapid.js), notifier.js
 src/                      # OpenClaw plugin wrapper (TypeScript)
   index.ts                # Plugin entry point — registers with OpenClaw, manages lifecycle
   signaling-client.ts     # Connects to ClawChats signaling server for P2P handshake
@@ -101,6 +103,8 @@ src/                      # OpenClaw plugin wrapper (TypeScript)
 **Session cleanup:** When a thread or workspace is deleted, the plugin removes the associated OpenClaw session files (`.jsonl`) to prevent stale context. These are files created by the gateway itself during that session.
 
 **Auth:** Before any data is processed, the connector proves its identity to the browser (a signature over the WebRTC connection's DTLS fingerprints, made with the connector's own key), then the browser logs in by signing the same data with its device key. A new browser pairs once with a TOTP or backup code. There is no session token. Manage paired browsers with `openclaw clawchats devices` and `openclaw clawchats devices revoke <id|label>`; compare the connector key with `openclaw clawchats show-fingerprint`. The HTTP API uses a local bearer token (set via `CLAWCHATS_AUTH_TOKEN` or `config.js`). No credentials are sent to external servers.
+
+**Push notifications:** only once you turn them on for a device (ClawChats Settings → Phone & background notifications), the connector sends that device's notifications itself: each message is encrypted to the device (RFC 8291) and POSTed to the browser's push service (Google FCM, Apple, Mozilla or Windows), which sees only ciphertext. The ClawChats server signs a short-lived VAPID token for each push service about twice a day and never sees the messages, the device addresses or when they are sent. Device subscriptions are kept in `push-subscriptions.json` in the connector's data dir (0600).
 
 **No shell execution:** The plugin contains no `exec`, `spawn`, or shell calls. SQLite is handled by Node's built-in `node:sqlite` module — no native binary compilation required.
 
