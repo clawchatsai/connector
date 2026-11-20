@@ -8,6 +8,7 @@ import { Database } from './bootstrap/native.js';
 import { GATEWAY_WS_URL, AUTH_TOKEN, discoverWorkspaceDir } from './config.js';
 import { DebugLogger } from './debug.js';
 import { GatewayClient } from './gateway.js';
+import { LostAllowRetry } from './approval-retry.js';
 import { withGatewayRetry } from './util/gateway-retry.js';
 import { createChatAbort } from './util/chat-abort.js';
 import { handleServeFile, handleWorkspaceList, handleWorkspaceFileRead, handleWorkspaceFileWrite, handleWorkspaceFileDelete, handleWorkspaceUpload, handleWorkspaceCreate, handleWorkspaceMove, handleWorkspaceCopy } from './controllers/filesystem.js';
@@ -95,8 +96,10 @@ export function createApp(config = {}) {
   }) : null;
   // Team chats: several agents in one thread (server/team.js).
   const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, chatAbort, broadcast, titler: createTitler(config.llm), remote: sharing });
+  // Exec Allows the gateway lost after a session change (OpenClaw 2026.9.7+; server/approval-retry.js).
+  const lostAllows = new LostAllowRetry({ request: gwRequest });
   gatewayClient.onEvent = msg => { team.onGatewayEvent(msg); sharing?.onGatewayEvent(msg); };
-  gatewayClient.onApprovalEvent = msg => sharing?.onApprovalEvent(msg);
+  gatewayClient.onApprovalEvent = msg => { sharing?.onApprovalEvent(msg); lostAllows.onApprovalEvent(msg); };
   gatewayClient.onConnected = () => { sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); };
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
   // Renamed agents: shares re-issued with the new names, copies of rooms here told (peer/sharing.js, team.js).
