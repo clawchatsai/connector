@@ -251,6 +251,18 @@ test('a team chat needs two agents; removing down to one is refused', async () =
   assert.deepEqual((await h.team.removeAgent(roomKey, 'dev')).agents.map(a => a.agentId), ['atlas', 'main']);
 });
 
+test('an agent added on the gateway a moment ago can join right away (agents.list cache refreshed on a miss)', async () => {
+  const agents = [...AGENTS];
+  const h = harness(() => 'x', { agents });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] }); // fills the cache
+  agents.push({ id: 'helper', identity: { name: 'Helper' } }, { id: 'ops', identity: {} });
+  assert.deepEqual((await h.team.createRoom({ agentIds: ['main', 'helper'] })).agents.map(a => a.agentId), ['main', 'helper']);
+  assert.deepEqual((await h.team.addAgent(roomKey, 'ops')).agents.map(a => a.agentId), ['dev', 'atlas', 'ops']);
+  const lists = h.calls.filter(c => c.method === 'agents.list').length;
+  await assert.rejects(h.team.createRoom({ agentIds: ['main', 'nobody'] }), /unknown agent: nobody/);
+  assert.equal(h.calls.filter(c => c.method === 'agents.list').length, lists + 1); // one re-read, then refused
+});
+
 test('stop: a partial reply is posted marked stopped; a reply that finished anyway is posted', async () => {
   const pending = [];
   const h = harness(agent => new Promise(resolve => pending.push({ agent, resolve })));

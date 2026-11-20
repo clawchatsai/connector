@@ -221,6 +221,15 @@ export class TeamCoordinator {
     return [...this._agents.list, ...this._remoteAgents()];
   }
 
+  /** One agent, or null. A miss reads agents.list again: an agent added in the last minute isn't in the cache yet. */
+  async _agent(agentId) {
+    const find = list => list.find(a => a.agentId === agentId) || null;
+    const hit = find(await this.agents());
+    if (hit || TeamCoordinator.isRemote(agentId)) return hit;
+    this._agents = null;
+    return find(await this.agents());
+  }
+
   _remoteAgents() {
     let list = [];
     try { list = (this.remote?.remoteAgents() || []).map(a => ({ agentId: a.agentId, name: a.name, remote: true, ownerName: a.ownerName })); }
@@ -340,9 +349,7 @@ export class TeamCoordinator {
       members.unshift({ agentId: own.agentId });
     }
     if (members.length + people.length < 2) throw new Error('a team chat needs at least two participants');
-    const known = new Set((await this.agents()).map(a => a.agentId));
-    const unknown = members.find(m => !known.has(m.agentId));
-    if (unknown) throw new Error(`unknown agent: ${unknown.agentId}`);
+    for (const m of members) if (!await this._agent(m.agentId)) throw new Error(`unknown agent: ${m.agentId}`);
 
     const roomKey = `agent:${members[0].agentId}:dashboard:${crypto.randomUUID()}`;
     // Register first so the lens never shows a working session or forwards a half-made room.
@@ -428,7 +435,7 @@ export class TeamCoordinator {
   async addAgent(roomKey, agentId, { history = 'all' } = {}) {
     const room = this.store.getRoom(roomKey);
     if (room?.host) throw new Error("Only the chat's host can add agents");
-    const named = (await this.agents()).find(a => a.agentId === agentId);
+    const named = await this._agent(agentId);
     if (!named) throw new Error(`unknown agent: ${agentId}`);
     const fresh = !room?.members.some(m => m.agentId === agentId);
     if (!this.store.addMember(roomKey, agentId, { history, seenAt: history === 'now' ? Date.now() : 0 })) return null;
