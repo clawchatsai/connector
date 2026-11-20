@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { WebSocketServer } from 'ws';
-import { GatewayClient } from './gateway.js';
+import { GatewayClient, attachmentLimitsOf } from './gateway.js';
 
 const logger = { logFrame() {} };
 
@@ -68,4 +68,19 @@ test('request() keeps the error fields the gateway sends (gatewayCode, retryable
   gw.close();
   await new Promise(r => wss.close(r));
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('attachment limits come from hello-ok policy (2026.11+); older gateways name none', () => {
+  const hello = { type: 'hello-ok', policy: { maxPayload: 25 * 1024 * 1024, attachments: { maxBytes: 20 * 1024 * 1024, maxImageBytes: 6 * 1024 * 1024 } } };
+  assert.deepEqual(attachmentLimitsOf(hello), { maxBytes: 20971520, maxImageBytes: 6291456, maxBatchBytes: Math.floor(((25 * 1024 * 1024 - 256 * 1024) * 3) / 4) });
+  assert.equal(attachmentLimitsOf({ type: 'hello-ok' }), null);
+  assert.equal(attachmentLimitsOf({ type: 'hello-ok', policy: { maxPayload: 1 } }), null);
+});
+
+test('browsers hear the attachment limits once the gateway named them', () => {
+  const gw = new GatewayClient({ dataDir: '/tmp', debugLogger: logger, gatewayWsUrl: 'ws://127.0.0.1:1', authToken: '' });
+  assert.equal(gw.attachmentLimitsFrame(), null);
+  gw.attachmentLimits = { maxBytes: 10, maxImageBytes: 5 };
+  assert.deepEqual(JSON.parse(gw.attachmentLimitsFrame()), { type: 'clawchats', event: 'attachment-limits', limits: { maxBytes: 10, maxImageBytes: 5 } });
+  gw.close();
 });

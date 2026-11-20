@@ -63,6 +63,7 @@ interface AppInstance {
     removeBroadcastTarget: (fn: (data: string) => void) => void;
     browsersChanged: () => void;
     setExternalBrowserCount: (fn: () => number) => void;
+    attachmentLimitsFrame: () => string | null;
   };
   setupBrowserWs: (wss: unknown) => void;
   debugLogger: {
@@ -775,6 +776,9 @@ function setupDataChannelHandler(
       }
       connectedClients.set(connectionId, dc);
       ctx.logger.info(`Browser authenticated: ${connectionId} (${label})`);
+      // The gateway's chat attachment limits (its hello-ok policy), which this browser checks files against.
+      const limits = app?.gatewayClient?.attachmentLimitsFrame();
+      if (limits) { try { dc.send(JSON.stringify({ type: 'gateway-event', payload: limits })); } catch { /* closed */ } }
     },
     onMessage: (msg) => processAuthenticatedMessage(dc, connectionId, msg, ctx),
     onLoginFailure: (reason) => {

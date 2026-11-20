@@ -24,6 +24,21 @@ export function gatewayError(error, fallback) {
   return err;
 }
 
+/**
+ * The chat attachment limits a 2026.11+ gateway advertises in hello-ok (policy.attachments: maxBytes,
+ * maxImageBytes) plus one send's byte budget, which has to fit a single frame: the Control UI's
+ * resolveChatAttachmentLimits (chat-attachment-admission.ts) and chat-attachment-frame-budget.ts.
+ * Null when the gateway doesn't say (older versions): then only the gateway itself checks.
+ */
+export function attachmentLimitsOf(hello) {
+  const policy = hello?.policy;
+  const a = policy?.attachments;
+  if (!a || !(a.maxBytes > 0)) return null;
+  const maxImageBytes = a.maxImageBytes > 0 ? Math.min(a.maxImageBytes, a.maxBytes) : a.maxBytes;
+  const maxBatchBytes = policy.maxPayload > 0 ? Math.max(0, Math.floor(((policy.maxPayload - 256 * 1024) * 3) / 4)) : null;
+  return { maxBytes: a.maxBytes, maxImageBytes, ...(maxBatchBytes ? { maxBatchBytes } : {}) };
+}
+
 export class GatewayClient {
   constructor({ dataDir, debugLogger, gatewayWsUrl, authToken, approvalClientGraceMs = APPROVAL_CLIENT_GRACE_MS }) {
     this.dataDir = dataDir;
@@ -120,7 +135,7 @@ export class GatewayClient {
       this.ws.send(JSON.stringify({ type: 'req', id: 'gw-connect-1', method: 'connect', params: this._connectParams(msg.payload?.nonce || '', ['tool-events', 'chat-queue-status']) }));
       return;
     }
-    if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.broadcastGatewayStatus(true); this.sync?.onConnected(); this.onConnected?.(); this.request('sessions.subscribe', {}).catch(e => console.warn(`[lens] sessions.subscribe failed: ${e.message}`)); this.lens?.seedWithRetry(); }
+    if (msg.type === 'res' && msg.payload?.type === 'hello-ok') { console.log('Gateway handshake complete'); this.connected = true; this.attachmentLimits = attachmentLimitsOf(msg.payload); this.broadcastGatewayStatus(true); if (this.attachmentLimits) this.broadcastToBrowsers(this.attachmentLimitsFrame()); this.sync?.onConnected(); this.onConnected?.(); this.request('sessions.subscribe', {}).catch(e => console.warn(`[lens] sessions.subscribe failed: ${e.message}`)); this.lens?.seedWithRetry(); }
     // Session events arrive through the connector's own subscription; the lens filters them
     // for the browser (session.message only for chats a browser subscribed to).
     if (msg.type === 'event' && (msg.event === 'sessions.changed' || msg.event === 'session.message')) {
@@ -161,6 +176,11 @@ export class GatewayClient {
 
   broadcastGatewayStatus(connected) {
     this.broadcastToBrowsers(JSON.stringify({ type: 'clawchats', event: 'gateway-status', connected }));
+  }
+
+  /** The gateway's attachment limits for browsers (sent on each hello-ok and to a browser that joins); null if unknown. */
+  attachmentLimitsFrame() {
+    return this.attachmentLimits ? JSON.stringify({ type: 'clawchats', event: 'attachment-limits', limits: this.attachmentLimits }) : null;
   }
 
   /** A frame from a browser: the lens may rewrite it or answer it itself. */
@@ -214,6 +234,8 @@ export class GatewayClient {
     this.browsersChanged();
     if (ws.readyState === WS.OPEN) {
       ws.send(JSON.stringify({ type: 'clawchats', event: 'gateway-status', connected: this.connected }));
+      const limits = this.attachmentLimitsFrame();
+      if (limits) ws.send(limits);
     }
   }
 
