@@ -40,6 +40,8 @@ export const ROW_FIELDS = new Set([
   'model', 'modelProvider', 'thinkingLevel', 'contextTokens', 'totalTokens', 'totalTokensFresh',
   'inputTokens', 'outputTokens', 'permissionMode', 'workspaceDir', 'contextBudgetStatus', 'fastMode', 'effectiveFastMode',
   'startedAt', 'runtimeMs', 'ccParentKey',
+  // Subagents panel: a run waiting on its own runs, and the run's live headline.
+  'hasActiveSubagentRun', 'observerDigest',
 ]);
 
 // `sessions.changed` envelope fields (snapshot fields are spread next to these).
