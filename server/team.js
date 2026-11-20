@@ -39,6 +39,8 @@ const AGENTS_TTL_MS = 60_000;
 const ALL_WORDS = new Set(['all', 'everyone']);
 /** Rounds of @mention replies when agents don't "discuss": an agent a reply names answers once, and so on. */
 const MENTION_ROUNDS = 3;
+// Rounds per human message each autonomy tier allows (peer/contact-policy.js AUTONOMY; Notify only: none).
+const ROUND_LIMITS = { bounded: 3, extended: 10 };
 
 const norm = s => String(s || '').toLowerCase().replace(/\s+/g, '');
 /** Room entries up to and including `id` (all of them when it's not given or not among them). */
@@ -292,6 +294,37 @@ export class TeamCoordinator {
     return this.store.listRooms().map(r => this._publicRoom(r));
   }
 
+  /** Agents answer only when @mentioned: the host's choice, or automatic (on while another person is in the chat, D12). */
+  _mentionOnly(room) { return room.mentionOnly === null || room.mentionOnly === undefined ? !!room.people?.length : room.mentionOnly; }
+
+  /**
+   * What the contact cards allow in this room, both directions, per person in it (people, and the owners of other
+   * people's agents): { people: [{ personId, name, mine, theirs }], roundsCap: { n, by, personId, name } | null,
+   * quiet(agentId, actingFor) }. Rounds are capped by the strictest tier that lets agents talk at all; Notify only makes
+   * that side's agents sit out agent rounds instead (`quiet`).
+   */
+  _limits(room) {
+    const ids = new Set((room.people || []).map(p => p.personId));
+    for (const m of room.members || []) if (TeamCoordinator.isRemote(m.agentId)) { const gw = this.remote?.ownerOf?.(m.agentId); if (gw) ids.add(gw); }
+    const people = [...ids].map(id => ({ personId: id, name: (room.people || []).find(p => p.personId === id)?.name || this.remote?.contact?.(id)?.name || null, ...(this.remote?.limitsFor?.(id) || {}) }));
+    let roundsCap = null;
+    for (const p of people) {
+      for (const by of ['mine', 'theirs']) {
+        const n = ROUND_LIMITS[p[by]?.autonomy];
+        if (!n) continue; // unknown, or Notify only (handled by `quiet`)
+        if (!roundsCap || n < roundsCap.n) roundsCap = { n, by, personId: p.personId, name: p.name };
+      }
+    }
+    const tierOf = gw => people.find(p => p.personId === gw);
+    const quiet = (agentId, actingFor) => {
+      if (TeamCoordinator.isRemote(agentId)) return tierOf(this.remote?.ownerOf?.(agentId))?.theirs?.autonomy === 'notify';
+      if (!actingFor) return false;
+      const gw = String(actingFor).startsWith('person:') ? actingFor.slice('person:'.length) : this.remote?.ownerOf?.(actingFor);
+      return tierOf(gw)?.mine?.autonomy === 'notify';
+    };
+    return { people, roundsCap, quiet };
+  }
+
   room(roomKey) {
     const r = this.store.getRoom(roomKey);
     return r ? { ...this._publicRoom(r), authors: this.store.authors(roomKey) } : null;
@@ -302,8 +335,10 @@ export class TeamCoordinator {
     return {
       roomKey: r.roomKey,
       discuss: r.discuss,
-      mentionOnly: r.mentionOnly,
+      mentionOnly: r.mentionOnly, // null: automatic (D12)
+      mentionAuto: this._mentionOnly(r),
       rounds: r.rounds,
+      ...(r.host ? {} : { limits: this._limits(r) }),
       sourceKey: r.sourceKey,
       createdAt: r.createdAt,
       agents: r.members.map(m => {
@@ -311,7 +346,7 @@ export class TeamCoordinator {
         const a = this._remoteAgents().find(x => x.agentId === m.agentId);
         // A share that ended keeps its member, shown as unavailable.
         const known = a || this._remoteName(m.agentId);
-        return { agentId: m.agentId, workKey: null, remote: true, name: known?.name || null, ownerName: known?.ownerName || null, available: !!a };
+        return { agentId: m.agentId, workKey: null, remote: true, name: known?.name || null, ownerName: known?.ownerName || null, ownerId: this.remote?.ownerOf?.(m.agentId) || null, available: !!a };
       }),
       running: live ? [...live.running.keys()] : [],
       // Remote agents whose run waits for their owner to approve something: { agentId: { owner, what, expiresAtMs } }.
@@ -328,7 +363,7 @@ export class TeamCoordinator {
    * Create a team chat. With `sourceKey`, an existing chat becomes the first agent's working
    * session (it keeps its memory) and is hidden from the thread list.
    */
-  async createRoom({ agentIds = [], personIds = [], sourceKey = null, category, label, mentionOnly = false } = {}) {
+  async createRoom({ agentIds = [], personIds = [], sourceKey = null, category, label, mentionOnly = null } = {}) {
     const agents = [...new Set(agentIds.filter(a => typeof a === 'string' && a))];
     const people = [...new Set(personIds.filter(a => typeof a === 'string' && a))];
     const members = [];
@@ -353,7 +388,7 @@ export class TeamCoordinator {
 
     const roomKey = `agent:${members[0].agentId}:dashboard:${crypto.randomUUID()}`;
     // Register first so the lens never shows a working session or forwards a half-made room.
-    this.store.createRoom(roomKey, members, { sourceKey, mentionOnly: !!mentionOnly });
+    this.store.createRoom(roomKey, members, { sourceKey, mentionOnly: mentionOnly === null || mentionOnly === undefined ? null : !!mentionOnly });
     this._workKeysChanged();
     // Labels are unique per gateway and the source chat still holds this one: it steps aside (as the
     // hidden working session) so the team chat can take it; it gets it back when the room goes.
@@ -480,12 +515,12 @@ export class TeamCoordinator {
     return this.room(roomKey);
   }
 
-  /** Host setting: agents answer only when @mentioned (chats between people, with the agents quiet). */
+  /** Host setting: agents answer only when @mentioned (chats between people, with the agents quiet). null: automatic. */
   setMentionOnly(roomKey, on) {
     const r = this.store.getRoom(roomKey);
     if (!r) return null;
     if (r.host) throw new Error("Only the chat's host can change this");
-    this.store.setMentionOnly(roomKey, !!on);
+    this.store.setMentionOnly(roomKey, on === null ? null : !!on);
     this._changed();
     this._pushSoon(roomKey);
     return this.room(roomKey);
@@ -570,13 +605,15 @@ export class TeamCoordinator {
     let targets, mode;
     if (mention.all) { targets = agents.map(a => a.agentId); mode = 'addressed'; }
     else if (mention.agentIds.length) { targets = mention.agentIds; mode = 'addressed'; }
-    else { targets = room.mentionOnly ? [] : agents.map(a => a.agentId); mode = 'open'; }
+    else { targets = this._mentionOnly(room) ? [] : agents.map(a => a.agentId); mode = 'open'; }
     // A person's own agents answer them on their own gateway (their connector runs them at full
     // strength); this gateway never runs them for that person's messages.
     if (fromPerson) targets = targets.filter(id => !(TeamCoordinator.isRemote(id) && this.remote?.ownerOf?.(id) === fromPerson));
 
-    // Without "discuss" an agent still answers once when a reply @mentions it (a few rounds at most).
-    const maxRounds = room.discuss ? room.rounds : MENTION_ROUNDS;
+    // Without "discuss" an agent still answers once when a reply @mentions it (a few rounds at most). Either way no
+    // more rounds than the strictest autonomy tier between this gateway and the people in the chat (both directions).
+    const limits = this._limits(room);
+    const maxRounds = Math.min(room.discuss ? room.rounds : MENTION_ROUNDS, limits.roundsCap?.n ?? Infinity);
     const maxTurns = room.discuss ? agents.length * Math.max(2, room.rounds - 1) : agents.length * 2;
     let turns = 0;
     // Authority comes from who asked (specs/sharing-people.md): the first round answers the owner,
@@ -594,7 +631,11 @@ export class TeamCoordinator {
       mode = room.discuss ? 'followup' : 'addressed';
     }
     for (; round <= maxRounds && targets.length && turns < maxTurns && !stopped(); round++) {
+      // Notify only: in agent rounds, agents never answer another agent across that tier (the person can still ask).
+      if (round > 1) targets = targets.filter(id => !limits.quiet(id, actingFor.get(id)));
+      if (!targets.length) break;
       targets = targets.slice(0, maxTurns - turns);
+      this._live(roomKey).round = round; // for the peer turn: what triggered it (owner-side autonomy check)
       turns += targets.length;
       // The first round answers the message itself: what others said after it (still queued, or posted meanwhile)
       // is for a later turn, so it can never pass for the request this round runs on.
@@ -761,7 +802,8 @@ export class TeamCoordinator {
     let result, partial = '';
     try {
       this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
-      result = await this.remote.turn(agentId, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier) },
+      const round = live.round || 1;
+      result = await this.remote.turn(agentId, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier), trigger: round > 1 ? 'agent' : 'person', round },
         {
           stopped, // a turn whose link dropped is sent again, unless the room was stopped meanwhile
           onDelta: text => { partial = text; delta(text); },
@@ -803,7 +845,7 @@ export class TeamCoordinator {
     let result, partial = '';
     try {
       this._setSeen(roomKey, agentId, lane, fresh);
-      result = await this.remote?.localTurnFor(agentId, actingFor, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier) },
+      result = await this.remote?.localTurnFor(agentId, actingFor, { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier), round: live.round || 1 },
         { onDelta: text => { partial = text; delta(text); } });
     } catch (e) {
       throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
@@ -1008,7 +1050,7 @@ export class TeamCoordinator {
     const c = this.remote?.contact?.(personId);
     if (!c) throw new Error('Connect with them first (Settings → People)');
     const already = room.people.some(p => p.personId === personId);
-    if (quietAgents && !already && !room.people.length && !room.mentionOnly) this.store.setMentionOnly(roomKey, true);
+    if (quietAgents && !already && !room.people.length && room.mentionOnly === false) this.store.setMentionOnly(roomKey, true);
     this.store.addPerson(roomKey, { personId, name: c.name, email: c.email, historyFrom: history === 'now' ? Date.now() : 0 });
     if (!already) await this._note(roomKey, `${c.name} joined`);
     this._changed();
@@ -1104,7 +1146,7 @@ export class TeamCoordinator {
       roomId: room.roomKey, title, hostName: this._hostName(), full: !!full, entries,
       view: {
         discuss: room.discuss,
-        mentionOnly: room.mentionOnly,
+        mentionOnly: this._mentionOnly(room),
         members: agents.map(a => {
           const remote = TeamCoordinator.isRemote(a.agentId);
           return { agentId: a.agentId, ref: this._ref(a.agentId), name: remote ? a.name : `${a.name} · ${this.remote?.labelOf?.(self, this._hostName()) || this._hostName().split(/\s+/)[0]}`, ownerId: remote ? this.remote?.ownerOf?.(a.agentId) || null : self };

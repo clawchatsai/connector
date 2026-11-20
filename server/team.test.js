@@ -398,7 +398,7 @@ test('shared (remote) agents: in the roster, turns over the peer link, streamed,
   const h = harness(agent => `${agent} local`, { remote });
   const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
   const room = h.team.room(roomKey);
-  assert.deepEqual(room.agents[1], { agentId: 'peer:sh1:jarvis', workKey: null, remote: true, name: 'Jarvis · Kamil', ownerName: 'Kamil', available: true });
+  assert.deepEqual(room.agents[1], { agentId: 'peer:sh1:jarvis', workKey: null, remote: true, name: 'Jarvis · Kamil', ownerName: 'Kamil', ownerId: null, available: true });
 
   await h.team.send(roomKey, { text: '@all hi', userLabel: 'H' });
   await h.settle();
@@ -606,7 +606,7 @@ test('rounds: a per-room host setting, validated', async () => {
 function twoGateways({ devShared = true, hostReply = null } = {}) {
   const forCalls = [];
   const sides = {};
-  const net = { connected: true, jarvisShared: true };
+  const net = { connected: true, jarvisShared: true, limits: {} };
   const mk = (self, other, name) => ({
     gatewayId: () => self,
     selfName: () => name,
@@ -633,6 +633,7 @@ function twoGateways({ devShared = true, hostReply = null } = {}) {
     },
     abort: async () => {},
     actingForName: () => 'Kamil',
+    limitsFor: gw => (gw === other ? net.limits[self] || {} : {}),
     localTurnFor: async (localId, who, args) => {
       forCalls.push({ localId, who, args });
       return devShared ? { state: 'final', text: `${localId} for kamil` } : null;
@@ -791,21 +792,24 @@ test('a chat with only people: the agent stays quiet unless @mentioned', async (
   assert.equal(H.team.room(room.roomKey).mentionOnly, false);
 });
 
-test('adding the first person from the popover turns "agents reply only when @mentioned" on; later adds and create-time adds leave it', async () => {
+test('"agents reply only when @mentioned" is automatic (D12): on with another person in the chat, off with only agents; a host choice sticks', async () => {
   const { H, K, settle } = twoGateways();
   const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
-  assert.equal(H.team.room(roomKey).mentionOnly, false);
-  await H.team.addPerson(roomKey, 'gwK', { history: 'all', quietAgents: true });
+  assert.deepEqual([H.team.room(roomKey).mentionOnly, H.team.room(roomKey).mentionAuto], [null, false], 'automatic, off: only agents');
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
   await settle();
-  assert.equal(H.team.room(roomKey).mentionOnly, true, 'first other person: agents go quiet');
+  assert.deepEqual([H.team.room(roomKey).mentionOnly, H.team.room(roomKey).mentionAuto], [null, true], 'another person: agents go quiet');
   assert.equal(K.team.rooms().find(r => r.replica).mentionOnly, true, 'and the copy knows');
   H.team.setMentionOnly(roomKey, false);
   await H.team.addPerson(roomKey, 'gwK', { history: 'all', quietAgents: true });
-  assert.equal(H.team.room(roomKey).mentionOnly, false, 'the host\'s later choice is kept');
+  assert.deepEqual([H.team.room(roomKey).mentionOnly, H.team.room(roomKey).mentionAuto], [false, false], "the host's choice is kept");
+  H.team.setMentionOnly(roomKey, null);
+  assert.deepEqual([H.team.room(roomKey).mentionOnly, H.team.room(roomKey).mentionAuto], [null, true], 'back to automatic');
 
-  const plain = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
-  await H.team.addPerson(plain.roomKey, 'gwK', { history: 'all' });
-  assert.equal(H.team.room(plain.roomKey).mentionOnly, false, 'create-time adds decide for themselves');
+  // A room made before automatic (an explicit "off"): the first person still turns it on, as before.
+  const old = await H.team.createRoom({ agentIds: ['dev', 'atlas'], mentionOnly: false });
+  await H.team.addPerson(old.roomKey, 'gwK', { history: 'all', quietAgents: true });
+  assert.equal(H.team.room(old.roomKey).mentionOnly, true);
 });
 
 test("someone's agent answering on its owner's copy and through the host: each session gets what it said in the other", async () => {
@@ -1104,7 +1108,7 @@ test('a host renaming the chat reaches the copies without anyone sending a messa
 
 test("a host can't put your unshared agents in its room, nor write lines as you or your agents", async () => {
   const { H, K, settle } = twoGateways();
-  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'], mentionOnly: false });
   await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
   await settle();
   const copy = K.team.rooms().find(r => r.replica);
@@ -1246,4 +1250,34 @@ test("a shared agent's turn gets the room's stopped(), so a dropped link isn't r
   await h.settle();
   assert.equal(typeof opts?.stopped, 'function');
   assert.equal(opts.stopped(), false);
+});
+
+test('rounds are capped by the strictest autonomy tier either way, and Notify only keeps that side\'s agents out of agent rounds', async () => {
+  const { H, settle, net } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'], mentionOnly: false });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  H.team.setMentionOnly(roomKey, false);
+  H.team.setDiscuss(roomKey, true);
+  H.team.setRounds(roomKey, 10);
+  // Houman's card for Kamil: Bounded (3); Kamil's for Houman: Extended (10).
+  net.limits.gwH = { mine: { access: 'trusted', autonomy: 'bounded' }, theirs: { access: 'trusted', autonomy: 'extended' } };
+  const room = H.team.room(roomKey);
+  assert.deepEqual(room.limits.roundsCap, { n: 3, by: 'mine', personId: 'gwK', name: 'Kamil' });
+  assert.deepEqual(room.limits.people[0].theirs, { access: 'trusted', autonomy: 'extended' });
+
+  const turns = [];
+  const turn = H.team.remote.turn;
+  H.team.remote.turn = async (agentId, args) => { turns.push(args); return turn(agentId, args); };
+  await H.team.send(roomKey, { text: 'what do you both think?' });
+  await settle();
+  assert.ok(turns.length >= 2, 'their agent joins the discussion');
+  assert.equal(Math.max(...turns.map(t => t.round)), 3, 'no fourth round');
+  assert.deepEqual([turns[0].trigger, turns.at(-1).trigger], ['person', 'agent']);
+
+  // Kamil set Notify only for Houman: his agent answers Houman's message, then sits out the agent rounds.
+  net.limits.gwH = { mine: { access: 'trusted', autonomy: 'extended' }, theirs: { access: 'trusted', autonomy: 'notify' } };
+  turns.length = 0;
+  await H.team.send(roomKey, { text: 'and now?' });
+  await settle();
+  assert.deepEqual(turns.map(t => t.round), [1]);
 });

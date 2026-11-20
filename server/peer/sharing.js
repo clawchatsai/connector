@@ -18,12 +18,18 @@ import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
 import { redactSecrets } from '../util/redact.js';
 import { createChatAbort } from '../util/chat-abort.js';
-import { hasGuestRestrictions, ensureGuestRestrictions, findGuestAgent, isGuestAgent, restrictionsPending } from './guest-agent.js';
+import { ensureGuestRestrictions, findGuestAgent, isGuestAgent } from './guest-agent.js';
+import { ContactBook, personKeyOf } from './contacts.js';
+import { AUTONOMY, ACCESS, sessionMode, toolOverrides as contactOverrides, topicsNote, copyTools, copyToolsHold, copyKind, defaultContact, TOOL_GROUPS, ALWAYS_OFF, BASIC_DEFAULTS, DEFAULT_TOOLS, DEFAULT_COMMANDS } from './contact-policy.js';
+import { ensureContactCopy, retireCopy, reviewerModelFor } from './contact-copy.js';
+import { noteCandidates, resolvePicks, picksSignature, syncNotes, removeNotes, NOTES_DIR } from './notes-sync.js';
+import { peerOutdated, outdatedMessage, connectorVersion } from './version.js';
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
+// A turn whose commands may ask the owner: as long as the gateway keeps an approval pending (30 min) plus the run.
+const APPROVAL_TURN_TIMEOUT_MS = 35 * 60_000;
 /** The gateway's "the run gave no visible reply" failure (2026.10.1+: a passed turn, see team.js PASS_TOKEN). */
 export const EMPTY_REPLY_ERROR = /empty response|did not produce a visible reply/i;
-const DEFAULT_DAILY_CAP = 50;
 const MAX_CONCURRENT_TURNS = 2;   // per share: the daily cap alone would allow 50 parallel 10-minute runs
 // Owner side: finished guest turns, so a resend after a dropped link gets the result instead of a new run.
 const RECENT_TURN_MS = 10 * 60_000;
@@ -34,7 +40,8 @@ const RESEND_BACKOFF_MS = [2_000, 5_000];
 // restarted" turn of its own, under another run id); this long for that to start, polled this often.
 const RECOVERY_WAIT_MS = 30_000;
 const RECOVERY_POLL_MS = 2_000;
-const ACCESS_MODES = { restricted: 'read-only', trusted: 'guarded' };
+/** Old grants (v1) carried a daily cap; migrated contacts get the autonomy tier closest to it. */
+const autonomyFromCap = cap => (Number(cap) > 50 ? 'extended' : 'bounded');
 /**
  * Requests one contact's gateway may make of this one over the sharing link: [burst, per ms] token
  * buckets per contact and kind. Far above what a person and their agents send in a chat (a turn per
@@ -57,10 +64,12 @@ export const defangLocalPaths = text => String(text ?? '')
   .replace(/\bMEDIA:/gi, m => `${m.slice(0, -1)}\u200b:`)
   .replace(/(^|[\s"'`(\]])(?=(?:\.\.?[\\/]|[~/\\]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
 const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team chat on behalf of your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
+const files0 = notes => (notes ? [...notes.candidates.filter(x => x.on).map(x => x.path), ...notes.repoDocs.map(x => x.path)] : null);
+// A copy with picked notes (Knowledge "My notes"): where they are.
+const NOTES_NOTE = name => `(Your owner chose to share the notes in the ${NOTES_DIR}/ folder of your workspace with ${name}: read them and use them freely to answer. Anything that isn't in them stays private.)`;
 // The same agent in its owner's own team chat, answering another person's agent (localTurnFor).
 const ACTING_FOR_NOTE = (name, byPerson) => `(Shared session: in your owner's team chat, you are answering ${byPerson ? name : `${name}'s agent`}, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
 
-const today = () => new Date().toISOString().slice(0, 10);
 /** A guest turn's emit with secrets redacted from streamed text (see _guestTurn). */
 const redacting = emit => emit && ((event, data) => emit(event, event === 'delta' ? redactSecrets(data) : data));
 /** A name that came from the other side, safe to show and to use as a chat label (no brackets, newlines, controls). */
@@ -85,8 +94,8 @@ export class SharingManager {
    * @param {(shareId: string) => Promise<{ dc, dtls }>} o.openPeer  open a peer DataChannel (requester)
    * @param {(data: string) => void} o.broadcast  frame to this gateway's browsers
    */
-  constructor({ getDb, request, chatAbort = null, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console, resendBackoffMs = RESEND_BACKOFF_MS, recovery = { waitMs: RECOVERY_WAIT_MS, pollMs: RECOVERY_POLL_MS } }) {
-    Object.assign(this, { getDb, request, key, gatewayId, signal, openPeer, broadcast, log, resendBackoffMs, recovery });
+  constructor({ getDb, request, chatAbort = null, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console, resendBackoffMs = RESEND_BACKOFF_MS, recovery = { waitMs: RECOVERY_WAIT_MS, pollMs: RECOVERY_POLL_MS }, version = connectorVersion(), holdApprovals = null }) {
+    Object.assign(this, { getDb, request, key, gatewayId, signal, openPeer, broadcast, log, resendBackoffMs, recovery, version, holdApprovals });
     this.chatAbort = chatAbort || createChatAbort((m, p, t) => this.request(m, p, t)); // Stop, fenced where supported
     this._shares = [];            // latest share-list from the signal server
     this.serverEnabled = false;   // the signal server sends a share-list only to accounts with sharing on
@@ -99,6 +108,9 @@ export class SharingManager {
     this._turns = new Map();
     this._finished = new Map();   // `${shareId}|${clientTurnId}` -> { same, result | error, at } (RECENT_TURN_MS)
     this._buckets = new Map();    // `${gateway}|${kind}` -> { tokens, at } (PEER_RATES)
+    this.book = new ContactBook(getDb); // contact cards: per-person settings, copies, usage (owner side)
+    this._peerVersions = new Map(); // their gateway id -> connector version from its last link hello (null: too old to say)
+    this._copying = new Map();    // `${person}|${agent}` -> Promise (one copy write at a time)
     this._ready = false;
   }
 
@@ -147,6 +159,7 @@ export class SharingManager {
     for (const s of this._localGrants()) if (!live.has(s.share_id) && !this._shares.some(x => x.id === s.share_id && x.status === 'pending')) this._revokeLocal(s.share_id);
     this._changed();
     if (first) setImmediate(() => { try { this.onFirstShares?.(); } catch (e) { this.log.warn?.(`[sharing] ${e.message}`); } });
+    if (first) setImmediate(() => this.migrateContacts().catch(e => this.log.warn?.(`[sharing] contact migration: ${e.message}`)));
     this._sharesChanged();
     this._presenceTick();
   }
@@ -197,13 +210,25 @@ export class SharingManager {
       if (s.as === 'owner') {
         const g = this._grant(s.id);
         out.access = g?.grant.access || null;
-        out.dailyCap = g?.grant.dailyCap || null;
-        out.usedToday = this._usage(s.id);
+        out.autonomy = g?.grant.autonomy || null;
+        out.person = personKeyOf(s.requester?.email) || null;
+        const c = out.person && this.book.get(out.person);
+        if (c) {
+          const u = this.book.usage(c.personKey), t = AUTONOMY[c.autonomy] || AUTONOMY.bounded;
+          out.contact = { access: c.access, autonomy: c.autonomy, knowledge: c.knowledge, migrated: c.migrated, usedToday: u.day, usedHour: u.hour, perDay: t.perDay, perHour: t.perHour || null };
+          // Read by the older People view (no contact cards): "N of M replies today".
+          out.usedToday = u.day;
+          out.dailyCap = t.perDay;
+        }
         const key = g?.grant.requesterPubKey || s.requester?.pubKey;
         out.theirKey = key ? fingerprint(key) : null;
         out.keyVerified = !!key && this._keyVerified(s.id, key);
       } else {
-        out.verified = !!this._verifiedGrant(s);
+        const vg = this._verifiedGrant(s);
+        out.verified = !!vg;
+        // What they let this side's person do (the popover's "Kamil's for you" line, and the rounds cap).
+        out.theirAccess = vg?.access || null;
+        out.theirAutonomy = vg ? (AUTONOMY[vg.autonomy] ? vg.autonomy : 'bounded') : null;
         const pin = this._theirKey(s);
         out.theirKey = pin ? fingerprint(pin) : null;
         out.keyVerified = !!pin && this._keyVerified(s.id, pin);
@@ -214,6 +239,11 @@ export class SharingManager {
       out.keyChanged = !!(presented && pinned && presented !== pinned);
       // What "Trust new key" would accept, as fingerprints to compare with the contact out of band.
       if (out.keyChanged) out.keyChange = { was: fingerprint(pinned), now: fingerprint(presented) };
+      // Their connector is older than this one accepts (seen on a link): nothing is shared until they update.
+      const gw = this._other(s).gatewayId;
+      if (gw && this._peerVersions.has(gw) && peerOutdated(this._peerVersions.get(gw))) {
+        out.needsUpdate = { version: this._peerVersions.get(gw), message: outdatedMessage(this._other(s).name.split(/\s/)[0], this._peerVersions.get(gw)) };
+      }
       return out;
     });
   }
@@ -240,7 +270,8 @@ export class SharingManager {
     const key = s?.as === 'owner' ? s.requester?.pubKey : s?.owner?.pubKey;
     if (!gw || !key) throw new Error('Nothing to trust yet');
     this._db().prepare('INSERT OR REPLACE INTO peer_gateway_keys (gateway_id, pubkey, created_at) VALUES (?, ?, ?)').run(gw, key, Date.now());
-    if (s.as === 'requester') this._db().prepare('DELETE FROM peer_pins WHERE share_id = ?').run(shareId); // its own pin follows
+    // Every share with that gateway follows (the card trusts from whichever direction; the pins are per share).
+    for (const x of this._shares) if (x.as === 'requester' && x.owner?.gatewayId === gw) this._db().prepare('DELETE FROM peer_pins WHERE share_id = ?').run(x.id);
     this._nameCache = null;
     this._changed();
     this._sharesChanged();
@@ -308,7 +339,7 @@ export class SharingManager {
 
   /** Ids of the guest agents this connector made (the gateway may show them under another name). */
   guestAgentIds() {
-    return new Set(this._db().prepare('SELECT agent_id FROM peer_guest_agents').all().map(r => r.agent_id));
+    return new Set([...this._db().prepare('SELECT agent_id FROM peer_guest_agents').all().map(r => r.agent_id), ...this.book.copyIds()]);
   }
 
   markGuestAgent(agentId) {
@@ -333,14 +364,19 @@ export class SharingManager {
     return updated;
   }
 
-  /** Approve (or change) a share: sign and store the grant, send it to the signal server. */
-  approve(shareId, { agents, access = 'restricted', dailyCap = DEFAULT_DAILY_CAP } = {}) {
+  /**
+   * Approve (or change) a share: sign and store the grant (v2: agents, access, autonomy), send it to the signal server.
+   * The person's contact card is created on first approval (with `contact`: the first-time form's settings) and keeps
+   * access, autonomy and agents in step with the grant. `dailyCap` (older ClawChats) maps to an autonomy tier.
+   */
+  approve(shareId, { agents, access = 'restricted', autonomy = null, dailyCap = null, contact = null, confirmFull = false } = {}) {
     const s = this._shares.find(x => x.id === shareId && x.as === 'owner' && ['pending', 'active'].includes(x.status));
     if (!s) throw new Error('No such request');
     if (!s.requester?.pubKey || !s.requester?.gatewayId) throw new Error("The requester's gateway hasn't connected with sharing support yet");
     const list = (Array.isArray(agents) ? agents : []).filter(a => a && typeof a.id === 'string' && a.id).map(a => ({ id: a.id, name: String(a.name || a.id).slice(0, 80) }));
     // No agents is fine: a connection can be just for chatting (team chats with people).
-    if (!ACCESS_MODES[access]) throw new Error('Unknown access level');
+    if (!ACCESS.includes(access)) throw new Error('Unknown access level');
+    autonomy = AUTONOMY[autonomy] ? autonomy : dailyCap != null ? autonomyFromCap(dailyCap) : (this.book.get(s.requester.email)?.autonomy || 'bounded');
     // A changed grant keeps the requester key it was first approved for: the signal server can't swap it.
     const prev = this._db().prepare('SELECT grant_json FROM peer_grants WHERE share_id = ?').get(shareId);
     if (prev && JSON.parse(prev.grant_json).requesterPubKey !== s.requester.pubKey) {
@@ -354,10 +390,32 @@ export class SharingManager {
     // The signal server only activates a grant signed for this gateway's own id; without one it would say no, silently.
     const ownerGatewayId = this.gatewayId();
     if (!ownerGatewayId) throw new Error("This gateway isn't connected to the signal server yet. Try again in a moment.");
+    // The contact card: made on first approval, then access/autonomy/agents follow the grant.
+    const person = personKeyOf(s.requester.email);
+    if (person) {
+      const had = this.book.get(person);
+      if (access === 'full' && !had?.fullConfirmedAt && !confirmFull && !contact?.fullConfirmedAt) throw Object.assign(new Error('Full agent needs confirming'), { code: 'confirm_full' });
+      if (!had) {
+        const sources = list.map(a => a.id);
+        // Without the card's first-time form (an older ClawChats app), nothing of the owner's notes is shared.
+        this.book.create(person, { ...defaultContact(access), ...(contact ? {} : { knowledge: 'none' }), ...(contact || {}), name: cleanName(s.requester.name, 60) || null, access, autonomy, agents: sources, ...(access === 'full' ? { fullConfirmedAt: Date.now() } : {}) });
+      } else {
+        // Accepting again (they reconnected): the form started from the old card; what was changed on it is saved.
+        // Access first: it resets Tools and Commands to that tier, which the form's own values then override.
+        if (had.access !== access) this.book.set(person, 'access', access, { confirmFull: true });
+        const now = this.book.get(person);
+        for (const f of ['knowledge', 'notes', 'repos', 'tools', 'commands', 'skills', 'mcp', 'private', 'alwaysFine', 'basicList']) {
+          if (contact && contact[f] !== undefined && JSON.stringify(contact[f]) !== JSON.stringify(now[f])) this.book.set(person, f, contact[f]);
+        }
+        if (had.autonomy !== autonomy) this.book.set(person, 'autonomy', autonomy);
+        const ids = list.map(a => this._sourceIdSync(a.id));
+        if (JSON.stringify([...(had.agents || [])].sort()) !== JSON.stringify([...ids].sort())) this.book.set(person, 'agents', ids);
+      }
+    }
     const grant = {
-      v: 1, shareId, ownerGatewayId, requesterGatewayId: s.requester.gatewayId, requesterPubKey: s.requester.pubKey,
+      v: 2, shareId, ownerGatewayId, requesterGatewayId: s.requester.gatewayId, requesterPubKey: s.requester.pubKey,
       requesterName: cleanName(s.requester.name || s.requester.email, 60) || null,
-      agents: list, access, dailyCap: Math.max(1, Math.min(1000, Math.floor(Number(dailyCap) || DEFAULT_DAILY_CAP))), issuedAt: Date.now(),
+      agents: list, access, autonomy, issuedAt: Date.now(),
     };
     const sig = this.key.signJson(grant);
     this._pinGatewayKey(grant.requesterGatewayId, grant.requesterPubKey);
@@ -378,8 +436,10 @@ export class SharingManager {
     this.signal({ type: 'share-revoke', shareId });
   }
 
+  /** Replies counted today for the person behind a share (one counter per person). */
   _usage(shareId) {
-    return this._db().prepare('SELECT turns FROM peer_usage WHERE share_id = ? AND day = ?').get(shareId, today())?.turns || 0;
+    const person = this._personOfShare(shareId);
+    return person ? this.book.usage(person).day : 0;
   }
 
   /** Whether this side would serve a peer connection for the share (checked before any WebRTC setup). */
@@ -399,14 +459,20 @@ export class SharingManager {
       try { dc.close(); } catch { /* gone */ }
       return null;
     }
-    const link = new PeerLink({ dc, dtls, role: 'owner', shareId, key: this.key, peerKey: g.grant.requesterPubKey, log: this.log });
+    const link = new PeerLink({ dc, dtls, role: 'owner', shareId, key: this.key, peerKey: g.grant.requesterPubKey, log: this.log, version: this.version });
     const gw = g.grant.requesterGatewayId; // the gateway the key this link authenticates was approved for
     this._served.add(link);
     link.on('closed', () => this._served.delete(link));
-    link.handle('agents', this._limited(gw, 'agents', async () => ({ agents: this._grant(shareId)?.grant.agents || [] })));
-    link.handle('turn', this._limited(gw, 'turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false, byPerson: false }, emit))); // only localTurnFor sets these
+    // A connector older than this one accepts gets every request refused with what to do (it shows the message), and
+    // nothing of this side's rooms; checked at the handshake and again before every turn.
+    const current = fn => (p, emit) => {
+      if (this._checkPeer(link, gw)) return Promise.reject(Object.assign(new Error(outdatedMessage(null, link.peerVersion)), { code: 'peer_outdated' }));
+      return fn(p, emit);
+    };
+    link.handle('agents', current(this._limited(gw, 'agents', async () => ({ agents: this._grant(shareId)?.grant.agents || [] }))));
+    link.handle('turn', current(this._limited(gw, 'turn', (p, emit) => this._guestTurn(shareId, { ...p, inOwnerRoom: false, byPerson: false }, emit)))); // only localTurnFor sets these
     link.handle('abort', this._limited(gw, 'abort', async p => this._guestAbort(shareId, p?.turnId)));
-    this._wireRooms(link, gw);
+    this._wireRooms(link, gw, current);
     return link;
   }
 
@@ -436,14 +502,17 @@ export class SharingManager {
    * leave and ask for a fresh copy (room.post / room.leave / room.fetch). `onRoom` (TeamCoordinator)
    * decides; it gets the other side's gateway id, which the link authenticated.
    */
-  _wireRooms(link, otherGatewayId) {
+  _wireRooms(link, otherGatewayId, current = fn => fn) {
     for (const method of ['room.sync', 'room.post', 'room.leave', 'room.fetch']) {
-      link.handle(method, this._limited(otherGatewayId, method, async p => {
+      link.handle(method, current(this._limited(otherGatewayId, method, async p => {
         if (!this.onRoom) throw Object.assign(new Error('team chats are not available'), { code: 'unavailable' });
         return this.onRoom(method, p || {}, otherGatewayId);
-      }));
+      })));
     }
-    const ready = () => { try { this.onPeerReady?.(otherGatewayId); } catch (e) { this.log.warn?.(`[sharing] peer ready: ${e.message}`); } };
+    const ready = () => {
+      if (this._checkPeer(link, otherGatewayId)) return; // too old: no room pushes either way
+      try { this.onPeerReady?.(otherGatewayId); } catch (e) { this.log.warn?.(`[sharing] peer ready: ${e.message}`); }
+    };
     if (link.ready) setImmediate(ready); else link.once('ready', ready);
   }
 
@@ -587,6 +656,7 @@ export class SharingManager {
   async personRequest(personId, method, params, { timeoutMs = 60_000 } = {}) {
     if (!this.contact(personId)) throw Object.assign(new Error('Not connected with them'), { code: 'not_connected' });
     const link = await this._personLink(personId);
+    if (this._checkPeer(link, personId)) throw Object.assign(new Error(outdatedMessage(this.contact(personId)?.name?.split(/\s/)[0] || 'Their', link.peerVersion)), { code: 'peer_outdated' });
     return link.request(method, params, { timeoutMs });
   }
 
@@ -613,7 +683,18 @@ export class SharingManager {
       if (done?.error) throw Object.assign(new Error(done.error.message), { code: done.error.code, partial: done.error.partial });
       if (done) return { ...done.result };
     }
-    if (this._usage(shareId) >= grant.dailyCap) throw Object.assign(new Error(`Daily limit reached (${grant.dailyCap} replies)`), { code: 'cap' });
+    // The person's contact card decides (one counter per person across their gateways, D10).
+    const person = this._personOfShare(shareId);
+    const contact = person && this._contactFor(person, grant);
+    if (!contact) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' });
+    const tier = AUTONOMY[contact.autonomy] || AUTONOMY.bounded;
+    // Autonomy: their agents may start a reply of ours only within the tier's rounds (Notify only: never; the person
+    // can still ask). The host says what triggered the turn; a host that doesn't say counts as a person asking.
+    const round = Math.max(0, Math.floor(Number(p.round) || 0));
+    if (p.trigger === 'agent' && tier.rounds === 0) throw Object.assign(new Error(`Your agents don't answer ${firstName({ name: grant.requesterName })}'s agents on their own (Notify only)`), { code: 'notify_only' });
+    if (p.trigger === 'agent' && round > tier.rounds) throw Object.assign(new Error(`Agents paused after ${tier.rounds} rounds; reply to continue`), { code: 'rounds' });
+    const capped = this.book.overCap(person, contact.autonomy);
+    if (capped) throw Object.assign(new Error(capped), { code: 'cap' });
     const running = [...this._turns.values()].filter(t => t.shareId === shareId);
     if (running.length >= MAX_CONCURRENT_TURNS) throw Object.assign(new Error('Too many replies at once; try again shortly'), { code: 'busy' });
     const turnKey = crypto.randomUUID();
@@ -624,11 +705,11 @@ export class SharingManager {
     const turn = { shareId, clientTurnId, same, sessionKey: null, runId: null, sessionId: null, aborted: false, emit: redacting(emit), result: null };
     this._turns.set(turnKey, turn); // counts toward the limit from here on
     // Counted before any await, so parallel turns can't both pass the cap.
-    this._db().prepare('INSERT INTO peer_usage (share_id, day, turns) VALUES (?, ?, 1) ON CONFLICT(share_id, day) DO UPDATE SET turns = turns + 1').run(shareId, today());
+    this.book.count(person, 1);
     this._changed(); // the owner's Sharing view shows today's count
     turn.result = (async () => {
       try {
-        const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, (event, data) => turn.emit?.(event, data), turn);
+        const r = await this._runGuestTurn(shareId, grant, agent, roomId, p, (event, data) => turn.emit?.(event, data), turn, contact);
         if (typeof r?.text === 'string') r.text = redactSecrets(r.text);
         // What this gateway's agent said for that gateway's room: its copy of the room may show it as ours (team.js).
         if (!p.inOwnerRoom && r?.text) try { this.onGuestReply?.(grant.requesterGatewayId, roomId, shareId, agent.id, r.text); } catch { /* best effort */ }
@@ -640,7 +721,7 @@ export class SharingManager {
         // A reply that failed without saying anything doesn't use up the day's replies. A timeout still
         // counts: it ran for the full turn timeout.
         if (!e.partial && !/timed out/i.test(e.message)) {
-          this._db().prepare('UPDATE peer_usage SET turns = MAX(0, turns - 1) WHERE share_id = ? AND day = ?').run(shareId, today());
+          this.book.count(person, -1);
           this._changed();
         }
         if (recentKey) this._rememberTurn(recentKey, { same, error: { message: e.message, code: e.code, partial: e.partial } });
@@ -675,29 +756,43 @@ export class SharingManager {
     }
   }
 
-  async _runGuestTurn(shareId, grant, agent, roomId, p, emit, turn) {
+  async _runGuestTurn(shareId, grant, agent, roomId, p, emit, turn, contact) {
+    // The person's own copy of the agent (D3), brought up to the card's policy; notes synced if they changed.
+    const sourceId = await this._sourceId(agent.id);
+    if (Array.isArray(contact.agents) && !contact.agents.map(id => this._sourceIdSync(id)).includes(sourceId)) throw Object.assign(new Error('That agent is not shared'), { code: 'not_shared' });
+    const copyId = await this._ensureCopy(contact, sourceId, firstName({ name: grant.requesterName }));
     const cfg = await this.request('config.get', {}, 30_000);
-    // A guest version whose restrictions were edited away (e.g. in the Control UI) isn't served.
-    const isGuest = this._db().prepare('SELECT 1 FROM peer_guest_agents WHERE agent_id = ?').get(agent.id);
-    if (isGuest && (!hasGuestRestrictions(cfg?.parsed?.agents?.entries?.[agent.id]?.tools) || restrictionsPending(cfg, agent.id))) {
-      this.log.warn?.(`[sharing] ${agent.id} lost its guest restrictions: refusing turn for ${shareId}`);
+    // A copy whose policy was edited away (e.g. in the Control UI) and couldn't be restored isn't served.
+    // Saved but not applied: the running gateway still has the old policy until its reload lands (the check the
+    // gateway's own CLI uses: configRevisionHash vs appliedConfigHash; missing hashes count as applied).
+    const applied = !cfg?.configRevisionHash || !cfg?.appliedConfigHash || cfg.configRevisionHash === cfg.appliedConfigHash;
+    if (applied) this._pendingCopies?.delete(copyId);
+    if (!copyToolsHold(cfg?.parsed?.agents?.entries?.[copyId]?.tools, copyTools(contact, { reviewerModel: reviewerModelFor(cfg?.parsed) }))
+      || this._pendingCopies?.has(copyId)) {
+      this.log.warn?.(`[sharing] ${copyId} doesn't hold its contact policy: refusing turn for ${shareId}`);
       throw Object.assign(new Error(`${agent.name} isn't available right now`), { code: 'unavailable' });
     }
+    this.book.touchCopy(copyId);
 
     // Their full name, as the approval screen shows it ("Shared with Houman Test").
     const name = String(grant.requesterName || 'Someone').replace(/[\n\r]/g, ' ').trim().slice(0, 60) || 'Someone';
-    const permissionMode = ACCESS_MODES[grant.access] || 'read-only';
-    // Every configured MCP server is off for guest sessions (they act with the owner's accounts).
-    const mcpServers = Object.fromEntries(Object.keys(cfg?.parsed?.mcp?.servers || {}).sort().map(n => [n, false]));
-    const toolOverrides = { webSearch: false, ...(Object.keys(mcpServers).length ? { mcpServers } : {}) };
-    const sessionKey = await this._guestSession(shareId, roomId, agent.id, { name, roomTitle: String(p.roomTitle || 'team chat').slice(0, 80), permissionMode, toolOverrides });
+    const permissionMode = sessionMode(contact);
+    const skillNames = await this._skillNames(copyId);
+    const toolOverrides = contactOverrides(contact, { skillNames, mcpServers: Object.keys(cfg?.parsed?.mcp?.servers || {}) });
+    const sessionKey = await this._guestSession(shareId, roomId, copyId, { name, roomTitle: String(p.roomTitle || 'team chat').slice(0, 80), permissionMode, toolOverrides, cwd: contact.access === 'full' ? contact.openFolder : null });
     // Made from the requester's turn id when there is one: a resend (after a dropped link, or after this connector
     // restarted) reuses the idempotency key, so the gateway answers with the first run instead of starting another.
     const runId = turn.clientTurnId
       ? `peer-${crypto.createHash('sha256').update(`${shareId}|${turn.clientTurnId}`).digest('hex').slice(0, 32)}`
       : `peer-${crypto.randomUUID()}`;
+    // Commands that may ask the owner ("Basic + ask me", or Auto-review's unsure cases): the approval connection stays up
+    // for this turn, so the gateway keeps the approval pending until the owner answers (no tab open needed), and the
+    // turn may run as long as that approval can wait.
+    const asks = contact.commands === 'ask' || contact.commands === 'auto';
+    const turnTimeout = asks ? APPROVAL_TURN_TIMEOUT_MS : TURN_TIMEOUT_MS;
+    const releaseApprovals = asks && this.holdApprovals ? await this.holdApprovals().catch(() => null) : null;
     const done = new Promise(resolve => {
-      const timer = setTimeout(() => { this._runs.delete(runId); resolve({ state: 'error', errorMessage: 'timed out' }); }, TURN_TIMEOUT_MS + 30_000);
+      const timer = setTimeout(() => { this._runs.delete(runId); resolve({ state: 'error', errorMessage: 'timed out' }); }, turnTimeout + 30_000);
       timer.unref?.();
       this._runs.set(runId, { resolve, timer, text: '', emit, sessionKey });
     });
@@ -709,7 +804,8 @@ export class SharingManager {
       // transcript decides, not the ack. 2026.9.7 forgets its chat.send dedupe on a gateway restart and would start a
       // run with no new input (a reply to nothing). Only this connector reloaded, so its run is still going: the send
       // below is answered "in_flight" and the run's events finish the turn.
-      const sent = defangLocalPaths(`${p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name)}\n\n${p.message}`);
+      const notes = [p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name), contact.access !== 'full' && contact.knowledge === 'notes' ? NOTES_NOTE(name) : '', topicsNote(contact, name.split(/\s/)[0])].filter(Boolean);
+      const sent = defangLocalPaths(`${notes.join('\n')}\n\n${p.message}`);
       if (turn.clientTurnId) {
         const earlier = await this._replyTo(sessionKey, runId);
         if (earlier && earlier.input.trim() !== sent.trim()) throw Object.assign(new Error('That turn was already sent with another message'), { code: 'bad_request' });
@@ -719,7 +815,7 @@ export class SharingManager {
       }
       const ack = await this.request('chat.send', {
         sessionKey, message: sent, deliver: false, idempotencyKey: runId,
-        timeoutMs: TURN_TIMEOUT_MS, suppressCommandInterpretation: true,
+        timeoutMs: turnTimeout, suppressCommandInterpretation: true,
         expectedPermissionMode: permissionMode, expectedToolOverrides: toolOverrides,
       }, 30_000).catch(e => {
         // The same key with another message (2026.11.5+): the requester has to resend the identical one.
@@ -741,10 +837,336 @@ export class SharingManager {
       if (!r.text && EMPTY_REPLY_ERROR.test(r.errorMessage || '')) return { state: 'final', text: '' };
       throw Object.assign(new Error(r.errorMessage || 'The agent run failed'), { code: 'run_failed', partial: r.text || '' });
     } finally {
+      releaseApprovals?.();
       const run = this._runs.get(runId);
       if (run) { clearTimeout(run.timer); this._runs.delete(runId); }
       for (const [id, r] of this._approvalRuns || []) if (r === runId) this._approvalRuns.delete(id);
     }
+  }
+
+
+  // ── Contact cards (owner side) ─────────────────────────────────────
+
+  /** The person (lowercased email) who asked for a share this gateway owns. */
+  _personOfShare(shareId) {
+    const s = this._shares.find(x => x.id === shareId && x.as === 'owner');
+    return personKeyOf(s?.requester?.email) || null;
+  }
+
+  /** The person's contact; one made from their grant if migration hasn't run yet (a turn right after the update). */
+  _contactFor(person, grant) {
+    return this.book.get(person) || this.book.create(person, {
+      ...defaultContact(grant.access === 'trusted' ? 'trusted' : 'restricted'), knowledge: 'none', migrated: true,
+      name: grant.requesterName || null, autonomy: AUTONOMY[grant.autonomy] ? grant.autonomy : autonomyFromCap(grant.dailyCap),
+      agents: (grant.agents || []).map(a => this._sourceIdSync(a.id)),
+    });
+  }
+
+  /** The original agent behind a shared id: grants made before contact cards name the shared guest version ("main-guest"). */
+  _sourceIdSync(id, agents = this._agentsCache || []) {
+    const known = this.guestAgentIds();
+    const a = agents.find(x => x.id === id);
+    if (a && isGuestAgent(a, known)) {
+      const src = agents.find(o => o.id !== id && !isGuestAgent(o, known) && findGuestAgent(agents, o.id, known)?.id === id);
+      if (src) return src.id;
+    }
+    if (!a && known.has(id) && /-guest$/.test(id)) return id.replace(/-guest$/, '');
+    return id;
+  }
+
+  async _agents() {
+    this._agentsCache = (await this.request('agents.list', {}))?.agents || [];
+    return this._agentsCache;
+  }
+
+  async _sourceId(id) { return this._sourceIdSync(id, await this._agents()); }
+
+  /** The person's copy of an agent, written to the card's policy (one write at a time per copy); its notes synced. */
+  async _ensureCopy(contact, sourceId, first) {
+    const key = `${contact.personKey}|${sourceId}`;
+    while (this._copying.has(key)) await this._copying.get(key).catch(() => {});
+    const job = (async () => {
+      const c = this.book.get(contact.personKey) || contact;
+      const kind = copyKind(c);
+      const r = await ensureContactCopy({ request: this.request, contact: c, agentId: sourceId, firstName: first, known: this.book.copy(c.personKey, sourceId, kind), log: this.log });
+      this.book.putCopy(c.personKey, sourceId, kind, r.copyId, r.hash);
+      if (r.pending) (this._pendingCopies ??= new Set()).add(r.copyId); // saved, not applied yet: not served until it is
+      if (r.created) this._changed(); // agent pickers hide it
+      if (kind === 'guest') await this._syncNotesFor(c, r.copyId);
+      return r.copyId;
+    })();
+    this._copying.set(key, job);
+    try { return await job; } finally { this._copying.delete(key); }
+  }
+
+  /** Workspaces of the agents shared with a person (where "My notes" come from). */
+  async _noteCandidates(contact) {
+    const agents = await this._agents();
+    const known = this.guestAgentIds();
+    const shared = agents.filter(a => !isGuestAgent(a, known) && (!Array.isArray(contact.agents) || contact.agents.map(id => this._sourceIdSync(id, agents)).includes(a.id)));
+    return noteCandidates(shared.map(a => a.workspace));
+  }
+
+  /** The files a contact's notes are made of: their picks, or the defaults (all project notes but the infra ones). */
+  async _notePicks(contact) {
+    const cands = await this._noteCandidates(contact);
+    const picks = Array.isArray(contact.notes) ? contact.notes : cands.filter(c => c.defaultOn).map(c => c.path);
+    return { cands, files: resolvePicks(picks, cands) };
+  }
+
+  /** Copy the picked notes into a guest copy's folder when they changed (or `force`); "None" removes them. */
+  async _syncNotesFor(contact, copyId, { force = false } = {}) {
+    const ws = (this._agentsCache || []).find(a => a.id === copyId)?.workspace || (await this._agents()).find(a => a.id === copyId)?.workspace;
+    if (!ws || !ws.startsWith('/')) return null;
+    if (contact.knowledge !== 'notes') { removeNotes(ws); return null; }
+    const { files } = await this._notePicks(contact);
+    const sig = picksSignature(files);
+    const last = contact.notesSync?.copies?.[copyId];
+    if (!force && last === sig) return contact.notesSync;
+    const r = syncNotes(ws, files);
+    const summary = { ...r, copies: { ...(contact.notesSync?.copies || {}), [copyId]: r.signature } };
+    this.book.setNotesSync(contact.personKey, summary);
+    return summary;
+  }
+
+  async _skillNames(agentId) {
+    const hit = this._skillsCache;
+    if (hit && hit.agentId === agentId && Date.now() - hit.at < 60_000) return hit.names;
+    const r = await this.request('skills.status', { agentId }, 30_000).catch(() => null);
+    const names = (r?.skills || []).map(x => x?.name || x?.skillKey).filter(n => typeof n === 'string' && n);
+    this._skillsCache = { agentId, at: Date.now(), names };
+    return names;
+  }
+
+  /**
+   * Existing shares become contacts (once, on the first share list): access kept, a daily cap above 50 → Extended,
+   * else Bounded; a real-agent share becomes Full agent (confirmed when it was approved); Knowledge starts as None.
+   * Grants are re-issued as v2 so the other side sees the autonomy tier.
+   */
+  async migrateContacts() {
+    const grants = this._localGrants();
+    if (!grants.length) return [];
+    const agents = await this._agents();
+    const known = this.guestAgentIds();
+    const made = [];
+    for (const r of grants) {
+      const s = this._shares.find(x => x.id === r.share_id && x.as === 'owner');
+      const person = personKeyOf(s?.requester?.email);
+      if (!person) continue;
+      let grant; try { grant = JSON.parse(r.grant_json); } catch { continue; }
+      if (!this.book.get(person)) {
+        const ids = (grant.agents || []).map(a => a.id);
+        const real = ids.some(id => { const a = agents.find(x => x.id === id); return a && !isGuestAgent(a, known); });
+        const access = real ? 'full' : grant.access === 'trusted' ? 'trusted' : 'restricted';
+        this.book.create(person, {
+          ...defaultContact(access), knowledge: 'none', migrated: true, name: grant.requesterName || null,
+          autonomy: AUTONOMY[grant.autonomy] ? grant.autonomy : autonomyFromCap(grant.dailyCap),
+          agents: ids.map(id => this._sourceIdSync(id, agents)), ...(access === 'full' ? { fullConfirmedAt: r.created_at } : {}),
+        });
+        made.push(person);
+      }
+      // Signed with a key this gateway no longer has (its peer key was replaced): the same grant is signed again,
+      // or the other side, once it trusts the new key, still couldn't verify it.
+      const stale = s.status === 'active' && !verifySignature(this.key.publicKey, canonicalJson(grant), r.sig);
+      if ((grant.v !== 2 || stale) && s.status === 'active') {
+        const c = this.book.get(person);
+        try { this.approve(r.share_id, { agents: grant.agents, access: c.access, autonomy: c.autonomy, confirmFull: true }); }
+        catch (e) { this.log.warn?.(`[sharing] re-issue ${r.share_id}: ${e.message}`); }
+      }
+    }
+    if (made.length) { this.log.info?.(`[sharing] contacts made from existing shares: ${made.join(', ')}`); this._changed(); }
+    return made;
+  }
+
+  /** Owner shares with this person that have a grant, newest first. */
+  _ownerSharesOf(person) {
+    return this._shares.filter(s => s.as === 'owner' && personKeyOf(s.requester?.email) === person && this._grant(s.id));
+  }
+
+  /** Everything the contact card shows for a person (Settings → People → name). */
+  async contactCard(personKey) {
+    const person = personKeyOf(personKey);
+    const shares = this._shares.filter(s => this._sharingPerson(s) === person);
+    if (!shares.length && !this.book.get(person)) throw Object.assign(new Error('Not a contact'), { code: 'not_found' });
+    const c = this.book.get(person);
+    const agents = await this._agents();
+    const known = this.guestAgentIds();
+    const cfg = await this.request('config.get', {}, 30_000).catch(() => null);
+    const own = agents.filter(a => !isGuestAgent(a, known));
+    const skillNames = await this._skillNames(own.find(a => a.default)?.id || own[0]?.id || 'main');
+    const skillInfo = await this.request('skills.status', { agentId: own[0]?.id }, 30_000).then(r => r?.skills || [], () => []);
+    const gateways = new Map();
+    for (const s of shares) {
+      const o = this._other(s);
+      if (!o.gatewayId) continue;
+      const g = gateways.get(o.gatewayId) || { gatewayId: o.gatewayId, shareIds: [], online: false, theirAgents: [], version: this._peerVersions.get(o.gatewayId) ?? undefined };
+      g.shareIds.push(s.id);
+      if (s.as === 'requester') g.theirAgents = (this._verifiedGrant(s)?.agents || []).map(a => cleanName(a.name || a.id));
+      g.online ||= [...this._links.values(), ...this._served].some(l => l.ready && !l.closed && (l.shareId === s.id));
+      gateways.set(o.gatewayId, g);
+    }
+    // Before Accept there is no contact yet: the first-time form starts from the defaults (Trusted, My notes).
+    const view = c || { ...defaultContact('trusted'), personKey: person, agents: null };
+    let notes = null;
+    {
+      const { cands, files } = await this._notePicks(view);
+      const picked = new Set(files.map(f => f.src));
+      notes = {
+        candidates: cands.map(x => ({ path: x.path, name: x.name, size: x.size, mtimeMs: x.mtimeMs, on: picked.has(x.path), defaultOn: x.defaultOn })),
+        repoDocs: files.filter(f => !cands.some(x => x.path === f.src)).map(f => ({ path: f.src, name: f.dest.replace(/^repos\//, '') })),
+        sync: c?.notesSync ? { files: c.notesSync.files, bytes: c.notesSync.bytes, secretsRemoved: c.notesSync.secretsRemoved, at: c.notesSync.at } : null,
+      };
+    }
+    const u = c ? this.book.usage(person) : { day: 0, hour: 0 };
+    return {
+      person, contact: c, usage: { ...u, ...(c ? AUTONOMY[c.autonomy] : {}) }, gateways: [...gateways.values()],
+      agents: own.map(a => ({ id: a.id, name: a.identity?.name || a.name || a.id })),
+      skills: skillNames.map(n => { const i = skillInfo.find(x => (x?.name || x?.skillKey) === n); return { name: n, description: String(i?.description || '').slice(0, 160) }; }),
+      mcpServers: Object.keys(cfg?.parsed?.mcp?.servers || {}).sort().map(n => ({ name: n, enabled: cfg.parsed.mcp.servers[n]?.enabled !== false })),
+      notes, copies: this.book.copies(person), sessions: this._guestSessionKeysOf(person),
+      reviewerModel: reviewerModelFor(cfg?.parsed),
+      // What the card draws its controls from (one source with the policy the copies get).
+      catalog: { toolGroups: TOOL_GROUPS, alwaysOff: ALWAYS_OFF, basicDefaults: BASIC_DEFAULTS, defaultTools: DEFAULT_TOOLS, defaultCommands: DEFAULT_COMMANDS, autonomy: AUTONOMY, draft: c ? null : { ...view, notes: files0(notes) } },
+    };
+  }
+
+  /**
+   * What the two contact cards between this gateway and a person allow (team.js room limits): `mine` = this side's
+   * card for them, `theirs` = their grant to this side. { mine: { access, autonomy } | null, theirs: … | null }.
+   */
+  limitsFor(gatewayId) {
+    const email = this.contact(gatewayId)?.email;
+    const c = email ? this.book.get(email) : null;
+    const theirs = this._shares.map(s => (s.as === 'requester' && this._ownerGateway(s) === gatewayId ? this._verifiedGrant(s) : null)).find(Boolean);
+    return {
+      mine: c ? { access: c.access, autonomy: c.autonomy } : null,
+      theirs: theirs ? { access: theirs.access, autonomy: AUTONOMY[theirs.autonomy] ? theirs.autonomy : 'bounded' } : null,
+    };
+  }
+
+  /** The person of a share, either direction. */
+  _sharingPerson(s) { return personKeyOf(s.as === 'owner' ? s.requester?.email : s.owner?.email); }
+
+  /**
+   * Change one card setting. Access, autonomy and agents re-issue the person's grants; anything a copy holds updates
+   * that person's existing copies in the background (new ones are made on first use). Returns the contact.
+   */
+  async setContact(personKey, field, value, { confirmFull = false } = {}) {
+    const person = personKeyOf(personKey);
+    const before = this.book.get(person);
+    if (!before) throw Object.assign(new Error('Not a contact'), { code: 'not_found' });
+    if (field === 'agents') value = (Array.isArray(value) ? value : []).map(String);
+    if (field === 'openFolder' && value) value = await this._checkFolder(before, value);
+    const c = this.book.set(person, field, value, { confirmFull });
+    if (['access', 'autonomy', 'agents'].includes(field)) {
+      const names = new Map((await this._agents()).map(a => [a.id, a.identity?.name || a.name || a.id]));
+      for (const s of this._ownerSharesOf(person)) {
+        const g = this._grant(s.id).grant;
+        // Agents keep the id they were shared under (rooms on the other side refer to it).
+        const list = (c.agents || []).map(id => g.agents.find(a => this._sourceIdSync(a.id) === id) || { id, name: String(names.get(id) || id).slice(0, 80) });
+        this.approve(s.id, { agents: list, access: c.access, autonomy: c.autonomy, confirmFull: true });
+      }
+    }
+    if (field === 'access' && copyKind(before) !== copyKind(c)) this._dropCopies(person, copyKind(before)).catch(e => this.log.warn?.(`[sharing] ${e.message}`));
+    this._refreshCopies(person).catch(e => this.log.warn?.(`[sharing] copies for ${person}: ${e.message}`));
+    this._changed();
+    return c;
+  }
+
+  /**
+   * "Open one folder" (§12): a real folder inside a shared agent's workspace, never the workspace itself, never one
+   * that is or holds secrets/, no links or `..` on the way. Returns its real path.
+   */
+  async _checkFolder(contact, folder) {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const raw = String(folder || '');
+    if (!path.isAbsolute(raw) || raw.split(/[\\/]/).includes('..')) throw new Error('Pick a folder inside your workspace');
+    let real; try { real = fs.realpathSync(raw); } catch { throw new Error("That folder doesn't exist"); }
+    if (real !== path.normalize(raw).replace(/\/+$/, '')) throw new Error("That path goes through a link; use the folder's real path");
+    const roots = (await this._agents()).filter(a => !Array.isArray(contact.agents) || contact.agents.map(id => this._sourceIdSync(id)).includes(a.id)).map(a => a.workspace).filter(Boolean);
+    const root = roots.find(r => real.startsWith(`${r.replace(/\/+$/, '')}/`));
+    if (!root) throw new Error('Pick a folder inside your workspace, not the workspace itself');
+    if (real.split('/').includes('secrets') || fs.existsSync(path.join(real, 'secrets'))) throw new Error('Not secrets/, nor a folder that holds it');
+    return real;
+  }
+
+  /** Make the person's copies of every agent they can use (after Accept/Save), so their first message doesn't wait on it. */
+  prepareCopies(shareId) {
+    const person = this._personOfShare(shareId);
+    const c = person && this.book.get(person);
+    if (!c) return;
+    const g = this._grant(shareId)?.grant;
+    (async () => {
+      for (const a of g?.agents || []) await this._ensureCopy(this.book.get(person), await this._sourceId(a.id), firstName({ name: c.name || person }));
+    })().catch(e => this.log.warn?.(`[sharing] copies for ${person}: ${e.message}`));
+  }
+
+  /** Bring a person's existing copies up to their card (config write, approvals, notes). */
+  async _refreshCopies(person) {
+    const c = this.book.get(person);
+    if (!c) return;
+    const first = firstName({ name: c.name || person });
+    for (const r of this.book.copies(person).filter(x => x.kind === copyKind(c))) {
+      if (Array.isArray(c.agents) && !c.agents.map(id => this._sourceIdSync(id)).includes(r.agentId)) continue;
+      await this._ensureCopy(c, r.agentId, first);
+    }
+  }
+
+  /** Copies of the other kind after an access change: retired (locked down, kept with their chats), not deleted. */
+  async _dropCopies(person, kind) {
+    for (const r of this.book.copies(person).filter(x => x.kind === kind)) {
+      await retireCopy(this.request, r.copyId);
+      this.book.retireCopyRow(r.copyId);
+    }
+  }
+
+  /** Sync now (card): rewrite every guest copy's notes. Returns the summary. */
+  async syncNotesNow(personKey) {
+    const c = this.book.get(personKey);
+    if (!c) throw Object.assign(new Error('Not a contact'), { code: 'not_found' });
+    let summary = null;
+    for (const r of this.book.copies(c.personKey).filter(x => x.kind === 'guest')) summary = await this._syncNotesFor(this.book.get(c.personKey), r.copyId, { force: true }) || summary;
+    if (!summary && c.knowledge === 'notes') {
+      const { files } = await this._notePicks(c);
+      summary = { files: files.length, bytes: 0, secretsRemoved: 0, at: null, pending: true }; // copied on their first message
+    }
+    this._changed();
+    return summary;
+  }
+
+  /**
+   * Disconnect (spec §8.3): their guest sessions are archived, then their copies, approvals entries, notes and every
+   * peer_* row for them go. The shares themselves are revoked by the caller (both directions).
+   */
+  async forgetPerson(personKey) {
+    const person = personKeyOf(personKey);
+    const keys = this._guestSessionKeysOf(person);
+    let archived = 0;
+    for (const key of keys) if (await this._archive(key)) archived++;
+    // Copies are retired, not deleted: deleting an agent deletes its sessions (2026.11.6), and these chats are kept.
+    let retired = 0;
+    for (const r of this.book.copies(person).filter(x => !x.kind.startsWith('retired'))) {
+      try {
+        if (r.kind === 'guest') { const ws = (await this._agents()).find(a => a.id === r.copyId)?.workspace; if (ws?.startsWith('/')) removeNotes(ws); }
+        if (await retireCopy(this.request, r.copyId)) retired++;
+      } catch (e) { this.log.warn?.(`[sharing] retire ${r.copyId}: ${e.message}`); }
+    }
+    const db = this._db();
+    for (const key of keys) db.prepare('DELETE FROM peer_sessions WHERE session_key = ?').run(key);
+    this.book.forget(person);
+    this._guestKeys = null;
+    this._changed();
+    return { archived, retired };
+  }
+
+  // ── Peer versions ──────────────────────────────────────────────────
+
+  /** Note a linked gateway's connector version; true when it's too old to share with. */
+  _checkPeer(link, gatewayId) {
+    const v = link.peerVersion ?? null;
+    if (gatewayId && this._peerVersions.get(gatewayId) !== v) { this._peerVersions.set(gatewayId, v); this._changed(); }
+    return peerOutdated(v);
   }
 
   async _guestAbort(shareId, turnId) {
@@ -752,25 +1174,45 @@ export class SharingManager {
     return { ok: true };
   }
 
+  /**
+   * Archive a session. 2026.11.x needs the session id it expects (a lifecycle patch); 9.x has no such field.
+   * Returns whether it worked.
+   */
+  async _archive(key, sessionId = null) {
+    const id = sessionId || await this.request('sessions.describe', { key }, 5000).then(r => r?.session?.sessionId || null, () => null);
+    const patch = p => this.request('sessions.patch', p).then(() => true);
+    return patch({ key, archived: true, ...(id ? { expectedSessionId: id } : {}) })
+      .catch(e => (/expectedSessionId|unexpected property|additional/i.test(e.message) && id ? patch({ key, archived: true }) : false))
+      .catch(() => false);
+  }
+
   /** The (share, room, agent) session on this gateway: visible to the owner in "Shared with <name>". */
-  async _guestSession(shareId, roomId, agentId, { name, roomTitle, permissionMode, toolOverrides }) {
+  async _guestSession(shareId, roomId, agentId, { name, roomTitle, permissionMode, toolOverrides, cwd = null }) {
     const db = this._db();
     const row = db.prepare('SELECT session_key FROM peer_sessions WHERE share_id = ? AND room_id = ? AND agent_id = ?').get(shareId, roomId, agentId);
     // The owner may have deleted it from their chat list: then it's made again (same key, so the
     // room keeps pointing at it), in "Shared with <name>" with its label, instead of the gateway
     // bringing it back as an untitled chat that ClawChats hides.
-    const exists = row && await this.request('sessions.describe', { key: row.session_key }, 5000).then(r => !(r && 'session' in r && !r.session), () => true);
-    if (exists) {
-      // Re-apply the policy each turn: the owner may have changed the access level since.
+    const described = row && await this.request('sessions.describe', { key: row.session_key }, 5000).then(r => r, () => ({ unknown: true }));
+    const exists = row && !(described && 'session' in described && !described.session);
+    // A session's root is fixed when it's made. "Open one folder" opened (or moved) after that: the old session (rooted
+    // at the whole workspace, secrets/ included) is archived and a new one is made at the folder. Unknown: never reused.
+    const root = described?.session?.sessionRoot;
+    const wrongRoot = exists && cwd && (described.unknown || !root || root.replace(/\/+$/, '') !== cwd.replace(/\/+$/, ''));
+    if (wrongRoot) await this._archive(row.session_key, described?.session?.sessionId);
+    if (exists && !wrongRoot) {
+      // Re-apply the policy each turn: the owner may have changed the card since. Basic only and Off clear the mode
+      // (null): a session mode would override the copy's exec allowlist (spike run 1).
       await this.request('sessions.patch', { key: row.session_key, permissionMode, toolOverrides }).catch(() => {});
       return row.session_key;
     }
-    const key = row?.session_key || `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
+    const key = (!wrongRoot && row?.session_key) || `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
     const category = this.funnelOf(this._shares.find(x => x.id === shareId && x.as === 'owner')?.requester?.email, name);
     // Labels are unique per gateway, and untitled rooms all fall back to "team chat": tag each room.
     const tag = crypto.createHash('sha256').update(`${shareId}|${roomId}`).digest('hex').slice(0, 6);
     const create = label => this.request('sessions.create', {
-      key, agentId, permissionMode, toolOverrides, label: label.slice(0, 200), category,
+      key, agentId, ...(permissionMode ? { permissionMode } : {}), toolOverrides, label: label.slice(0, 200), category,
+      ...(cwd ? { cwd } : {}), // Full agent's "Open one folder": the session root (§12)
     });
     try { await create(`${name} · ${roomTitle} · ${tag}`); }
     catch (e) {
@@ -907,8 +1349,13 @@ export class SharingManager {
     if (!s.owner.gatewayId || s.grant.ownerGatewayId !== s.owner.gatewayId) return null;
     const db = this._db();
     const pinRow = db.prepare('SELECT owner_pubkey, owner_gateway_id FROM peer_pins WHERE share_id = ?').get(s.id);
-    const pin = pinRow?.owner_pubkey;
+    let pin = pinRow?.owner_pubkey;
     const gwPin = this._gatewayKey(s.owner.gatewayId);
+    // The owner already trusted this gateway's new key (trustNewKey): a share's older pin follows it.
+    if (pin && gwPin && pin !== gwPin && gwPin === s.owner.pubKey) {
+      db.prepare('UPDATE peer_pins SET owner_pubkey = ? WHERE share_id = ?').run(gwPin, s.id);
+      pin = gwPin;
+    }
     if ((pin && pin !== s.owner.pubKey) || (gwPin && gwPin !== s.owner.pubKey)) {
       const was = pin && pin !== s.owner.pubKey ? pin : gwPin;
       if (!(this._warnedKeys ??= new Set()).has(`${s.id}|${s.owner.pubKey}`)) {
@@ -953,8 +1400,12 @@ export class SharingManager {
     if (!grant) throw Object.assign(new Error('This share is not active'), { code: 'revoked' });
     const p = (async () => {
       const { dc, dtls } = await this.openPeer(shareId);
-      const link = new PeerLink({ dc, dtls, role: 'requester', shareId, key: this.key, peerKey: s.owner.pubKey, log: this.log });
+      const link = new PeerLink({ dc, dtls, role: 'requester', shareId, key: this.key, peerKey: s.owner.pubKey, log: this.log, version: this.version });
       await new Promise((resolve, reject) => { link.once('ready', resolve); link.once('closed', () => reject(new Error(`Couldn't reach ${firstName(s.owner)}'s gateway`))); });
+      if (this._checkPeer(link, grant.ownerGatewayId)) {
+        link.close();
+        throw Object.assign(new Error(outdatedMessage(firstName(s.owner), link.peerVersion)), { code: 'peer_outdated' });
+      }
       this._links.set(shareId, link);
       link.on('closed', () => { if (this._links.get(shareId) === link) this._links.delete(shareId); });
       this._wireRooms(link, grant.ownerGatewayId); // the gateway the key this link authenticated signed for
@@ -970,18 +1421,22 @@ export class SharingManager {
    * turn's timeout): the owner attaches it to the run still going there, or answers from the finished one, so the
    * turn never runs twice. `stopped()`: the room was stopped, so it isn't sent again.
    */
-  async turn(agentId, { turnId, roomId, roomTitle, message }, { onDelta, onStatus, stopped = () => false } = {}) {
+  async turn(agentId, { turnId, roomId, roomTitle, message, trigger = 'person', round = 0 }, { onDelta, onStatus, stopped = () => false } = {}) {
     const id = SharingManager.parseRemoteId(agentId);
     if (!id) throw new Error('not a shared agent');
-    const params = { turnId, agentId: id.remoteId, roomId, roomTitle, message };
+    // trigger/round: what started this turn (a person's message, or another agent's reply in round N), for the
+    // owner's autonomy tier.
+    const params = { turnId, agentId: id.remoteId, roomId, roomTitle, message, trigger, round };
     const onEvent = (event, data) => {
       if (event === 'delta' && typeof data === 'string') onDelta?.(data);
       else if (event === 'status' && data && typeof data === 'object') onStatus?.(data);
     };
-    const deadline = Date.now() + TURN_TIMEOUT_MS + 60_000;
+    const deadline = Date.now() + APPROVAL_TURN_TIMEOUT_MS + 60_000; // the owner ends the turn sooner when it can't ask
     for (let resend = 0; ; resend++) {
       try {
         const link = await this._link(id.shareId);
+        const s = this._shares.find(x => x.id === id.shareId);
+        if (this._checkPeer(link, this._ownerGateway(s))) throw Object.assign(new Error(outdatedMessage(firstName(s?.owner), link.peerVersion)), { code: 'peer_outdated' });
         return await link.request('turn', params, { onEvent, timeoutMs: deadline - Date.now() });
       } catch (e) {
         // Only a dropped link (or, while resending, the link not back yet): local errors, without a code. Never
@@ -1053,7 +1508,7 @@ export class SharingManager {
       if (!live || !Array.isArray(grant.agents)) continue;
       const next = grant.agents.map(a => ({ id: a.id, name: String(shown(a.id) || a.name).slice(0, 80) }));
       if (next.every((a, i) => a.name === grant.agents[i].name)) continue;
-      try { this.approve(r.share_id, { agents: next, access: grant.access, dailyCap: grant.dailyCap }); reissued.push(r.share_id); }
+      try { this.approve(r.share_id, { agents: next, access: grant.access, autonomy: grant.autonomy, dailyCap: grant.autonomy ? null : grant.dailyCap, confirmFull: true }); reissued.push(r.share_id); }
       catch (e) { this.log?.warn?.(`[sharing] rename ${r.share_id}: ${e.message}`); }
     }
     return reissued;
@@ -1105,15 +1560,17 @@ export class SharingManager {
     return ids;
   }
 
-  /** Our agents' guest sessions for this person, including ones from shares since ended. */
+  /** Our agents' guest sessions for this person, including ones from shares since ended (and their own copies' sessions). */
   _guestSessionKeysOf(email) {
     const ids = this.gatewayIdsOf(email);
-    const keys = [];
-    for (const r of this._db().prepare('SELECT p.session_key, g.grant_json FROM peer_sessions p JOIN peer_grants g ON g.share_id = p.share_id').all()) {
+    const copies = new Set(this.book.copies(email).map(c => c.copyId));
+    const keys = new Set();
+    for (const r of this._db().prepare('SELECT p.session_key, p.agent_id, g.grant_json FROM peer_sessions p LEFT JOIN peer_grants g ON g.share_id = p.share_id').all()) {
+      if (copies.has(r.agent_id)) { keys.add(r.session_key); continue; }
       let gw; try { gw = JSON.parse(r.grant_json).requesterGatewayId; } catch { continue; }
-      if (ids.has(gw)) keys.push(r.session_key);
+      if (ids.has(gw)) keys.add(r.session_key);
     }
-    return keys;
+    return [...keys];
   }
 
   /** The guest session that answers `who` in a team chat here (TeamCoordinator lanes): one per share, like _guestSession. */
@@ -1128,14 +1585,18 @@ export class SharingManager {
    * that person (its guest copy, normally) under their grant: access level, daily cap, its own
    * session in "Shared with <name>". Returns null when that agent isn't shared with them.
    */
-  async localTurnFor(localAgentId, remoteAgentId, { turnId, roomId, roomTitle, message }, { onDelta } = {}) {
+  async localTurnFor(localAgentId, remoteAgentId, { turnId, roomId, roomTitle, message, round = 0 }, { onDelta } = {}) {
     const g = this._grantToOwnerOf(remoteAgentId);
     if (!g) return null;
     const agents = (await this.request('agents.list', {}))?.agents || [];
     const guestId = findGuestAgent(agents, localAgentId, this.guestAgentIds())?.id;
     const shared = g.grant.agents.find(a => a.id === guestId) || g.grant.agents.find(a => a.id === localAgentId);
     if (!shared) return null;
-    return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true, byPerson: String(remoteAgentId).startsWith('person:') },
+    const byPerson = String(remoteAgentId).startsWith('person:');
+    // Their gateway is too old to share with: nothing runs for them here either.
+    const gw = byPerson ? remoteAgentId.slice('person:'.length) : this.ownerOf(remoteAgentId);
+    if (gw && this._peerVersions.has(gw) && peerOutdated(this._peerVersions.get(gw))) throw Object.assign(new Error(outdatedMessage(firstName({ name: g.grant.requesterName }), this._peerVersions.get(gw))), { code: 'peer_outdated' });
+    return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true, byPerson, trigger: byPerson ? 'person' : 'agent', round },
       (event, data) => { if (event === 'delta' && typeof data === 'string') onDelta?.(data); });
   }
 

@@ -35,6 +35,8 @@ import { SearchIndexer } from './search/indexer.js';
 import { createTagStore } from './tags/store.js';
 import { Tagger } from './tags/tagger.js';
 import { readLegacyThreadSummaries } from './store/legacy-threads.js';
+import { checkRepoDoc } from './peer/notes-sync.js';
+import { connectorVersion } from './peer/version.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -98,6 +100,7 @@ export function createApp(config = {}) {
   // plugin host (src/index.ts) supplies the signal server link and the peer transport (config.peer).
   const peerKey = loadOrCreatePeerKey(DATA_DIR);
   const sharing = config.peer ? new SharingManager({
+    holdApprovals: () => gatewayClient.holdApprovals(),
     getDb: () => globalDbCache.get(), request: gwRequest, chatAbort, key: peerKey, broadcast,
     gatewayId: config.peer.gatewayId, signal: config.peer.signal, openPeer: config.peer.openPeer,
   }) : null;
@@ -318,7 +321,36 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/sharing') {
         // Enabled once the signal server has sharing on for this account (it then sends share lists).
         if (!sharing?.serverEnabled) return send(res, 200, { enabled: false, shares: [], remoteAgents: [] });
-        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null, guestAgentIds: [...sharing.guestAgentIds()] });
+        return send(res, 200, { enabled: true, fingerprint: peerKey.fingerprint, shares: sharing.list(), remoteAgents: sharing.remoteAgents(), contacts: sharing.contacts(), me: sharing.gatewayId?.() || null, guestAgentIds: [...sharing.guestAgentIds()], version: connectorVersion(), features: { contactCards: 1 } });
+      }
+      // Contact cards (peer/sharing.js contactCard/setContact): one person's settings, by lowercased email.
+      if ((p = matchRoute(method, urlPath, 'GET /api/sharing/contact/:person'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        try { return send(res, 200, await sharing.contactCard(p.person)); }
+        catch (e) { return sendError(res, e.code === 'not_found' ? 404 : 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'PUT /api/sharing/contact/:person'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        const { field, value, confirmFull } = await parseBody(req);
+        try { return send(res, 200, { contact: await sharing.setContact(p.person, field, value, { confirmFull: !!confirmFull }) }); }
+        catch (e) { return sendError(res, e.code === 'not_found' ? 404 : 400, e.message); }
+      }
+      if ((p = matchRoute(method, urlPath, 'POST /api/sharing/contact/:person/sync'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        try { return send(res, 200, { sync: await sharing.syncNotesNow(p.person) }); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      // Disconnect: after the shares are revoked, everything kept for the person goes (copies, approvals, notes, rows).
+      if ((p = matchRoute(method, urlPath, 'POST /api/sharing/contact/:person/forget'))) {
+        if (!sharing) return sendError(res, 404, 'Sharing is not available');
+        try { return send(res, 200, await sharing.forgetPerson(p.person)); }
+        catch (e) { return sendError(res, 400, e.message); }
+      }
+      // "Add a repo doc…": is this file allowed as a note? (a .md file in a git repo, not under ~/.openclaw, no links)
+      if (method === 'POST' && urlPath === '/api/sharing/check-doc') {
+        const { path: file } = await parseBody(req);
+        const r = checkRepoDoc(file);
+        return r.ok ? send(res, 200, r) : sendError(res, 400, r.error);
       }
       // The project a person's chats go to (peer/sharing.js funnel). Keyed by email.
       if (method === 'GET' && urlPath === '/api/sharing/funnel') return send(res, 200, { funnel: sharing?.funnels() || {} });
@@ -334,7 +366,11 @@ export function createApp(config = {}) {
       }
       if ((p = matchRoute(method, urlPath, 'POST /api/sharing/:id/approve'))) {
         if (!sharing) return sendError(res, 404, 'Sharing is not available');
-        try { return send(res, 200, { grant: sharing.approve(p.id, await parseBody(req)) }); }
+        try {
+          const grant = sharing.approve(p.id, await parseBody(req));
+          sharing.prepareCopies(p.id); // in the background: the copies are ready before their first message (D9)
+          return send(res, 200, { grant });
+        }
         catch (e) { return sendError(res, 400, e.message); }
       }
       if (method === 'POST' && urlPath === '/api/sharing/guest-agent') {

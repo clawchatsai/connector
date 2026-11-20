@@ -5,7 +5,7 @@
 // signatures don't verify and the link never opens.
 //
 // Wire format (JSON strings):
-//   { t: 'hello', v: 1, role, shareId, nonce }
+//   { t: 'hello', v: 1, role, shareId, nonce, cv }   cv: the sender's connector version (0.3.0+; version.js)
 //   { t: 'auth', sig }
 //   { t: 'req', id, method, params } → { t: 'res', id, ok, result | error }
 //   { t: 'ev', id, event, data }      (progress for a request, e.g. streamed text)
@@ -13,6 +13,7 @@
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { canonicalJson, verifySignature } from './keys.js';
+import { connectorVersion } from './version.js';
 
 const HANDSHAKE_MS = 15_000;
 const MAX_FRAME = 256 * 1024;
@@ -33,12 +34,13 @@ export class PeerLink extends EventEmitter {
    * @param {string} o.peerKey   the other side's pinned public key (base64 SPKI)
    * @param {{ local: string, remote: string }} o.dtls  DTLS fingerprints as this side sees them
    */
-  constructor({ dc, role, shareId, key, peerKey, dtls = { local: '', remote: '' }, handshakeMs = HANDSHAKE_MS, log = console }) {
+  constructor({ dc, role, shareId, key, peerKey, dtls = { local: '', remote: '' }, handshakeMs = HANDSHAKE_MS, log = console, version = connectorVersion() }) {
     super();
     Object.assign(this, { dc, role, shareId, key, peerKey, dtls, log });
     this.peerRole = role === 'owner' ? 'requester' : 'owner';
     this.nonce = crypto.randomBytes(24).toString('base64');
     this.peerNonce = null;
+    this.peerVersion = null; // the other side's connector version, from its hello (null: too old to send one)
     this.sentAuth = false;
     this.verified = false;
     this.ready = false;
@@ -53,7 +55,7 @@ export class PeerLink extends EventEmitter {
       try { this._onFrame(data); } catch (e) { this.log.warn?.(`[peer] ${this.shareId}: frame handling failed: ${e?.message}`); this._fail('bad frame'); }
     });
     dc.onClosed(() => this._onClosed());
-    this._send({ t: 'hello', v: 1, role, shareId, nonce: this.nonce });
+    this._send({ t: 'hello', v: 1, role, shareId, nonce: this.nonce, cv: version });
   }
 
   /** What `signer` signs: both nonces and both fingerprints, from the signer's point of view. */
@@ -82,6 +84,8 @@ export class PeerLink extends EventEmitter {
     if (m.t === 'hello') {
       if (m.v !== 1 || m.role !== this.peerRole || m.shareId !== this.shareId || typeof m.nonce !== 'string' || this.peerNonce) return this._fail('bad hello');
       this.peerNonce = m.nonce;
+      // Rides the DTLS channel the auth below binds, so a relay can't change it.
+      if (typeof m.cv === 'string') this.peerVersion = m.cv.slice(0, 40);
       this.sentAuth = true;
       this._send({ t: 'auth', sig: this.key.signJson(JSON.parse(this._statement(this.role, this.nonce, this.peerNonce, this.dtls.local, this.dtls.remote))) });
     } else if (m.t === 'auth') {

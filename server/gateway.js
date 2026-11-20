@@ -57,6 +57,7 @@ export class GatewayClient {
     this._externalBrowserCount = () => 0;
     this._approvalGraceMs = approvalClientGraceMs;
     this._approvalStopTimer = null;
+    this._approvalHolds = 0; // guest turns that may wait for this gateway's owner to approve (holdApprovals)
     this.approvalClient = new ApprovalClient({
       gatewayWsUrl,
       debugLogger,
@@ -79,10 +80,24 @@ export class GatewayClient {
   /** Browsers attached over the DataChannel (src/index.ts); local WebSocket browsers are counted here. */
   setExternalBrowserCount(fn) { this._externalBrowserCount = fn; this.browsersChanged(); }
 
-  /** A browser attached or left: hold the approval-client connection while any is attached. */
+  /**
+   * A contact's guest turn that may ask this gateway's owner to approve a command: while one runs, the approval-client
+   * connection stays up even with no browser attached, so the gateway keeps the approval pending (its 30-minute
+   * window) for the owner to answer when they open ClawChats, instead of refusing at once ("no-approval-route").
+   * Returns a release function; resolves once connected (or after a few seconds).
+   */
+  async holdApprovals() {
+    this._approvalHolds++;
+    this.browsersChanged();
+    await this.approvalClient.waitConnected(5000);
+    let released = false;
+    return () => { if (released) return; released = true; this._approvalHolds--; this.browsersChanged(); };
+  }
+
+  /** A browser attached or left, or a guest turn holds approvals: keep the approval-client connection while any is. */
   browsersChanged() {
     if (this._closed) return;
-    const count = this.browserClients.size + this._externalBrowserCount();
+    const count = this.browserClients.size + this._externalBrowserCount() + this._approvalHolds;
     if (count > 0) {
       clearTimeout(this._approvalStopTimer);
       this._approvalStopTimer = null;

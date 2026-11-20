@@ -104,3 +104,19 @@ test('local WebSocket browsers count too; close() stops the approval-client conn
   assert.equal(gw.approvalConns().length, 1);
   await new Promise(r => gw.wss.close(r));
 });
+
+test('a guest turn that may ask its owner holds the approval-client connection with no browser attached, then lets it go', async () => {
+  const gw = await fakeGateway();
+  const c = client(gw.url, 50);
+  c.connect();
+  await wait(150);
+  assert.equal(gw.approvalConns().length, 0, 'no browser, no hold: none');
+  const release = await c.holdApprovals();
+  assert.equal(c.approvalClient.connected, true, 'connected before the turn sends anything');
+  assert.equal(gw.approvalConns().filter(x => !x.closed).length, 1);
+  release(); release(); // once is enough
+  await wait(200);
+  assert.equal(gw.approvalConns().filter(x => !x.closed).length, 0, 'closed after the grace period');
+  c.close();
+  await new Promise(r => gw.wss.close(r));
+});

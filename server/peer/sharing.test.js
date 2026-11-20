@@ -6,7 +6,7 @@ import path from 'node:path';
 import { Database } from '../bootstrap/native.js';
 import { SharingManager, defangLocalPaths } from './sharing.js';
 import { loadOrCreatePeerKey, fingerprint } from './keys.js';
-import { GUEST_TOOLS, unappliedGuests } from './guest-agent.js';
+import { GUEST_TOOLS } from './guest-agent.js';
 
 const quiet = { warn() {}, info() {} };
 const keyIn = () => loadOrCreatePeerKey(fs.mkdtempSync(path.join(os.tmpdir(), 'pk-')));
@@ -22,7 +22,7 @@ function pair() {
 }
 
 /** Owner (Kamil, gateway gwK) shares with requester (Houman, gateway gwH). */
-function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, config = {}, cfgExtra = {} } = {}) {
+function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, config = {}, cfgExtra = {}, ownerVersion, reqVersion } = {}) {
   const kOwner = keyIn(), kReq = keyIn();
   const ownerCalls = [], ownerSignals = [], reqSignals = [];
   let owner;
@@ -37,14 +37,32 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, c
       });
       return { runId: params.idempotencyKey, status: 'started' };
     }
-    if (method === 'config.get') return { hash: 'h', parsed: config, ...cfgExtra };
+    if (method === 'config.get') return { hash: 'h', parsed: { ...config, agents: { ...(config.agents || {}), entries: { ...(config.agents?.entries || {}), ...gw.entries } } }, ...cfgExtra };
     if (method === 'chat.abort') { setImmediate(() => owner.onGatewayEvent({ event: 'chat', payload: { runId: params.runId, state: 'aborted' } })); return { ok: true }; }
+    // A small fake gateway for the contact copies: agents, their config entries, the exec approvals document.
+    if (method === 'agents.list') return { agents: gw.agents };
+    if (method === 'agents.create') {
+      const id = params.agentId || params.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+      gw.agents.push({ id, name: params.name, workspace: params.workspace });
+      return { ok: true, agentId: id, name: params.name, workspace: params.workspace };
+    }
+    if (method === 'agents.delete') { gw.agents = gw.agents.filter(x => x.id !== params.agentId); delete gw.entries[params.agentId]; return { ok: true }; }
+    if (method === 'config.patch') {
+      for (const [id, e] of Object.entries(JSON.parse(params.raw).agents?.entries || {})) gw.entries[id] = { ...(gw.entries[id] || {}), ...e };
+      return { ok: true };
+    }
+    if (method === 'exec.approvals.get') return { hash: 'a', file: gw.approvals };
+    if (method === 'exec.approvals.set') { gw.approvals = params.file; return { ok: true }; }
+    if (method === 'skills.status') return { skills: gw.skills.map(name => ({ name })) };
+    if (method === 'agents.files.get') return { file: { missing: true } };
     return { ok: true };
   };
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gw-'));
+  const gw = { root, agents: [{ id: 'jarvis', name: 'Jarvis', workspace: path.join(root, 'ws') }, { id: 'jarvis-guest', name: 'Jarvis (guest)', workspace: path.join(root, 'ws-guest') }, { id: 'main', name: 'Main', workspace: path.join(root, 'ws-main') }], entries: {}, approvals: { version: 1 }, skills: [] };
   const ownerDb = new Database(':memory:'), reqDb = new Database(':memory:');
-  owner = new SharingManager({ getDb: () => ownerDb, request: ownerRequest, recovery: { waitMs: 60, pollMs: 5 }, key: kOwner, gatewayId: () => 'gwK', signal: m => ownerSignals.push(m), openPeer: async () => { throw new Error('owner never dials'); }, log: quiet });
+  owner = new SharingManager({ getDb: () => ownerDb, request: ownerRequest, recovery: { waitMs: 60, pollMs: 5 }, key: kOwner, gatewayId: () => 'gwK', signal: m => ownerSignals.push(m), openPeer: async () => { throw new Error('owner never dials'); }, log: quiet, ...(ownerVersion !== undefined ? { version: ownerVersion } : {}) });
   const req = new SharingManager({
-    getDb: () => reqDb, request: async () => ({}), key: kReq, gatewayId: () => 'gwH', signal: m => reqSignals.push(m), log: quiet, resendBackoffMs: [5, 10],
+    getDb: () => reqDb, request: async () => ({}), key: kReq, gatewayId: () => 'gwH', signal: m => reqSignals.push(m), log: quiet, resendBackoffMs: [5, 10], ...(reqVersion !== undefined ? { version: reqVersion } : {}),
     openPeer: async shareId => {
       const [a, b] = pair();
       owner.servePeer({ dc: b, dtls: { local: 'FK', remote: 'FH' }, shareId, requesterGatewayId: 'gwH' });
@@ -63,7 +81,7 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, c
     req.setShares([{ ...active, as: 'requester' }]);
     return active;
   };
-  return { owner, req, ownerCalls, ownerSignals, reqSignals, activate, kOwner, kReq, people };
+  return { owner, req, ownerCalls, ownerSignals, reqSignals, activate, kOwner, kReq, people, gw };
 }
 
 test('a guest session the owner deleted is made again on the next turn, with its label in "Shared with <name>"', async () => {
@@ -79,7 +97,8 @@ test('a guest session the owner deleted is made again on the next turn, with its
   await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room1', roomTitle: 'Rivers', message: 'still there?' });
   const creates = s.ownerCalls.filter(c => c.method === 'sessions.create').map(c => c.params);
   assert.equal(creates.length, 2);
-  assert.deepEqual([creates[1].key, creates[1].label, creates[1].category, creates[1].permissionMode], [first.key, first.label, 'Shared with Houman S', 'read-only']);
+  // Restricted runs Basic only: no session mode (a mode would override the copy's exec allowlist).
+  assert.deepEqual([creates[1].key, creates[1].label, creates[1].category, creates[1].permissionMode], [first.key, first.label, 'Shared with Houman S', undefined]);
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.sessionKey, first.key);
 
   // Still there: reused, no new session.
@@ -88,7 +107,7 @@ test('a guest session the owner deleted is made again on the next turn, with its
   assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.create').length, 2);
 });
 
-test('a shared agent renamed by its owner: the grant is re-issued with the new name, same access and cap', async () => {
+test('a shared agent renamed by its owner: the grant is re-issued with the new name, same access and autonomy', async () => {
   const s = setup();
   s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted', dailyCap: 7 });
   s.activate();
@@ -100,7 +119,7 @@ test('a shared agent renamed by its owner: the grant is re-issued with the new n
   agents = [{ id: 'jarvis', identity: { name: 'Jarvy' } }, { id: 'jarvis-guest', identity: { name: 'Jarvis (guest)' } }];
   assert.deepEqual(await s.owner.syncAgentNames(), ['sh1']);
   const g = s.ownerSignals.filter(m => m.type === 'share-grant').at(-1).grant;
-  assert.deepEqual([g.agents, g.access, g.dailyCap], [[{ id: 'jarvis-guest', name: 'Jarvy' }], 'trusted', 7]);
+  assert.deepEqual([g.v, g.agents, g.access, g.autonomy, g.dailyCap], [2, [{ id: 'jarvis-guest', name: 'Jarvy' }], 'trusted', 'bounded', undefined]);
   s.activate();
   assert.equal(s.req.remoteAgents()[0].name, 'Jarvy · Kamil', 'the requester sees the new name');
   assert.deepEqual(await s.owner.syncAgentNames(), [], 'once');
@@ -221,19 +240,20 @@ test('approve → verified on the requester → turn runs in a guest session on 
   assert.deepEqual(deltas, ['jar']);
 
   const create = s.ownerCalls.find(c => c.method === 'sessions.create').params;
-  assert.equal(create.agentId, 'jarvis-guest');
-  assert.equal(create.permissionMode, 'read-only');
-  assert.deepEqual(create.toolOverrides, { webSearch: false });  // no MCP servers configured here
+  assert.equal(create.agentId, 'jarvis-guest-h-bc35', "Houman's own copy of Jarvis (D3), not the shared guest version");
+  assert.equal(create.permissionMode, undefined, 'Restricted = Basic only: no session mode');
+  assert.deepEqual(create.toolOverrides, { webSearch: false });  // no MCP servers or skills configured here
   assert.equal(create.category, 'Shared with Houman S');
   const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
   assert.equal(send.suppressCommandInterpretation, true); // guest text is never a slash command
-  assert.equal(send.expectedPermissionMode, 'read-only');
+  assert.equal(send.expectedPermissionMode, null, 'the turn checks the session still has no mode');
   assert.ok(send.timeoutMs > 0);
   assert.match(send.message, /is not your owner/);
 
-  // Same room reuses the session; daily cap enforced by the owner.
+  // Same room reuses the session; the person's daily cap (Bounded: 50) enforced by the owner.
   await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room1', message: 'again' });
   assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.create').length, 1);
+  s.owner.book.count('h@x.dev', 48);
   await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't3', roomId: 'room1', message: 'third' }), e => e.code === 'cap');
   // An agent that isn't in the grant can't be asked for.
   await assert.rejects(s.req.turn('peer:sh1:main', { turnId: 't4', roomId: 'room1', message: 'x' }), e => e.code === 'not_shared');
@@ -248,7 +268,8 @@ test('trusted access uses guarded mode; changing the grant re-applies the policy
   s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'restricted' });
   s.activate();
   await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'hi' });
-  assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.patch').at(-1).params.permissionMode, 'read-only');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.sessionKey.split(':')[1], 'jarvis-guest-h-bc35', 'Trusted and Restricted share the person\'s guest copy');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'sessions.patch').at(-1).params.permissionMode, null, 'Basic only clears the mode');
 });
 
 test('requester refuses a grant not signed by the owner key, and a changed owner key', async () => {
@@ -328,30 +349,39 @@ test('guest sessions turn every configured MCP server off, and chat.send checks 
   assert.deepEqual(s.ownerCalls.find(c => c.method === 'chat.send').params.expectedToolOverrides, want);
 });
 
-test('a guest agent whose restrictions were removed is not served', async () => {
-  const config = { agents: { entries: { 'jarvis-guest': { tools: GUEST_TOOLS } } } };
-  const s = setup({ config });
-  s.owner.markGuestAgent('jarvis-guest');
+test("a person's copy whose policy was edited away is written back before the turn; one that can't be is not served", async () => {
+  const s = setup();
   s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
   s.activate();
   await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'r', message: 'hi' });
-  config.agents.entries['jarvis-guest'].tools = { deny: ['message'] }; // edited in the Control UI
-  await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
-  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+  const copy = 'jarvis-guest-h-bc35';
+  s.gw.entries[copy].tools = { deny: ['message'] }; // edited in the Control UI
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'r', message: 'hi' });
+  assert.equal(s.gw.entries[copy].tools.profile, 'minimal', 'restored');
+  // The gateway won't take the write: refused, and the run never starts.
+  s.gw.entries[copy].tools = { deny: ['message'] };
+  const request = s.owner.request;
+  s.owner.request = async (m, p) => (m === 'config.patch' ? { ok: true } : request(m, p));
+  await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't3', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 2);
 });
 
-test('a guest whose saved restrictions the running gateway has not applied yet is not served until it has', async () => {
-  const config = { agents: { entries: { 'jarvis-guest': { tools: GUEST_TOOLS } } } };
+test("a copy whose saved policy the running gateway has not applied yet is not served until it has", async () => {
   const cfgExtra = { configRevisionHash: 'saved', appliedConfigHash: 'older' };
-  const s = setup({ config, cfgExtra });
-  s.owner.markGuestAgent('jarvis-guest');
-  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  const s = setup({ cfgExtra });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
   s.activate();
-  unappliedGuests.add('jarvis-guest'); // ensureGuestRestrictions saw "persisted but not applied" (2026.11.4+)
-  await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
+  // 2026.11.4+: the patch was saved, but a deferred reload hasn't applied it.
+  const request = s.owner.request;
+  s.owner.request = async (m, p) => {
+    if (m !== 'config.patch') return request(m, p);
+    await request(m, p);
+    throw Object.assign(new Error('saved, not applied'), { gatewayCode: 'UNAVAILABLE', details: { persistedConfig: {} } });
+  };
+  await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' }), e => e.code === 'unavailable');
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
   cfgExtra.appliedConfigHash = 'saved'; // the reload landed
-  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'r', message: 'hi' });
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'hi' });
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
 });
 
@@ -543,11 +573,12 @@ test('a reply that fails without text is not counted against the daily cap; one 
   const s = setup({ reply: () => null }); // runs stay open; the test ends them
   s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 5 });
   s.activate();
-  // A guest version whose restrictions were removed: refused before it runs, nothing said.
-  s.owner.markGuestAgent('jarvis');
+  // A copy that doesn't hold its policy: refused before it runs, nothing said.
+  const request = s.owner.request;
+  s.owner.request = async (m, p) => (m === 'config.patch' ? { ok: true } : request(m, p));
   await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'f1', roomId: 'room1', message: 'hi' }), e => e.code === 'unavailable');
   assert.equal(s.owner.list()[0].usedToday, 0);
-  s.owner._db().prepare('DELETE FROM peer_guest_agents').run();
+  s.owner.request = request;
   // Fails after streaming some text ("jar"): counted.
   const p = s.req.turn('peer:sh1:jarvis', { turnId: 'f2', roomId: 'room1', message: 'hi' });
   for (let i = 0; i < 50 && !s.ownerCalls.some(c => c.method === 'chat.send'); i++) await wait(2);
@@ -565,10 +596,7 @@ test("acting for someone: this gateway's agent answers their agent as the versio
   // Kamil (this gateway, gwK) also uses Houman's main: share sh2, Kamil as requester, Houman's gateway gwH.
   const theirs = { id: 'sh2', as: 'requester', status: 'active', requester: s.people.owner, owner: s.people.requester, agents: [{ id: 'main-guest', name: 'main' }] };
   s.owner.setShares([{ ...active, as: 'owner' }, theirs]);
-  const orig = s.owner.request;
-  s.owner.request = async (m, p) => (m === 'agents.list'
-    ? { agents: [{ id: 'jarvis', name: 'Jarvis' }, { id: 'jarvis-guest', name: 'Jarvis (guest)' }, { id: 'dev', name: 'Dev' }] }
-    : orig(m, p));
+  s.gw.agents.push({ id: 'dev', name: 'Dev' });
 
   assert.equal(s.owner.actingForName('peer:sh2:main-guest'), 'Houman');
   const deltas = [];
@@ -576,8 +604,8 @@ test("acting for someone: this gateway's agent answers their agent as the versio
   assert.equal(r.state, 'final');
   assert.deepEqual(deltas, ['jar']);
   const create = s.ownerCalls.find(c => c.method === 'sessions.create').params;
-  assert.equal(create.agentId, 'jarvis-guest', 'the guest copy, never the real agent');
-  assert.equal(create.permissionMode, 'read-only');
+  assert.equal(create.agentId, 'jarvis-guest-h-bc35', "Houman's copy, never the real agent");
+  assert.equal(create.permissionMode, undefined);
   assert.equal(create.category, 'Shared with Houman S');
   const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
   assert.match(send.message, /in your owner's team chat, you are answering Houman S's agent/);
@@ -766,7 +794,7 @@ test('a grant only counts for the gateway it was signed for (the server can\'t p
 
 test('peer requests are rate limited per contact (turns, and everything else), without touching normal use', async () => {
   const s = setup();
-  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 100 });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], autonomy: 'bounded' });
   s.activate();
   // A normal chat: a handful of replies is fine.
   for (let i = 0; i < 5; i++) await s.req.turn('peer:sh1:jarvis', { turnId: `n${i}`, roomId: 'r', message: 'hi' });
@@ -942,7 +970,7 @@ test('a resend of a turn its restart cut off (input there, no reply, nothing run
   s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], dailyCap: 10 });
   s.activate();
   await restartedOwner(s, { reply: null });
-  s.owner._db().prepare('DELETE FROM peer_usage').run();
+  s.owner._db().prepare('DELETE FROM peer_person_usage').run();
   await assert.rejects(s.req.turn('peer:sh1:jarvis', { turnId: 'team-11', roomId: 'r', message: 'hi' }), e => e.code === 'run_failed' && /interrupted/.test(e.message));
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
   assert.equal(s.owner._usage('sh1'), 0);
@@ -1059,4 +1087,237 @@ test('Stop while the gateway resumes a turn: the resumed run is aborted, fenced,
   assert.deepEqual(await run, { state: 'aborted', text: '' });
   const abort = s.ownerCalls.find(c => c.method === 'chat.abort' && c.params.runId === 'recovery-run')?.params;
   assert.ok(abort, 'the resumed run was aborted');
+});
+
+// ── Contact cards (TASK-08) ──────────────────────────────────────────
+
+test('an older connector on the requester side is refused cleanly: it is told to update, the owner marks them "needs update"', async () => {
+  for (const reqVersion of ['0.2.4', null]) {
+    const s = setup({ reqVersion });
+    s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+    s.activate();
+    const link = await s.req._link('sh1').catch(e => e); // this test's requester runs our code: it still dials
+    const err = await link.request('turn', { turnId: 't1', agentId: 'jarvis', roomId: 'r', message: 'hi' }, { timeoutMs: 5000 }).catch(e => e);
+    assert.equal(err.code, 'peer_outdated');
+    assert.match(err.message, /^Your ClawChats connector is out of date[^]*openclaw plugins install/, 'what the old side shows');
+    assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0, 'nothing ran');
+    const mine = s.owner.list()[0];
+    assert.match(mine.needsUpdate.message, /Houman's ClawChats connector is out of date/);
+    const rooms = await link.request('room.fetch', { roomId: 'x' }, { timeoutMs: 5000 }).catch(e => e);
+    assert.equal(rooms.code, 'peer_outdated', 'no room traffic either');
+  }
+});
+
+test('an older connector on the owner side is refused by the requester before any turn, with the update command', async () => {
+  const s = setup({ ownerVersion: '0.2.4' });
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  s.activate();
+  const err = await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' }).catch(e => e);
+  assert.equal(err.code, 'peer_outdated');
+  assert.match(err.message, /Kamil's ClawChats connector is out of date \(0\.2\.4\)[^]*openclaw plugins install npm:@clawchatsai\/connector --force/);
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 0);
+  assert.ok(s.req.list()[0].needsUpdate);
+});
+
+test('existing shares become contacts: access kept, cap → autonomy, Knowledge None, real agents → Full; grants re-issued as v2', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'trusted' });
+  s.activate();
+  // As an older connector left it: a v1 grant with a daily cap, and no contact.
+  const db = s.owner._db();
+  const g = { ...JSON.parse(db.prepare('SELECT grant_json FROM peer_grants').get().grant_json), v: 1, dailyCap: 100 };
+  delete g.autonomy;
+  db.prepare('UPDATE peer_grants SET grant_json = ?').run(JSON.stringify(g));
+  s.owner.book.forget('h@x.dev');
+  assert.deepEqual(await s.owner.migrateContacts(), ['h@x.dev']);
+  const c = s.owner.book.get('h@x.dev');
+  assert.deepEqual([c.access, c.autonomy, c.knowledge, c.migrated, c.commands, c.agents], ['trusted', 'extended', 'none', true, 'ask', ['jarvis']]);
+  const re = s.ownerSignals.filter(m => m.type === 'share-grant').at(-1).grant;
+  assert.deepEqual([re.v, re.access, re.autonomy, re.dailyCap, re.agents[0].id], [2, 'trusted', 'extended', undefined, 'jarvis-guest'], 'same agent id: rooms keep working');
+
+  // A share of the real agent: Full agent, confirmed when it was approved.
+  s.owner.book.forget('h@x.dev');
+  db.prepare('UPDATE peer_grants SET grant_json = ?').run(JSON.stringify({ ...g, agents: [{ id: 'jarvis', name: 'Jarvis' }] }));
+  await s.owner.migrateContacts();
+  const f = s.owner.book.get('h@x.dev');
+  assert.deepEqual([f.access, !!f.fullConfirmedAt], ['full', true]);
+});
+
+test("autonomy: Notify only refuses turns their agents start; rounds past the tier are refused; the person can always ask", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted', autonomy: 'notify' });
+  s.activate();
+  const err = await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi', trigger: 'agent', round: 2 }).catch(e => e);
+  assert.equal(err.code, 'notify_only');
+  assert.equal((await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'hi' })).state, 'final');
+  await s.owner.setContact('h@x.dev', 'autonomy', 'bounded');
+  s.activate();
+  assert.equal((await s.req.turn('peer:sh1:jarvis', { turnId: 't3', roomId: 'r', message: 'hi', trigger: 'agent', round: 3 })).state, 'final');
+  assert.equal((await s.req.turn('peer:sh1:jarvis', { turnId: 't4', roomId: 'r', message: 'hi', trigger: 'agent', round: 4 }).catch(e => e)).code, 'rounds');
+  assert.equal(s.owner.limitsFor('gwH').mine.autonomy, 'bounded');
+  assert.deepEqual(s.req.limitsFor('gwK').theirs, { access: 'trusted', autonomy: 'bounded' });
+});
+
+test('the card: Private / Always fine reach the prompt; an access change re-issues the grant and swaps the copy (guest → full)', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted' });
+  s.activate();
+  await s.owner.setContact('h@x.dev', 'private', 'my health');
+  await s.owner.setContact('h@x.dev', 'alwaysFine', 'OpenClaw');
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  const sent = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params;
+  assert.match(sent.message, /private from Houman[^]*my health/);
+  assert.match(sent.message, /freely: OpenClaw/);
+  assert.equal(sent.expectedPermissionMode, 'guarded', 'Trusted: Basic + ask me');
+  assert.ok(s.gw.agents.some(a => a.id === 'jarvis-guest-h-bc35'));
+  assert.equal(s.gw.approvals.agents['jarvis-guest-h-bc35'].ask, 'on-miss');
+
+  await assert.rejects(s.owner.setContact('h@x.dev', 'access', 'full'), e => e.code === 'confirm_full');
+  await s.owner.setContact('h@x.dev', 'access', 'full', { confirmFull: true });
+  assert.equal(s.ownerSignals.filter(m => m.type === 'share-grant').at(-1).grant.access, 'full');
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'hi' });
+  const full = s.gw.agents.find(a => a.id === 'jarvis-full-h-bc35');
+  assert.equal(full.workspace, path.join(s.gw.root, 'ws'), "Full agent: the agent's own workspace (memory)");
+  const tools = s.gw.entries['jarvis-full-h-bc35'].tools;
+  assert.ok(['read', 'write', 'edit', 'apply_patch'].every(t => tools.deny.includes(t)), 'no file tools, memory read-only');
+  for (let i = 0; i < 50 && s.gw.entries['jarvis-guest-h-bc35'].tools.alsoAllow.length; i++) await wait(5);
+  assert.deepEqual(s.gw.entries['jarvis-guest-h-bc35'].tools.alsoAllow, [], 'the guest copy is retired (locked down, kept with its chats)');
+  assert.equal(s.gw.approvals.agents['jarvis-guest-h-bc35'], undefined);
+});
+
+test('Knowledge "My notes": the default picks are copied read-only into the person\'s copy; unpicked notes never are', async () => {
+  const s = setup();
+  fs.mkdirSync(path.join(s.gw.root, 'ws/memory/projects'), { recursive: true });
+  fs.writeFileSync(path.join(s.gw.root, 'ws/memory/projects/clawchats.md'), '# ClawChats');
+  fs.writeFileSync(path.join(s.gw.root, 'ws/memory/projects/homelab.md'), '# Homelab: proxmox at 10.0.0.2');
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted', contact: { knowledge: 'notes' } });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  const copyWs = s.gw.agents.find(a => a.id === 'jarvis-guest-h-bc35').workspace;
+  assert.deepEqual(fs.readdirSync(path.join(copyWs, 'notes')), ['clawchats.md']);
+  assert.match(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.message, /share the notes in the notes\/ folder of your workspace with Houman S/);
+  const card = await s.owner.contactCard('h@x.dev');
+  assert.deepEqual(card.notes.candidates.map(c => [c.name, c.on]), [['clawchats.md', true], ['homelab.md', false]]);
+  await s.owner.setContact('h@x.dev', 'knowledge', 'none');
+  for (let i = 0; i < 50 && fs.existsSync(path.join(copyWs, 'notes')); i++) await wait(5);
+  assert.equal(fs.existsSync(path.join(copyWs, 'notes')), false, 'None: the copies go');
+});
+
+test('Disconnect: their sessions are archived, their copies retired (no tools, no approvals entry), nothing else kept for them', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted' });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  const key = s.ownerCalls.find(c => c.method === 'sessions.create').params.key;
+  s.owner.revoke('sh1');
+  const r = await s.owner.forgetPerson('h@x.dev');
+  assert.deepEqual(r, { archived: 1, retired: 1 }, 'found through the copy even after the share is gone');
+  assert.ok(s.ownerCalls.some(c => c.method === 'sessions.patch' && c.params.key === key && c.params.archived === true));
+  assert.ok(!s.ownerCalls.some(c => c.method === 'agents.delete'), 'deleting the agent would delete its chats (11.6)');
+  assert.deepEqual([s.gw.entries['jarvis-guest-h-bc35'].tools.alsoAllow, s.gw.entries['jarvis-guest-h-bc35'].tools.exec.mode], [[], 'deny']);
+  assert.equal(s.gw.approvals.agents['jarvis-guest-h-bc35'], undefined);
+  assert.equal(s.owner.book.get('h@x.dev'), null);
+  assert.deepEqual(s.owner.book.copies('h@x.dev').map(c => c.kind), ['retired-guest']);
+  assert.ok(s.owner.guestAgentIds().has('jarvis-guest-h-bc35'), 'still hidden from agent pickers');
+});
+
+test('accepting someone again starts from their old card; what the form changed is saved', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted', contact: { knowledge: 'notes', private: 'health' } });
+  s.owner.revoke('sh1');
+  s.owner.setShares([{ id: 'sh1', as: 'owner', status: 'pending', requester: s.people.requester, owner: s.people.owner, agents: [] }]);
+  const old = s.owner.book.get('h@x.dev');
+  s.owner._db().prepare('DELETE FROM peer_grants').run();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'restricted', autonomy: 'notify', contact: { ...old, access: 'restricted', commands: 'basic', tools: ['read', 'pdf'], private: 'health, money' } });
+  const c = s.owner.book.get('h@x.dev');
+  assert.deepEqual([c.access, c.autonomy, c.commands, c.tools, c.private, c.knowledge], ['restricted', 'notify', 'basic', ['read', 'pdf'], 'health, money', 'notes']);
+});
+
+test('"Open one folder" only takes a real folder inside the workspace: not the root, not secrets/ or a folder holding it, no .. or links', async () => {
+  const s = setup();
+  const ws = path.join(s.gw.root, 'ws');
+  for (const d of ['plans', 'secrets', 'outer/secrets']) fs.mkdirSync(path.join(ws, d), { recursive: true });
+  fs.symlinkSync(path.join(ws, 'secrets'), path.join(ws, 'link'));
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'full', confirmFull: true });
+  for (const bad of [ws, path.join(ws, 'secrets'), path.join(ws, 'outer'), `${ws}/plans/../secrets`, path.join(ws, 'link'), '/etc', 'plans']) {
+    await assert.rejects(s.owner.setContact('h@x.dev', 'openFolder', bad), Error, bad);
+  }
+  const c = await s.owner.setContact('h@x.dev', 'openFolder', path.join(ws, 'plans'));
+  assert.equal(c.openFolder, path.join(ws, 'plans'));
+});
+
+test('"Open one folder" after the session exists: the old session (rooted at the workspace) is archived and a new one is rooted at the folder', async () => {
+  const s = setup();
+  const ws = path.join(s.gw.root, 'ws');
+  fs.mkdirSync(path.join(ws, 'plans'), { recursive: true });
+  const roots = {};
+  const request = s.owner.request;
+  s.owner.request = async (m, p) => {
+    if (m === 'sessions.create') roots[p.key] = p.cwd || ws;
+    if (m === 'sessions.describe') return { session: { key: p.key, sessionRoot: roots[p.key] } };
+    return request(m, p);
+  };
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'full', confirmFull: true });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  const first = s.ownerCalls.filter(c => c.method === 'sessions.create').at(-1).params.key;
+  await s.owner.setContact('h@x.dev', 'openFolder', path.join(ws, 'plans'));
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'hi' });
+  const second = s.ownerCalls.filter(c => c.method === 'sessions.create').at(-1).params;
+  assert.notEqual(second.key, first);
+  assert.equal(second.cwd, path.join(ws, 'plans'));
+  assert.ok(s.ownerCalls.some(c => c.method === 'sessions.patch' && c.params.key === first && c.params.archived === true));
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.sessionKey, second.key);
+  assert.ok(s.gw.entries['jarvis-full-h-bc35'].tools.alsoAllow.includes('read'), 'reading comes with the folder');
+});
+
+test('a grant signed with a peer key this gateway no longer has is signed again on start', async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted' });
+  s.activate();
+  s.owner._db().prepare('UPDATE peer_grants SET sig = ?').run('bm90LWEtc2lnbmF0dXJl');
+  const before = s.ownerSignals.filter(m => m.type === 'share-grant').length;
+  await s.owner.migrateContacts();
+  const g = s.ownerSignals.filter(m => m.type === 'share-grant');
+  assert.equal(g.length, before + 1);
+  assert.equal(g.at(-1).grant.access, 'trusted');
+});
+
+test('trusting a new key from either direction of the connection also clears the pin on the other share', () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }] });
+  const active = s.activate();
+  assert.equal(s.req.remoteAgents().length, 1); // pins Kamil's key on sh1
+  // Kamil reinstalls: new key, grant signed again with it; Houman's gateway also owns a share to Kamil (sh9).
+  const next = keyIn();
+  const back = { id: 'sh9', status: 'active', as: 'owner', requester: { ...s.people.owner, pubKey: next.publicKey }, owner: s.people.requester, agents: [] };
+  s.req.setShares([{ ...active, as: 'requester', owner: { ...active.owner, pubKey: next.publicKey }, signature: next.signJson(active.grant) }, back]);
+  assert.deepEqual(s.req.remoteAgents(), []);
+  s.req.trustNewKey('sh9'); // the card's banner trusts from the owner-direction share
+  assert.deepEqual(s.req.remoteAgents().map(a => a.agentId), ['peer:sh1:jarvis']);
+});
+
+test('a turn that may ask the owner holds the approval connection for its whole run (no tab needed); Basic only does not', async () => {
+  const holds = [];
+  const s = setup({ reply: () => null });
+  s.owner.holdApprovals = async () => { const h = { released: false }; holds.push(h); return () => { h.released = true; }; };
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted' }); // Basic + ask me
+  s.activate();
+  const turn = s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  for (let i = 0; i < 100 && !s.ownerCalls.some(c => c.method === 'chat.send'); i++) await wait(5);
+  const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
+  assert.deepEqual(holds.map(h => h.released), [false], 'held while the run goes on');
+  assert.equal(send.timeoutMs, 35 * 60_000, 'as long as the gateway keeps an approval pending');
+  s.owner.onGatewayEvent({ event: 'chat', payload: { runId: send.idempotencyKey, state: 'final', message: { content: [{ type: 'text', text: 'ok' }] } } });
+  await turn;
+  assert.deepEqual(holds.map(h => h.released), [true]);
+  await s.owner.setContact('h@x.dev', 'commands', 'basic');
+  const t2 = s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'hi' });
+  for (let i = 0; i < 100 && s.ownerCalls.filter(c => c.method === 'chat.send').length < 2; i++) await wait(5);
+  const send2 = s.ownerCalls.filter(c => c.method === 'chat.send')[1].params;
+  assert.equal(holds.length, 1, 'Basic only never asks: nothing held');
+  assert.equal(send2.timeoutMs, 10 * 60_000);
+  s.owner.onGatewayEvent({ event: 'chat', payload: { runId: send2.idempotencyKey, state: 'final', message: { content: [{ type: 'text', text: 'ok' }] } } });
+  await t2;
 });

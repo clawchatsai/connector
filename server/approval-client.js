@@ -6,7 +6,8 @@ import { WebSocket as WS } from 'ws';
 // client is connected, an approval waits for a decision instead of expiring at once with
 // "no-approval-route". The connector's main connection is always up, so it must not be one.
 // Like an open Control UI tab, this second connection declares the cap only while a browser is
-// attached (GatewayClient.browsersChanged). Only approval events leave it; everything else the
+// attached (GatewayClient.browsersChanged), or while a contact's guest turn may need its owner's approval
+// (GatewayClient.holdApprovals: "Basic + ask me" must wait for the owner even with no tab open). Only approval events leave it; everything else the
 // gateway broadcasts to it is dropped (the main connection already delivers those).
 export const APPROVAL_EVENT_RE = /^(exec|plugin|openclaw)\.approval\.(requested|resolved)$/;
 
@@ -35,6 +36,13 @@ export class ApprovalClient {
     this.running = true;
     this.reconnectAttempts = 0;
     this._connect();
+  }
+
+  /** Resolves true once connected as an approval client (false after `ms`). */
+  async waitConnected(ms = 5000) {
+    const end = Date.now() + ms;
+    while (!this.connected && Date.now() < end) await new Promise(r => setTimeout(r, 100));
+    return this.connected;
   }
 
   stop() {
