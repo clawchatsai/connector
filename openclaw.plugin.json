@@ -7,6 +7,9 @@
     "onStartup": true
   },
   "reload": { "turnHandover": true },
+  "contracts": {
+    "tools": ["handoff"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": true,

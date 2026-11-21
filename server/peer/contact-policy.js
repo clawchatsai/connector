@@ -38,7 +38,7 @@ export const TOOL_GROUPS = Object.freeze([
   { id: 'accounts', title: 'Reaches your accounts', tools: ['message', 'browser', 'nodes', 'computer', 'talk_voice'], personal: true },
   { id: 'gateway', title: 'Your gateway', tools: ['sessions_list', 'sessions_history', 'subagents', 'cron', 'canvas', 'dashboard'] },
 ]);
-export const ALWAYS_OFF = Object.freeze(['gateway', 'openclaw', 'plugins', 'secrets', 'skill_workshop', 'agents_list']);
+export const ALWAYS_OFF = Object.freeze(['gateway', 'openclaw', 'plugins', 'secrets', 'handoff', 'skill_workshop', 'agents_list']);
 const TICKABLE = new Set(TOOL_GROUPS.filter(g => !g.byCommands).flatMap(g => g.tools));
 const FILE_TOOLS = ['read', 'write', 'edit', 'apply_patch'];
 const WRITE_TOOLS = ['write', 'edit', 'apply_patch'];

@@ -17,6 +17,8 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
+// @ts-expect-error server/ is plain JS without type declarations; imported statically because tools register in register()
+import { registerHandoff as registerHandoffJs } from '../server/handoff.js';
 import type { PluginConfig } from './plugin-config.js';
 import { SignalingClient } from './signaling-client.js';
 // Lazy-imported after ensureNativeModules() builds the native binary.
@@ -261,6 +263,7 @@ interface PluginApi {
     handler: (event: Record<string, unknown>, ctx: Record<string, unknown>) => unknown | Promise<unknown>,
     opts?: { name?: string; description?: string; priority?: number }
   ) => void;
+  registerTool?: (tool: unknown, opts?: { name?: string }) => void;
   runtime: {
     requestRestart?: (reason: string) => void;
     llm?: { complete: (params: Record<string, unknown>) => Promise<{ text?: string; provider?: string; model?: string }> };
@@ -1778,6 +1781,9 @@ const plugin: OpenClawPluginDefinition = {
       description: 'Show ClawChats tunnel status',
       handler: () => ({ text: formatStatus() }),
     });
+
+    // `handoff` agent tool: a HANDOFF_* secret piped once into a local command (owner turns only)
+    (registerHandoffJs as (a: PluginApi, o: { stateDir: string }) => void)(api, { stateDir: stateRoot() });
   },
 };
 
