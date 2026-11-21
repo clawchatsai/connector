@@ -6,6 +6,7 @@
 //   POST   /api/push/unsubscribe     { endpoint }                           this device stops getting pushes
 //   PUT    /api/push/devices/:id     { prefs }  → { device }
 //   DELETE /api/push/devices/:id
+//   POST   /api/push/devices/:id/test                                   → { ok }  one test push to that device now
 import { send, sendError, parseBody, matchRoute } from '../util/http.js';
 import { pushAudience } from '../push/web-push.js';
 import { publicDevice, PREF_KEYS } from '../push/store.js';
@@ -37,6 +38,11 @@ export function createPushHandlers(push) {
     if ((p = matchRoute(method, urlPath, 'PUT /api/push/devices/:id'))) {
       const d = push.store.setPrefs(p.id, cleanBody((await parseBody(req)).prefs));
       d ? send(res, 200, { device: publicDevice(d) }) : sendError(res, 404, 'No such device');
+      return true;
+    }
+    if ((p = matchRoute(method, urlPath, 'POST /api/push/devices/:id/test'))) {
+      if (!push.store.list().some(d => d.id === p.id)) { sendError(res, 404, 'No such device'); return true; }
+      (await push.notifier.sendTest(p.id)) ? send(res, 200, { ok: true }) : sendError(res, 502, 'The push service didn’t accept it');
       return true;
     }
     if ((p = matchRoute(method, urlPath, 'DELETE /api/push/devices/:id'))) {

@@ -344,3 +344,26 @@ test('no answer from the push service: one retry at most, same Topic, without re
   await h2.advance(1000); await h2.advance(2000);
   assert.equal(h2.sent.length, 3);
 });
+
+test('a plugin status final (Active Memory) is not a reply: no count, no preview', async () => {
+  const h = harness();
+  h.device(FCM + 'x');
+  await h.final('agent:main:dashboard:a', '🧩 Active Memory: status=no_relevant_memory elapsed=9.2s query=recent');
+  assert.equal(h.sent.length, 0);
+  await h.final('agent:main:dashboard:a', 'The real answer.');
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].payload.body, 'The real answer.');
+});
+
+test('a test push reaches that one device now, whatever presence and its categories say', async () => {
+  const h = harness();
+  const a = h.device(FCM + 'a', { prefs: { replies: false, approvals: false } });
+  h.device(FCM + 'b');
+  h.present(true);
+  assert.equal(await h.n.sendTest(a.id), true);
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.sent[0].endpoint, FCM + 'a');
+  assert.equal(h.sent[0].payload.kind, 'test');
+  assert.equal(h.sent[0].opts.urgency, 'high');
+  assert.equal(await h.n.sendTest('nope'), false);
+});

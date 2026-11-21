@@ -50,6 +50,11 @@ export function replyText(message) {
   return content.slice(last + 1).filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n');
 }
 
+// Plugin status lines the gateway sends as their own chat final when verbose status is on (Active Memory's
+// "🧩 Active Memory: status=…", memory search): not a reply, so they neither count nor become the preview.
+const STATUS_LINE = /^(?:🧩|🔎|🧠)?\s*(?:active memory(?: debug)?|memory search):/i;
+export const isStatusOnly = text => text.split('\n').every(l => !l.trim() || STATUS_LINE.test(l.trim()));
+
 const nativeToolCommand = text => {
   if (typeof text !== 'string' || !text.trim().startsWith('{')) return null;
   try { const v = JSON.parse(text); return typeof v?.command === 'string' ? v.command : null; } catch { return null; }
@@ -143,7 +148,9 @@ export class PushNotifier {
   async _onReply(p) {
     const key = p.sessionKey;
     if (!key || p.yielded === true || !this.lens.isTopLevel(key)) return;
-    const text = plainText(replyText(p.message));
+    const raw = replyText(p.message);
+    if (!raw.trim() || isStatusOnly(raw)) return;
+    const text = plainText(raw);
     if (!text) return;
     if (this.presence.isPresent()) return;
     const r = this.replies.get(key) || { count: 0, lastBuzzAt: 0 };
@@ -285,6 +292,17 @@ export class PushNotifier {
   }
 
   // ── Delivery ──
+
+  /** Settings → Send test notification: this one device, now, whatever presence and its categories say. */
+  async sendTest(deviceId) {
+    const d = this.store.list().find(x => x.id === deviceId);
+    if (!d) return false;
+    return this._sendTo(d, this._payload(d, {
+      kind: 'test', tag: 'clawchats-test', renotify: true, urgency: 'high', ttl: 120,
+      title: 'ClawChats', body: `Test notification from ${clip(this.gatewayName(), 60) || 'your gateway'}. Notifications reach this device.`,
+      privateTitle: 'ClawChats', privateBody: 'Test notification. Notifications reach this device.',
+    }, this.unreadCount()), { kind: 'test', tag: 'clawchats-test', ttl: 120, urgency: 'high' });
+  }
 
   /**
    * Send `n` to every device with `pref` on. Returns the ids of the devices it reached.

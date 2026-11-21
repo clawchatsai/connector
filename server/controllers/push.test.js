@@ -62,3 +62,16 @@ test('push-dev.json: a local VAPID key is offered to browsers and the escalation
   assert.equal((await call('GET', '/api/push')).body.publicKey, e.getPublicKey().toString('base64url'));
   assert.equal(push.notifier.escalateMs, 15000);
 });
+
+test('POST /api/push/devices/:id/test sends one test push; unknown device 404', async () => {
+  const { call, push } = setup();
+  const r = await call('POST', '/api/push/subscribe', { subscription: { endpoint: 'https://fcm.googleapis.com/fcm/send/t', keys: keys() }, deviceLabel: 'Chrome on Linux' });
+  const id = r.body.device.id;
+  const sent = [];
+  push.notifier.sendTest = async x => { sent.push(x); return true; };
+  assert.equal((await call('POST', `/api/push/devices/${id}/test`)).status, 200);
+  assert.deepEqual(sent, [id]);
+  assert.equal((await call('POST', '/api/push/devices/nope/test')).status, 404);
+  push.notifier.sendTest = async () => false;
+  assert.equal((await call('POST', `/api/push/devices/${id}/test`)).status, 502);
+});
