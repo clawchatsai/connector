@@ -18,8 +18,7 @@
 //   team_mirror   host entry id -> local message id in a live copy (each host entry injected once)
 //   team_entries.host_ts/owner_id/ref  a mirrored entry's original time, its agent's owner and room-wide agent ref
 //   team_entries author_type 'system': a line like "Kamil joined" (same on every screen)
-//   team_rooms.mention_only  agents answer only when @mentioned (human chats with silent agents): 0 off, 1 on,
-//                            2 automatic (on while another person is in the chat, D12; new rooms)
+//   team_rooms.mention_only  unused (was: agents answer only when @mentioned); a plain message now goes to the sender's agents
 //   team_entries.via  which of its sessions an agent wrote from: 'owner' (its owner's own session,
 //                 here or in its owner's copy) or 'guest:<who>' (a session it ran in for someone else).
 //                 NULL on older rows: treated as the session asking, as before.
@@ -40,7 +39,6 @@ function roomRow(r, members, people = []) {
   return {
     roomKey: r.room_key,
     discuss: !!r.discuss,
-    mentionOnly: r.mention_only === 2 ? null : !!r.mention_only, // null: automatic
     rounds: r.rounds || DISCUSS_ROUNDS,
     sourceKey: r.source_key || null,
     createdAt: r.created_at,
@@ -103,12 +101,12 @@ export function createTeamStore(getGlobalDb) {
     },
 
     /** members: [{ agentId, workKey?, seenAt? }] in display order; sourceKey: the chat it was converted from. */
-    createRoom(roomKey, memberList, { discuss = false, sourceKey = null, mentionOnly = null } = {}) {
+    createRoom(roomKey, memberList, { discuss = false, sourceKey = null } = {}) {
       const g = db();
       const now = Date.now();
       g.exec('BEGIN');
       try {
-        g.prepare('INSERT INTO team_rooms (room_key, discuss, source_key, created_at, updated_at, mention_only) VALUES (?, ?, ?, ?, ?, ?)').run(roomKey, discuss ? 1 : 0, sourceKey, now, now, mentionOnly === null ? 2 : mentionOnly ? 1 : 0);
+        g.prepare('INSERT INTO team_rooms (room_key, discuss, source_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)').run(roomKey, discuss ? 1 : 0, sourceKey, now, now);
         memberList.forEach((m, i) => g.prepare('INSERT INTO team_members (room_key, agent_id, work_key, seen_at, position) VALUES (?, ?, ?, ?, ?)').run(roomKey, m.agentId, m.workKey || null, m.seenAt || 0, i));
         g.exec('COMMIT');
       } catch (e) { g.exec('ROLLBACK'); throw e; }
@@ -288,10 +286,6 @@ export function createTeamStore(getGlobalDb) {
 
     setDiscuss(roomKey, discuss) {
       db().prepare('UPDATE team_rooms SET discuss = ?, updated_at = ? WHERE room_key = ?').run(discuss ? 1 : 0, Date.now(), roomKey);
-    },
-
-    setMentionOnly(roomKey, on) {
-      db().prepare('UPDATE team_rooms SET mention_only = ?, updated_at = ? WHERE room_key = ?').run(on === null ? 2 : on ? 1 : 0, Date.now(), roomKey);
     },
 
     setRounds(roomKey, rounds) {

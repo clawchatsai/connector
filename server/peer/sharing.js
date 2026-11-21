@@ -69,12 +69,15 @@ export const defangLocalPaths = text => String(text ?? '')
 // them on purpose. What they may see or do is the contact's settings (copy, tools, folder, Commands, Knowledge),
 // enforced in config; a "don't reveal" rule here overrode those settings, and models re-judge any rule against them.
 const SHARED_FACT = (name, topics) => `Everything you can access in this session was shared with ${name} on purpose${topics ? ' (except the private topics below)' : ''}: use it freely to help ${name}.`;
-const GUEST_NOTE = (name, topics) => `(Shared session: ${name} is talking to you, not your owner. ${SHARED_FACT(name, topics)})`;
+// "not your owner" read as a reason to refuse (QA 2026-11-21: asked to run a command it had, Haiku deferred to its
+// owner); say who it works for here, and that approvals go to the owner, so it tries instead of declining up front.
+const APPROVAL_FACT = 'Anything that needs approval asks your owner when you try it.';
+const GUEST_NOTE = (name, topics) => `(Shared session: you're working for ${name} here; ${name} is asking. ${SHARED_FACT(name, topics)} ${APPROVAL_FACT})`;
 const files0 = notes => (notes ? [...notes.candidates.filter(x => x.on).map(x => x.path), ...notes.repoDocs.map(x => x.path)] : null);
 // A copy with picked notes (Knowledge "My notes"): where they are.
 const NOTES_NOTE = name => `(Your owner chose to share the notes in the ${NOTES_DIR}/ folder of your workspace with ${name}: read them and use them freely to answer.)`;
 // The same agent in its owner's own team chat, answering another person's agent (localTurnFor).
-const ACTING_FOR_NOTE = (name, byPerson, topics) => `(Shared session: in your owner's team chat, ${byPerson ? name : `${name}'s agent`} is talking to you, not your owner. ${SHARED_FACT(name, topics)})`;
+const ACTING_FOR_NOTE = (name, byPerson, topics) => `(Shared session: in your owner's team chat you're working for ${name} here; ${byPerson ? name : `${name}'s agent`} is asking. ${SHARED_FACT(name, topics)} ${APPROVAL_FACT})`;
 
 /** A guest turn's emit with secrets redacted from streamed text (see _guestTurn). */
 const redacting = emit => emit && ((event, data) => emit(event, event === 'delta' ? redactSecrets(data) : data));
@@ -578,22 +581,30 @@ export class SharingManager {
     return clash ? cleanName(fullName, 60) || mine : mine;
   }
 
-  /** The room (and who asked) behind a guest session of this gateway, or null. */
-  /** Sessions here answering `roomId` of the room hosted by `hostGatewayId` (hidden from the list while a copy exists). */
+  /**
+   * Sessions here answering in room `roomId`: in a room this gateway hosts (`hostGatewayId` null), every one; in
+   * someone else's, the ones answering that host. A room's approvals and questions land in the room (team.js).
+   */
   guestSessionKeysFor(hostGatewayId, roomId) {
     const keys = [];
-    for (const r of this._db().prepare('SELECT p.session_key, g.grant_json FROM peer_sessions p JOIN peer_grants g ON g.share_id = p.share_id WHERE p.room_id = ?').all(roomId)) {
-      try { if (JSON.parse(r.grant_json).requesterGatewayId === hostGatewayId) keys.push(r.session_key); } catch { /* unreadable grant */ }
+    for (const r of this._db().prepare('SELECT p.session_key, g.grant_json FROM peer_sessions p LEFT JOIN peer_grants g ON g.share_id = p.share_id WHERE p.room_id = ?').all(roomId)) {
+      if (!hostGatewayId) { keys.push(r.session_key); continue; }
+      try { if (JSON.parse(r.grant_json).requesterGatewayId === hostGatewayId) keys.push(r.session_key); } catch { /* unreadable or ended grant */ }
     }
     return keys;
   }
 
+  /**
+   * The room (and who asked) behind a guest session of this gateway, or null. Every guest session answers in a room
+   * its owner can see (a peer turn needs the owner's copy of the room: _guestTurn), so none is a chat of its own.
+   * Kept after the share ends (requesterGatewayId null then): the session stays out of the chat list.
+   */
   guestSessionOf(key) {
     if (!this._guestKeys) {
       this._guestKeys = new Map();
       for (const r of this._db().prepare('SELECT share_id, room_id, session_key FROM peer_sessions').all()) {
         const g = this._grant(r.share_id);
-        if (g?.grant.requesterGatewayId) this._guestKeys.set(r.session_key, { requesterGatewayId: g.grant.requesterGatewayId, roomId: r.room_id, shareId: r.share_id });
+        this._guestKeys.set(r.session_key, { requesterGatewayId: g?.grant.requesterGatewayId || null, roomId: r.room_id, shareId: r.share_id });
       }
     }
     return this._guestKeys.get(key) || null;
@@ -675,6 +686,13 @@ export class SharingManager {
     if (!agent) throw Object.assign(new Error('That agent is not shared'), { code: 'not_shared' });
     const roomId = String(p.roomId || '').slice(0, 200);
     if (!roomId || typeof p.message !== 'string' || !p.message.trim()) throw Object.assign(new Error('Bad turn'), { code: 'bad_request' });
+    // Our agents only work in chats we can see: someone else's room needs our copy of it, i.e. us in it with our
+    // agent (people and their agents come as a pair). The host sends our copy first and asks again (team.js
+    // _remoteTurn), so a person and agent added together still get their first turn. inOwnerRoom: a room here.
+    if (!p.inOwnerRoom && this.hasCopy && !this.hasCopy(grant.requesterGatewayId, roomId)) {
+      const me = firstName({ name: this.selfName() });
+      throw Object.assign(new Error(`${agent.name} only answers in chats ${me} is in: add ${me} to this chat`), { code: 'owner_absent' });
+    }
     // The requester's turn id only names the turn (for its Stop, and for a resend after its link dropped); the turn
     // itself is tracked under an id made here, so reusing one can't hide a turn from the limit or from "Stop sharing".
     const clientTurnId = typeof p.turnId === 'string' && p.turnId ? p.turnId.slice(0, 200) : null;
@@ -1030,7 +1048,7 @@ export class SharingManager {
       agents: own.map(a => ({ id: a.id, name: a.identity?.name || a.name || a.id })),
       skills: skillNames.map(n => { const i = skillInfo.find(x => (x?.name || x?.skillKey) === n); return { name: n, description: String(i?.description || '').slice(0, 160) }; }),
       mcpServers: Object.keys(cfg?.parsed?.mcp?.servers || {}).sort().map(n => ({ name: n, enabled: cfg.parsed.mcp.servers[n]?.enabled !== false })),
-      notes, copies: this.book.copies(person), sessions: this._guestSessionKeysOf(person),
+      notes, copies: this.book.copies(person), sessions: await this._guestSessionRows(person),
       // What the card draws its controls from (one source with the policy the copies get).
       catalog: { toolGroups: TOOL_GROUPS, alwaysOff: ALWAYS_OFF, basicDefaults: BASIC_DEFAULTS, defaultTools: DEFAULT_TOOLS, defaultCommands: DEFAULT_COMMANDS, autonomy: AUTONOMY, draft: c ? null : { ...view, notes: files0(notes) } },
     };
@@ -1192,13 +1210,12 @@ export class SharingManager {
       .catch(() => false);
   }
 
-  /** The (share, room, agent) session on this gateway: visible to the owner in "Shared with <name>". */
+  /** The (share, room, agent) session on this gateway: the room's, out of the chat list; read in Settings → People → <name>. */
   async _guestSession(shareId, roomId, agentId, { name, roomTitle, permissionMode, toolOverrides, cwd = null }) {
     const db = this._db();
     const row = db.prepare('SELECT session_key FROM peer_sessions WHERE share_id = ? AND room_id = ? AND agent_id = ?').get(shareId, roomId, agentId);
-    // The owner may have deleted it from their chat list: then it's made again (same key, so the
-    // room keeps pointing at it), in "Shared with <name>" with its label, instead of the gateway
-    // bringing it back as an untitled chat that ClawChats hides.
+    // It may have been deleted (e.g. in the Control UI): then it's made again (same key, so the room keeps
+    // pointing at it) with its label, instead of the gateway bringing it back as an untitled chat.
     const described = row && await this.request('sessions.describe', { key: row.session_key }, 5000).then(r => r, () => ({ unknown: true }));
     const exists = row && !(described && 'session' in described && !described.session);
     // A session's root is fixed when it's made. "Open one folder" opened (or moved) after that: the old session (rooted
@@ -1213,11 +1230,10 @@ export class SharingManager {
       return row.session_key;
     }
     const key = (!wrongRoot && row?.session_key) || `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
-    const category = this.funnelOf(this._shares.find(x => x.id === shareId && x.as === 'owner')?.requester?.email, name);
     // Labels are unique per gateway, and untitled rooms all fall back to "team chat": tag each room.
     const tag = crypto.createHash('sha256').update(`${shareId}|${roomId}`).digest('hex').slice(0, 6);
     const create = label => this.request('sessions.create', {
-      key, agentId, ...(permissionMode ? { permissionMode } : {}), toolOverrides, label: label.slice(0, 200), category,
+      key, agentId, ...(permissionMode ? { permissionMode } : {}), toolOverrides, label: label.slice(0, 200),
       ...(cwd ? { cwd } : {}), // Full agent's "Open one folder": the session root (§12)
     });
     try { await create(`${name} · ${roomTitle} · ${tag}`); }
@@ -1517,7 +1533,7 @@ export class SharingManager {
 
   // ── Funnel: the project one person's chats go to ───────────────────
   // Set when the person is added (invite or accept) and changeable in Settings → People. It covers
-  // both what they host (our copies of their chats) and our agents' guest sessions for them. Stored by
+  // what they host (our copies of their chats; our agents' sessions for them belong to rooms). Stored by
   // name; ClawChats renames follow it (renameFunnel), a deleted project is made again by the next chat.
   // Keyed by the person's email: known from the invite on, before any gateway id.
 
@@ -1536,11 +1552,8 @@ export class SharingManager {
     const name = cleanName(project, 100);
     if (!e || !name) throw new Error('email and project are required');
     this._db().prepare('INSERT INTO peer_funnel (email, project, updated_at) VALUES (?, ?, ?) ON CONFLICT(email) DO UPDATE SET project = excluded.project, updated_at = excluded.updated_at').run(e, name, Date.now());
-    let moved = 0;
-    for (const key of this._guestSessionKeysOf(e)) {
-      if (await this.request('sessions.patch', { key, category: name }).then(() => true, () => false)) moved++;
-    }
-    moved += (await this.onFunnelChanged?.(e, name)) || 0; // copies of their chats (team.js)
+    // Our agents' sessions for them aren't chats (they belong to the rooms): only copies of their chats move.
+    const moved = (await this.onFunnelChanged?.(e, name)) || 0; // team.js
     this._changed();
     return { moved };
   }
@@ -1559,6 +1572,17 @@ export class SharingManager {
       if (String(o?.email || '').toLowerCase() === email && o.gatewayId) ids.add(o.gatewayId);
     }
     return ids;
+  }
+
+  /**
+   * "What your agents were asked" (Settings → People → <name>): their guest sessions, newest first, with what the
+   * list shows. They have no chat row (they belong to rooms), so the app can't read them from its chat list.
+   */
+  async _guestSessionRows(email) {
+    const keys = this._guestSessionKeysOf(email);
+    const rows = await Promise.all(keys.slice(0, 200).map(key => this.request('sessions.describe', { key }, 5000)
+      .then(r => r?.session && !r.session.archived ? { key, label: r.session.label || r.session.displayName || '', updatedAt: r.session.lastInteractionAt || r.session.updatedAt || 0 } : null, () => null)));
+    return rows.filter(Boolean).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   /** Our agents' guest sessions for this person, including ones from shares since ended (and their own copies' sessions). */

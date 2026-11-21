@@ -443,9 +443,6 @@ export function createApp(config = {}) {
         if (room && body.discuss !== undefined) {
           try { room = team.setDiscuss(p.room, body.discuss); } catch (e) { return sendError(res, 400, e.message); }
         }
-        if (room && body.mentionOnly !== undefined) {
-          try { room = team.setMentionOnly(p.room, body.mentionOnly); } catch (e) { return sendError(res, 400, e.message); }
-        }
         if (room && body.rounds !== undefined) {
           try { room = team.setRounds(p.room, body.rounds); } catch (e) { return sendError(res, 400, e.message); }
         }
@@ -455,7 +452,7 @@ export function createApp(config = {}) {
         const { personId, history } = await parseBody(req);
         if (typeof personId !== 'string' || !personId) return sendError(res, 400, 'personId is required');
         try {
-          const room = await team.addPerson(p.room, personId, { history, quietAgents: true });
+          const room = await team.addPerson(p.room, personId, { history });
           return room ? send(res, 200, { room }) : sendError(res, 404, 'Not a team chat');
         } catch (e) { return sendError(res, 400, e.message); }
       }
