@@ -108,6 +108,20 @@ src/                      # OpenClaw plugin wrapper (TypeScript)
 
 **No shell execution:** The plugin contains no `exec`, `spawn`, or shell calls. SQLite is handled by Node's built-in `node:sqlite` module — no native binary compilation required.
 
+## Progress cards in claude-cli chats
+
+OpenClaw tells the agent about its task progress card only when the chat runs on its built-in runtime. Chats on `claude-cli` (or another `*-cli` runtime) never get that instruction, so their agent almost never shows a progress card. The connector can add the missing line itself, but the gateway only lets a third-party plugin add to the agent's instructions once you allow it:
+
+```bash
+openclaw config set plugins.entries.connector.hooks.allowConversationAccess true
+```
+
+This needs OpenClaw 2026.11.6 or later: on older gateways a claude-cli agent's `progress_card` calls fail in the gateway, so the connector doesn't add the reminder there. The change applies without a gateway restart. Until it's set, the gateway log says once per start that the reminder is blocked, and ClawChats shows a one-time tip in claude-cli chats.
+
+**What the setting grants:** read access to conversation content in the connector's prompt hooks. The gateway has one switch for every hook that can see a chat's messages, so turning it on would let any such hook of the connector read them. The connector registers exactly one, `before_prompt_build`, and it doesn't read the conversation. It looks only at the chat's model provider and session key, and on claude-cli chats (not the agent's main session, not subagents) it appends one fixed line about `progress_card` to the system prompt. It stores nothing and sends nothing anywhere.
+
+**Why it asks:** this is a workaround for a gap in OpenClaw, and it goes away once OpenClaw reminds CLI runtimes itself. It does nothing when progress cards are off (`tools.updatePlan: false`) or prompt hooks are off for the connector (`plugins.entries.connector.hooks.allowPromptInjection: false`). To undo it, set the value back to `false`.
+
 ## Configuration
 
 Config is read in priority order:

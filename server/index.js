@@ -286,7 +286,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);
       if (method === 'PUT' && urlPath === '/api/settings') return await handleSaveSettings(req, res, parseBody);
       if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res, { openaiApiKey });
-      if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime() });
+      if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime(), progressCardReminder: config.progressCardReminder?.() });
       if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
       if (method === 'POST' && urlPath === '/api/title') return await handleTitle(req, res);
 
