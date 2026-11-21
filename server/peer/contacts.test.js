@@ -35,7 +35,7 @@ test('Access resets Tools and Commands to that tier; Full needs confirming once'
   assert.equal(b.set('k@x.dev', 'access', 'full').access, 'full', 'confirmed once');
 });
 
-test('"Open one folder" is Full agent only and needs ask/auto-review commands; Basic list entries are checked', () => {
+test('"Open one folder" is Full agent only and needs Commands "ask me"; Basic list entries are checked', () => {
   const b = book();
   b.create('k@x.dev');
   assert.throws(() => b.set('k@x.dev', 'openFolder', '/w/plans'), /Full agent/);
@@ -132,4 +132,12 @@ test('peer versions: older than the minimum, or none at all, is too old; the mes
   assert.equal(peerOutdated(MIN_PEER_VERSION), false);
   assert.match(outdatedMessage('Kamil', '0.2.4'), /Kamil's ClawChats connector is out of date \(0\.2\.4\)[^]*openclaw plugins install npm:@clawchatsai\/connector --force/);
   assert.match(outdatedMessage(null, null), /^Your ClawChats connector is out of date\./);
+});
+
+test('Auto-review is gone for contacts: a stored "auto" reads as ask, and setting it (an older card) gives ask', () => {
+  const b = book();
+  b.create('k@x.dev');
+  assert.equal(b.set('k@x.dev', 'commands', 'auto').commands, 'ask');
+  b.db().prepare("UPDATE peer_contact SET commands = 'auto'").run();
+  assert.equal(b.get('k@x.dev').commands, 'ask');
 });

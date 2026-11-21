@@ -11,7 +11,10 @@ import crypto from 'node:crypto';
 import { GUEST_TOOLS_DENY } from './guest-agent.js';
 
 export const ACCESS = ['restricted', 'trusted', 'full'];
-export const COMMANDS = ['off', 'basic', 'ask', 'auto'];
+// No AI auto-review for contacts (Houman, 2026-11-21): the gateway's reviewer is built for owner sessions and reads every
+// request in a shared session as a third party's, so it refused what the owner had granted. Old 'auto' reads as 'ask'.
+export const COMMANDS = ['off', 'basic', 'ask'];
+export const commandsSetting = v => (v === 'auto' ? 'ask' : v);
 export const KNOWLEDGE = ['none', 'notes'];
 
 /**
@@ -91,13 +94,10 @@ export function effectiveTools(c) {
   return [...new Set(t)].sort();
 }
 
-/** Copy exec settings per Commands tier (§4). `reviewerModel` only for Auto-review. */
-export function execConfig(commands, reviewerModel = null) {
-  const mode = { off: 'deny', basic: 'allowlist', ask: 'ask', auto: 'auto' }[commands] || 'deny';
-  return {
-    mode, strictInlineEval: true, safeBins: ['head', 'tail', 'wc', 'cut', 'uniq', 'tr'],
-    ...(mode === 'auto' && reviewerModel ? { reviewer: { model: reviewerModel } } : {}),
-  };
+/** Copy exec settings per Commands tier (§4). */
+export function execConfig(commands) {
+  const mode = { off: 'deny', basic: 'allowlist', ask: 'ask' }[commands] || 'deny';
+  return { mode, strictInlineEval: true, safeBins: ['head', 'tail', 'wc', 'cut', 'uniq', 'tr'] };
 }
 
 /**
@@ -106,13 +106,11 @@ export function execConfig(commands, reviewerModel = null) {
  * "Open one folder" needs a mode for its session root: refused for Off/Basic (card) and kept at guarded here.
  */
 export function sessionMode(c) {
-  if (c.commands === 'ask') return 'guarded';
-  if (c.commands === 'auto') return 'workspace';
-  return null;
+  return c.commands === 'ask' ? 'guarded' : null;
 }
 
 /** The copy's `tools` config: an allowlist on the minimal profile, everything else denied on top. */
-export function copyTools(c, { reviewerModel = null, autoApproveChanges = true } = {}) {
+export function copyTools(c, { autoApproveChanges = true } = {}) {
   const allowed = effectiveTools(c);
   const execOn = c.commands !== 'off';
   const mcpOn = Object.values(c.mcp || {}).some(Boolean);
@@ -131,7 +129,7 @@ export function copyTools(c, { reviewerModel = null, autoApproveChanges = true }
   return {
     profile: 'minimal', alsoAllow: alsoAllow.sort(), deny: [...deny].sort(),
     fs: { workspaceOnly: true },
-    exec: execConfig(c.commands, reviewerModel),
+    exec: execConfig(c.commands),
     ...(autoApproveChanges ? { openclaw: { autoApproveChanges: false } } : {}),
   };
 }
@@ -203,7 +201,7 @@ export function basicList(c) {
 
 /** The copy's entry in the exec approvals document (`agents.<copy>`). */
 export function approvalsEntry(c) {
-  const ask = c.commands === 'ask' || c.commands === 'auto' ? 'on-miss' : 'off';
+  const ask = c.commands === 'ask' ? 'on-miss' : 'off';
   return {
     security: c.commands === 'off' ? 'deny' : 'allowlist', ask, askFallback: 'deny', autoAllowSkills: false,
     allowlist: c.commands === 'off' ? [] : basicList(c).map(({ pattern, argPattern }) => (argPattern ? { pattern, argPattern } : { pattern })),

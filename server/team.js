@@ -81,24 +81,37 @@ export function splitLabel(text) {
   return m ? { label: m[1], body: text.slice(m[0].length) } : { label: null, body: text || '' };
 }
 
+/** "Jarvis · Kamil Gronowski" → "jarvis-kamil-gronowski": what a handle may hold (the @mention pattern's characters). */
+const slug = v => String(v || '').toLowerCase().trim().replace(/\s+/g, '-').replace(/[^\w.-]/g, '').replace(/-+/g, '-').replace(/^[.-]+|[.-]+$/g, '');
+
 /**
- * Who a message addresses. `agents`: [{ agentId, name }].
- * Returns { all: true } for @all/@everyone, else { agentIds: [...] } (empty = nobody mentioned).
+ * The @handle an agent gets when it joins a room: its name, else with its owner's first name, else the whole owner
+ * name, else numbered. `taken`: handles in the room already, the ones of agents that left included, so a handle never
+ * changes hands and old messages keep pointing at the same agent. Host-assigned: copies and browsers only show it.
+ */
+export function assignHandle(name, ownerName, taken) {
+  const base = slug(String(name || '').split('·')[0]) || 'agent';
+  const owner = String(ownerName || '').trim();
+  const tried = [base, owner && `${base}-${slug(owner.split(/\s+/)[0])}`, owner && `${base}-${slug(owner.replace(/\s+/g, ''))}`].filter(Boolean);
+  const free = h => !taken.has(h) && !ALL_WORDS.has(h);
+  const hit = tried.find(free);
+  if (hit) return hit;
+  for (let i = 2; ; i++) if (free(`${tried.at(-1)}-${i}`)) return `${tried.at(-1)}-${i}`;
+}
+
+/**
+ * Who a message addresses: @handle (exact, case-insensitive) or @all/@everyone. `agents`: [{ agentId, handle }].
+ * Returns { all: true }, else { agentIds: [...] } (empty = nobody mentioned). Handles are unique in a room, so a word
+ * names one agent or none: no name forms to guess between (Houman, 2026-11-21).
  */
 export function parseMentions(text, agents) {
   const ids = new Set();
   const re = /(^|[^\w@])@([\w.-]+)/g;
-  // Someone else's agent is "Jarvis · Kamil": @Jarvis-Kamil, or @Jarvis when that's unambiguous.
-  // aka: other names it goes by (the host's own agents as people's copies show them, "main · Houman").
-  const forms = n => [n, n.replace(/\s*·\s*/g, '-'), n.replace(/\s*·\s*(\S+).*$/, '-$1')];
-  const exact = a => [a.agentId, ...[a.name, ...(a.aka || [])].filter(Boolean).flatMap(forms)].filter(Boolean).map(norm);
-  const short = a => (a.name && a.name.includes('·') ? [norm(a.name.split('·')[0])] : []);
   let m;
   while ((m = re.exec(text || ''))) {
     const word = norm(m[2]).replace(/[.-]+$/, '');
     if (ALL_WORDS.has(word)) return { all: true };
-    const hits = agents.filter(a => exact(a).includes(word));
-    for (const a of hits.length ? hits : agents.filter(a => short(a).includes(word))) ids.add(a.agentId);
+    for (const a of agents) if (a.handle && a.handle === word) ids.add(a.agentId);
   }
   return { agentIds: [...ids] };
 }
@@ -273,6 +286,10 @@ export class TeamCoordinator {
   async refreshNames() {
     this._agents = null;
     const names = new Map((await this.agents()).map(a => [a.agentId, a.name]));
+    // Rooms from before @handles get theirs once (in join order, so earlier agents keep the shorter one).
+    const unhandled = this.store.listRooms().filter(r => !r.host && r.members.some(m => !m.handle));
+    for (const r of unhandled) await this._ensureHandles(r.roomKey).catch(e => this.log.warn?.(`[team] handles for ${r.roomKey}: ${e.message}`));
+    if (unhandled.length) { this._changed(); for (const r of unhandled) this._pushSoon(r.roomKey); }
     const prev = this._lastNames;
     this._lastNames = names;
     if (!prev) return [];
@@ -291,10 +308,31 @@ export class TeamCoordinator {
 
   async _named(agentIds) {
     const all = await this.agents();
-    const host = this._hostName();
-    return agentIds.map(id => all.find(a => a.agentId === id) || { agentId: id, name: this._remoteName(id)?.name || id })
-      // People's copies show this gateway's agents as "main · Houman Satarian", and offer @main-HoumanSatarian.
-      .map(a => (TeamCoordinator.isRemote(a.agentId) ? a : { ...a, aka: [`${a.name} · ${host}`] }));
+    return agentIds.map(id => all.find(a => a.agentId === id) || { agentId: id, name: this._remoteName(id)?.name || id });
+  }
+
+  /** The room's agents with their @handles ({ agentId, name, handle }), giving any that have none theirs first. */
+  async _roomAgents(room) {
+    const handles = await this._ensureHandles(room.roomKey);
+    return (await this._named(room.members.map(m => m.agentId))).map(a => ({ ...a, handle: handles.get(a.agentId) || null }));
+  }
+
+  /** Hands out missing handles in join order (rooms from before handles, agents just added). Returns agentId → handle. */
+  async _ensureHandles(roomKey) {
+    const rows = this.store.handles(roomKey);
+    const taken = new Set(rows.map(r => r.handle).filter(Boolean));
+    const missing = rows.filter(r => !r.handle);
+    if (missing.length) {
+      const named = await this._named(missing.map(r => r.agentId));
+      for (const [i, r] of missing.entries()) {
+        const remote = TeamCoordinator.isRemote(r.agentId);
+        const owner = remote ? this._remoteName(r.agentId)?.ownerName || String(named[i].name).split('·')[1] : this._hostName();
+        r.handle = assignHandle(named[i].name, owner, taken);
+        taken.add(r.handle);
+        this.store.setHandle(roomKey, r.agentId, r.handle);
+      }
+    }
+    return new Map(rows.map(r => [r.agentId, r.handle]));
   }
 
   // ── Rooms ──────────────────────────────────────────────────────────
@@ -351,11 +389,11 @@ export class TeamCoordinator {
       sourceKey: r.sourceKey,
       createdAt: r.createdAt,
       agents: r.members.map(m => {
-        if (!TeamCoordinator.isRemote(m.agentId)) return { agentId: m.agentId, workKey: m.workKey };
+        if (!TeamCoordinator.isRemote(m.agentId)) return { agentId: m.agentId, workKey: m.workKey, handle: m.handle };
         const a = this._remoteAgents().find(x => x.agentId === m.agentId);
         // A share that ended keeps its member, shown as unavailable.
         const known = a || this._remoteName(m.agentId);
-        return { agentId: m.agentId, workKey: null, remote: true, name: known?.name || null, ownerName: known?.ownerName || null, ownerId: this.remote?.ownerOf?.(m.agentId) || null, available: !!a };
+        return { agentId: m.agentId, workKey: null, handle: m.handle, remote: true, name: known?.name || null, ownerName: known?.ownerName || null, ownerId: this.remote?.ownerOf?.(m.agentId) || null, available: !!a };
       }),
       running: live ? [...live.running.keys()] : [],
       // Remote agents whose run waits for their owner to approve something: { agentId: { owner, what, expiresAtMs } }.
@@ -398,6 +436,7 @@ export class TeamCoordinator {
     const roomKey = `agent:${members[0].agentId}:dashboard:${crypto.randomUUID()}`;
     // Register first so the lens never shows a working session or forwards a half-made room.
     this.store.createRoom(roomKey, members, { sourceKey, mentionOnly: mentionOnly === null || mentionOnly === undefined ? null : !!mentionOnly });
+    await this._ensureHandles(roomKey);
     this._workKeysChanged();
     // Labels are unique per gateway and the source chat still holds this one: it steps aside (as the
     // hidden working session) so the team chat can take it; it gets it back when the room goes.
@@ -483,6 +522,7 @@ export class TeamCoordinator {
     if (!named) throw new Error(`unknown agent: ${agentId}`);
     const fresh = !room?.members.some(m => m.agentId === agentId);
     if (!this.store.addMember(roomKey, agentId, { history, seenAt: history === 'now' ? Date.now() : 0 })) return null;
+    await this._ensureHandles(roomKey);
     await this._ensureOwners(roomKey, { history });
     if (fresh) await this._note(roomKey, `${named.name} joined`);
     this._changed();
@@ -617,7 +657,7 @@ export class TeamCoordinator {
     const room = this.store.getRoom(roomKey);
     if (!room) return;
     if (room.host) return this._replicaRunOwn(room, text, stopped);
-    const agents = await this._named(room.members.map(m => m.agentId));
+    const agents = await this._roomAgents(room);
     const mention = parseMentions(text, agents);
     let targets, mode;
     if (mention.all) { targets = agents.map(a => a.agentId); mode = 'addressed'; }
@@ -965,7 +1005,11 @@ export class TeamCoordinator {
 
   /** owner: the agent answers its owner (full strength); others' quoted words are then context, never requests. */
   _prompt(self, agents, fresh, mode, earlier = '', { owner = false, notes = '' } = {}) {
-    const others = agents.filter(a => a.agentId !== self.agentId).map(a => a.name);
+    // The roster: what to write to address each agent, and whose it is ("@jarvis (Jarvis, Kamil's agent)").
+    const host = this._hostName();
+    const whose = a => { const [base, owner] = String(a.name).split('·').map(x => x.trim()); return `${base || a.name}, ${owner || (TeamCoordinator.isRemote(a.agentId) ? 'someone else' : host)}'s agent`; };
+    const at = a => (a.handle ? `@${a.handle} (${whose(a)})` : a.name);
+    const others = agents.filter(a => a.agentId !== self.agentId).map(at);
     // Someone else's words: quoted, so they can't pass for another line, and with no local path the gateway would load.
     const quote = body => defangLocalPaths(body).split('\n').map(l => `> ${l}`).join('\n');
     const lines = fresh.map(e => {
@@ -984,7 +1028,7 @@ export class TeamCoordinator {
       followup: `Other participants just replied (above). Reply only if you have something new to add or were asked something; otherwise reply with exactly ${PASS_TOKEN} and nothing else. Do not just agree or repeat what was said.`,
     }[mode];
     return [
-      `[Team chat] You are ${self.name}. Other agents here: ${others.join(', ') || 'none'}. Your reply is posted to the team chat as ${self.name}; address someone with @name.`,
+      `[Team chat] You are ${at(self)}. Other agents here: ${others.join(', ') || 'none'}. Your reply is posted to the team chat as ${self.name}; address an agent with its @handle.`,
       '',
       ...(earlier ? ['Earlier in this chat (before you joined):', '', earlier, ''] : []),
       'New messages since your last turn:',
@@ -1291,7 +1335,7 @@ export class TeamCoordinator {
       }
       entries.push({ id, ts, text: body, author });
     }
-    const agents = await this._named(room.members.map(m => m.agentId));
+    const agents = await this._roomAgents(room);
     const title = await this._roomRealTitle(room.roomKey);
     this._titles.set(room.roomKey, title);
     return {
@@ -1303,7 +1347,7 @@ export class TeamCoordinator {
         mentionOnly: this._mentionOnly(room),
         members: agents.map(a => {
           const remote = TeamCoordinator.isRemote(a.agentId);
-          return { agentId: a.agentId, ref: this._ref(a.agentId), name: remote ? a.name : `${a.name} · ${this.remote?.labelOf?.(self, this._hostName()) || this._hostName().split(/\s+/)[0]}`, ownerId: remote ? this.remote?.ownerOf?.(a.agentId) || null : self };
+          return { agentId: a.agentId, ref: this._ref(a.agentId), handle: a.handle, name: remote ? a.name : `${a.name} · ${this.remote?.labelOf?.(self, this._hostName()) || this._hostName().split(/\s+/)[0]}`, ownerId: remote ? this.remote?.ownerOf?.(a.agentId) || null : self };
         }),
         people: [{ personId: self, name: this._hostName(), host: true }, ...room.people.map(p => ({ personId: p.personId, name: p.name }))],
       },
@@ -1509,7 +1553,7 @@ export class TeamCoordinator {
       discuss: !!v.discuss,
       mentionOnly: !!v.mentionOnly,
       // Keyed by the room-wide ref (the host's `main` and this gateway's `main` are different agents).
-      agents: (v.members || []).map(m => ({ agentId: m.ref || m.agentId, workKey: null, remote: true, name: m.name, ownerName: null, available: !v.ended, mine: !!m.localAgentId })),
+      agents: (v.members || []).map(m => ({ agentId: m.ref || m.agentId, workKey: null, handle: m.handle || null, remote: true, name: m.name, ownerName: null, available: !v.ended, mine: !!m.localAgentId })),
       people: (v.people || []).map(p => ({ personId: p.personId, name: p.name, ...(p.host ? { host: true } : {}), ...(p.personId === me ? { me: true } : {}) })),
       replica: { hostName: v.name, hostId: v.gatewayId, ended: v.ended || null },
     };
@@ -1562,7 +1606,7 @@ export class TeamCoordinator {
       title,
       discuss: !!v.discuss,
       mentionOnly: !!v.mentionOnly,
-      members: (Array.isArray(v.members) ? v.members : []).slice(0, 50).map(m => ({ agentId: clean(m?.agentId, 200), ...(m?.ref ? { ref: clean(m.ref, 240) } : {}), name: clean(m?.name) || 'Agent', ownerId: clean(m?.ownerId, 100) || null })).filter(m => m.agentId),
+      members: (Array.isArray(v.members) ? v.members : []).slice(0, 50).map(m => ({ agentId: clean(m?.agentId, 200), ...(m?.ref ? { ref: clean(m.ref, 240) } : {}), name: clean(m?.name) || 'Agent', ...(m?.handle ? { handle: String(m.handle).toLowerCase().replace(/[^\w.-]/g, '').slice(0, 80) || null } : {}), ownerId: clean(m?.ownerId, 100) || null })).filter(m => m.agentId),
       people: (Array.isArray(v.people) ? v.people : []).slice(0, 50).map(x => ({ personId: clean(x?.personId, 100), name: clean(x?.name) || 'Someone', ...(x?.host ? { host: true } : {}) })).filter(x => x.personId),
     };
     await this._replicaOwnMembers(key, view, fromGw);
@@ -1695,7 +1739,7 @@ export class TeamCoordinator {
       if (!echo) await new Promise(r => setTimeout(r, 250));
     }
     // Everyone in the room by a name that can't clash: mine by their local id, the rest by their room-wide ref.
-    const all = (view.members || []).map(m => ({ agentId: m.localAgentId || m.ref || m.agentId, name: m.name }));
+    const all = (view.members || []).map(m => ({ agentId: m.localAgentId || m.ref || m.agentId, name: m.name, handle: m.handle || null }));
     const mention = parseMentions(text, all);
     const ownIds = own.map(m => m.localAgentId);
     let targets, mode;

@@ -44,7 +44,7 @@ function roomRow(r, members, people = []) {
     rounds: r.rounds || DISCUSS_ROUNDS,
     sourceKey: r.source_key || null,
     createdAt: r.created_at,
-    members: members.map(m => ({ agentId: m.agent_id, workKey: m.work_key || null, seenAt: m.seen_at || 0, history: m.history || 'all' })),
+    members: members.map(m => ({ agentId: m.agent_id, workKey: m.work_key || null, seenAt: m.seen_at || 0, history: m.history || 'all', handle: m.handle || null })),
     people: people.map(p => ({ personId: p.person_id, name: p.name, email: p.email || null, historyFrom: p.history_from || 0 })),
     ...(r.host_gateway_id ? { host: { gatewayId: r.host_gateway_id, roomId: r.host_room, name: r.host_name || 'Someone', ended: r.host_ended || null, ...JSON.parse(r.replica_json || '{}') } } : {}),
   };
@@ -64,6 +64,8 @@ export function createTeamStore(getGlobalDb) {
       if (!g.prepare('PRAGMA table_info(team_rooms)').all().some(c => c.name === 'rounds')) g.exec('ALTER TABLE team_rooms ADD COLUMN rounds INTEGER');
       const cols = t => new Set(g.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name));
       if (!cols('team_members').has('history')) g.exec('ALTER TABLE team_members ADD COLUMN history TEXT');
+      // The @handle the room gives the agent (team.js assignHandle): unique in the room, kept after it leaves.
+      if (!cols('team_members').has('handle')) g.exec('ALTER TABLE team_members ADD COLUMN handle TEXT');
       const rc = cols('team_rooms');
       for (const c of ['host_gateway_id', 'host_room', 'host_name', 'host_ended', 'replica_json']) if (!rc.has(c)) g.exec(`ALTER TABLE team_rooms ADD COLUMN ${c} TEXT`);
       if (!rc.has('mention_only')) g.exec('ALTER TABLE team_rooms ADD COLUMN mention_only INTEGER NOT NULL DEFAULT 0');
@@ -123,6 +125,15 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('INSERT INTO team_members (room_key, agent_id, work_key, seen_at, position, history) VALUES (?, ?, NULL, ?, ?, ?) ON CONFLICT(room_key, agent_id) DO UPDATE SET removed = 0, position = excluded.position WHERE removed = 1')
         .run(roomKey, agentId, seenAt, pos, history === 'now' ? 'now' : 'all');
       return true;
+    },
+
+    /** Every agent the room ever had, removed ones too, in join order: [{ agentId, handle }] (handles stay taken). */
+    handles(roomKey) {
+      return db().prepare('SELECT agent_id, handle FROM team_members WHERE room_key = ? ORDER BY position').all(roomKey).map(m => ({ agentId: m.agent_id, handle: m.handle || null }));
+    },
+
+    setHandle(roomKey, agentId, handle) {
+      db().prepare('UPDATE team_members SET handle = ? WHERE room_key = ? AND agent_id = ? AND handle IS NULL').run(handle, roomKey, agentId);
     },
 
     /** A person joins a room this gateway hosts (or comes back). historyFrom: oldest entry time they see. */

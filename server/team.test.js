@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Database } from './bootstrap/native.js';
 import { createTeamStore } from './store/team-store.js';
-import { TeamCoordinator, parseMentions, namedIn, splitLabel, entryId } from './team.js';
+import { TeamCoordinator, parseMentions, assignHandle, namedIn, splitLabel, entryId } from './team.js';
 import { SessionLens } from './session-lens.js';
 import { createChatAbort } from './util/chat-abort.js';
 
@@ -75,9 +75,23 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
   return { team, calls, room, settle, events, sessions, labels, restart, get current() { return team; } };
 }
 
+test('handles: the name, else with the owner\'s first name, else the whole owner name, else numbered; never all/everyone', () => {
+  const taken = new Set();
+  const give = (name, owner) => { const h = assignHandle(name, owner, taken); taken.add(h); return h; };
+  assert.equal(give('main', 'homiabot qa1'), 'main');
+  assert.equal(give('main · homiabot qa2', 'homiabot qa2'), 'main-homiabot', 'first word of the owner: still unique');
+  assert.equal(give('main · homiabot qa3', 'homiabot qa3'), 'main-homiabotqa3');
+  assert.equal(give('main · homiabot qa3', 'homiabot qa3'), 'main-homiabotqa3-2');
+  assert.equal(give('Jarvis · Kamil Gronowski', 'Kamil Gronowski'), 'jarvis');
+  assert.equal(give('Code Reviewer', 'Houman'), 'code-reviewer');
+  assert.equal(give('All', 'Houman'), 'all-houman', 'never @all');
+  assert.equal(assignHandle('★', '', new Set()), 'agent');
+});
+
 test('parsing helpers', () => {
-  const agents = [{ agentId: 'main', name: 'main' }, { agentId: 'atlas', name: 'Atlas' }, { agentId: 'dev', name: 'Dev Bot' }];
-  assert.deepEqual(parseMentions('hey @Atlas and @devbot.', agents), { agentIds: ['atlas', 'dev'] });
+  const agents = [{ agentId: 'main', name: 'main', handle: 'main' }, { agentId: 'atlas', name: 'Atlas', handle: 'atlas' }, { agentId: 'dev', name: 'Dev Bot', handle: 'dev-bot' }];
+  assert.deepEqual(parseMentions('hey @Atlas and @dev-bot.', agents), { agentIds: ['atlas', 'dev'] });
+  assert.deepEqual(parseMentions('@devbot or @Dev or @dev-bot-Houman', agents), { agentIds: [] }, 'the handle, exactly: no name forms');
   assert.deepEqual(parseMentions('mail me at x@atlas.com', agents), { agentIds: [] });
   assert.deepEqual(parseMentions('@all thoughts?', agents), { all: true });
   assert.deepEqual(parseMentions('no mention here', agents), { agentIds: [] });
@@ -482,13 +496,13 @@ test('shared (remote) agents: in the roster, turns over the peer link, streamed,
   const h = harness(agent => `${agent} local`, { remote });
   const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
   const room = h.team.room(roomKey);
-  assert.deepEqual(room.agents[1], { agentId: 'peer:sh1:jarvis', workKey: null, remote: true, name: 'Jarvis · Kamil', ownerName: 'Kamil', ownerId: null, available: true });
+  assert.deepEqual(room.agents[1], { agentId: 'peer:sh1:jarvis', workKey: null, handle: 'jarvis', remote: true, name: 'Jarvis · Kamil', ownerName: 'Kamil', ownerId: null, available: true });
 
   await h.team.send(roomKey, { text: '@all hi', userLabel: 'H' });
   await h.settle();
   assert.ok(h.room(roomKey).includes('[Jarvis · Kamil]\n\nremote hi'));
   assert.equal(calls[0].args.roomId, roomKey);
-  assert.match(calls[0].args.message, /You are Jarvis · Kamil/);
+  assert.match(calls[0].args.message, /You are @jarvis \(Jarvis, Kamil's agent\)\. Other agents here: @dev \(Dev, \w[^)]*'s agent\)\./);
   assert.ok(h.events.some(e => e.event === 'team-remote-delta' && e.text === 'rem'));
   assert.ok(h.events.some(e => e.event === 'team-remote-delta' && e.done));
   // no hidden working session is made for a remote agent
@@ -520,12 +534,12 @@ test('shared (remote) agents: in the roster, turns over the peer link, streamed,
   await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'peer:sh9:ghost'] }), /unknown agent/);
 });
 
-test('mentions of someone else\'s agent: @Jarvis-Kamil, or @Jarvis when unambiguous; exact names win', () => {
-  const agents = [{ agentId: 'dev', name: 'dev' }, { agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil' }, { agentId: 'peer:sh2:dev', name: 'dev · Owner' }];
-  assert.deepEqual(parseMentions('@Jarvis-Kamil hi', agents), { agentIds: ['peer:sh1:jarvis'] });
+test("mentions of someone else's agent: one handle each; a name form that isn't the handle reaches nobody", () => {
+  const agents = [{ agentId: 'dev', name: 'dev', handle: 'dev' }, { agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', handle: 'jarvis' }, { agentId: 'peer:sh2:dev', name: 'dev · Owner', handle: 'dev-owner' }];
   assert.deepEqual(parseMentions('@jarvis hi', agents), { agentIds: ['peer:sh1:jarvis'] });
-  assert.deepEqual(parseMentions('@dev hi', agents), { agentIds: ['dev'] }); // the local one, exactly named
+  assert.deepEqual(parseMentions('@dev hi', agents), { agentIds: ['dev'] });
   assert.deepEqual(parseMentions('@dev-Owner hi', agents), { agentIds: ['peer:sh2:dev'] });
+  assert.deepEqual(parseMentions('@Jarvis-Kamil hi', agents), { agentIds: [] });
 });
 
 test("a shared agent's reply is quoted in local prompts, so it can't pass for the user's line", () => {
@@ -599,7 +613,7 @@ test("authority comes from who asked: an agent answering someone else's agent ru
   assert.equal(devSends(), 1);
 
   // Kamil's agent asks dev: dev runs for Kamil (sharing's localTurnFor), never as itself.
-  await h.team.send(roomKey, { text: '@Jarvis-Kamil seen this crash?', userLabel: 'H' });
+  await h.team.send(roomKey, { text: '@jarvis seen this crash?', userLabel: 'H' });
   await h.settle();
   assert.equal(devSends(), 1, 'no full-strength run for a request from someone else\'s agent');
   assert.equal(forCalls.length, 1);
@@ -612,7 +626,7 @@ test("authority comes from who asked: an agent answering someone else's agent ru
 
   // Not shared with Kamil: dev stays out, and says so because Jarvis asked it by name.
   shared = false;
-  await h.team.send(roomKey, { text: '@Jarvis-Kamil again?', userLabel: 'H' });
+  await h.team.send(roomKey, { text: '@jarvis again?', userLabel: 'H' });
   await h.settle();
   assert.equal(devSends(), 1);
   assert.match(h.room(roomKey).at(-1), /^\[Dev\]\n\n\*Dev isn't shared with Kamil, so it doesn't answer Kamil's agents\.\*$/);
@@ -639,7 +653,7 @@ test("one agent, two sessions (its own, and the guest one for someone else's age
   await h.team.send(roomKey, { text: '@dev hi', userLabel: 'Houman' });
   await h.settle();
   // Jarvis asks dev: dev answers in its guest session, acting for Kamil.
-  await h.team.send(roomKey, { text: '@Jarvis-Kamil ask dev about the deploy loop', userLabel: 'Houman' });
+  await h.team.send(roomKey, { text: '@jarvis ask dev about the deploy loop', userLabel: 'Houman' });
   await h.settle();
   assert.equal(forPrompts.length, 1);
   assert.match(forPrompts[0], /\[Jarvis · Kamil\][^\n]*\n> @dev walk me through your deploy loop/);
@@ -655,7 +669,7 @@ test("one agent, two sessions (its own, and the guest one for someone else's age
   assert.ok(!/\[Dev \(you[^\]]*\)\]: hi/.test(own), 'what it said in the same session is not repeated');
 
   // Jarvis asks again: the guest session now gets the owner's go-ahead, marked as its own words.
-  await h.team.send(roomKey, { text: '@Jarvis-Kamil ask dev again', userLabel: 'Houman' });
+  await h.team.send(roomKey, { text: '@jarvis ask dev again', userLabel: 'Houman' });
   await h.settle();
   const guest = forPrompts.at(-1);
   assert.match(guest, /\[Houman\]: @dev proceed/);
@@ -757,12 +771,12 @@ test('people: a person gets a live copy, posts back, their own agent runs on the
 
   // Kamil asks his own Jarvis: it runs at full strength on Kamil's gateway; Houman's never runs it.
   const kSends = () => K.calls.filter(c => c.method === 'chat.send').map(c => c.params.sessionKey);
-  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil check yours' });
+  await K.team.send(copy.roomKey, { text: '@jarvis check yours' });
   await settle();
   assert.ok(kSends().some(k => k.startsWith('agent:jarvis:')), 'the real Jarvis ran on Kamil\'s gateway');
   assert.ok(!kSends().some(k => k.startsWith('agent:jarvis-guest:')));
   const hostRoom = H.room(roomKey);
-  assert.ok(hostRoom.includes('[Kamil]\n\n@Jarvis-Kamil check yours'), 'Kamil\'s message is in the host room under his name');
+  assert.ok(hostRoom.includes('[Kamil]\n\n@jarvis check yours'), 'Kamil\'s message is in the host room under his name');
   assert.ok(hostRoom.includes('[Jarvis · Kamil]\n\njarvis full on kamil'), 'Jarvis\'s reply reached the host room');
   const hAuthors = H.team.room(roomKey).authors;
   assert.ok(Object.values(hAuthors).some(a => a.type === 'person' && a.personId === 'gwK' && a.name === 'Kamil'));
@@ -910,37 +924,39 @@ test("someone's agent answering on its owner's copy and through the host: each s
   const copy = K.team.rooms().find(r => r.replica);
 
   // Kamil asks his own Jarvis on his copy: it answers in Kamil's own session.
-  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil here are four questions' });
+  await K.team.send(copy.roomKey, { text: '@jarvis here are four questions' });
   await settle();
   assert.ok(H.room(roomKey).includes('[Jarvis · Kamil]\n\njarvis full on kamil'));
 
   // Houman asks Jarvis: the session Kamil's gateway runs for Houman is told what Jarvis said in the other.
-  await H.team.send(roomKey, { text: '@Jarvis-Kamil did you send those questions?', userLabel: 'Houman' });
+  await H.team.send(roomKey, { text: '@jarvis did you send those questions?', userLabel: 'Houman' });
   await settle();
   const asked = hostAsks.at(-1);
-  assert.match(asked, /\[Kamil\]: @Jarvis-Kamil here are four questions/, 'it sees Kamil\'s ask too');
+  assert.match(asked, /\[Kamil\]: @jarvis here are four questions/, 'it sees Kamil\'s ask too');
   assert.match(asked, /\[Jarvis · Kamil \(you, for your owner\)\]: jarvis full on kamil/);
 
   // Back on Kamil's copy, his Jarvis is told what it said through the host, marked as its own.
   const kPrompts = () => K.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:jarvis:')).map(c => c.params.message);
-  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil and now?' });
+  await K.team.send(copy.roomKey, { text: '@jarvis and now?' });
   await settle();
   const own = kPrompts().at(-1);
   assert.match(own, /\(you, in another session\)\]: guest jarvis here/);
   assert.ok(!/jarvis full on kamil/.test(own), 'what it said in this session is not repeated');
 });
 
-test("people can ask the host's agent by the name their copy shows: @dev-HoumanSatarian, @dev-Houman, @dev", async () => {
+test("people ask the host's agent by the handle their copy shows (the host's, one per agent); other name forms reach nobody", async () => {
   const { H, K, settle, forCalls } = twoGateways();
   const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'atlas'] });
   await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
   await settle();
   const copy = K.team.rooms().find(r => r.replica);
-  for (const name of ['dev-HoumanSatarian', 'dev-Houman', 'dev']) {
+  assert.deepEqual(copy.agents.map(a => a.handle).sort(), ['atlas', 'dev'], 'the copy gets the host\'s handles');
+  assert.deepEqual(H.team.room(roomKey).agents.map(a => a.handle).sort(), ['atlas', 'dev']);
+  for (const [name, reached] of [['dev', ['dev']], ['dev-Houman', []], ['dev-HoumanSatarian', []]]) {
     const before = forCalls.length;
     await K.team.send(copy.roomKey, { text: `@${name} ping` });
     await settle();
-    assert.deepEqual(forCalls.slice(before).map(c => c.localId), ['dev'], `@${name} reaches dev, and only dev`);
+    assert.deepEqual(forCalls.slice(before).map(c => c.localId), reached, `@${name}`);
   }
 });
 
@@ -1008,7 +1024,7 @@ test("a remote agent waiting for its owner's approval: the room says so (who, wh
   };
   const h = harness(() => 'ok', { remote });
   const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
-  const sent = h.team.send(roomKey, { text: '@Jarvis-Kamil run the tests', userLabel: 'Houman' });
+  const sent = h.team.send(roomKey, { text: '@jarvis run the tests', userLabel: 'Houman' });
   for (let i = 0; i < 100 && !release; i++) await new Promise(r => setTimeout(r, 10));
   assert.deepEqual(seen, { 'peer:sh1:jarvis': { owner: 'Kamil', what: 'a command', expiresAtMs: 99 } });
   const ev = h.events.filter(e => e.event === 'team-remote-status');
@@ -1062,7 +1078,7 @@ test('a copy shows entries at the time they were sent, and host and guest agents
   assert.ok(hostMain, 'Houman\'s main is recorded under its owner');
   assert.notEqual(hostMain[1].agentId, 'main');
   // Kamil asks his Jarvis: it is told about Houman\'s main reply (not filtered out as its own).
-  await K.team.send(copy.roomKey, { text: '@Jarvis-Kamil what did main say?' });
+  await K.team.send(copy.roomKey, { text: '@jarvis what did main say?' });
   await settle();
   const prompt = K.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:jarvis:')).at(-1).params.message;
   assert.match(prompt, /main/);
@@ -1241,7 +1257,7 @@ test("someone else's request named alongside the owner's agent's: the lower auth
   };
   const h = harness(agent => (agent === 'atlas' ? '@dev can you check?' : `${agent} ok`), { remote });
   const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas', 'peer:sh1:jarvis'] });
-  await h.team.send(roomKey, { text: '@atlas @Jarvis-Kamil look at the logs', userLabel: 'Houman' });
+  await h.team.send(roomKey, { text: '@atlas @jarvis look at the logs', userLabel: 'Houman' });
   await h.settle();
   const devFull = h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:dev:'));
   assert.equal(devFull.length, 0, 'dev never runs at full strength on a round Kamil\'s agent asked for');
@@ -1437,4 +1453,40 @@ test('reactions in a shared room: a person reacts from their copy under their ow
   await settle();
   assert.deepEqual(K.team.room(copy.roomKey).reactions, {});
   assert.deepEqual(H.team.room(roomKey).reactions, {});
+});
+
+test("two owners' agents both named main: each gets its own handle, and @main-homiabot reaches only the one it names", async () => {
+  const sent = [];
+  const remote = {
+    selfName: () => 'homiabot qa1',
+    remoteAgents: () => [{ agentId: 'peer:sh1:main', name: 'main · homiabot qa2', ownerName: 'homiabot qa2' }],
+    turn: async (agentId) => { sent.push(agentId); return { state: 'final', text: 'remote hi' }; },
+    abort: async () => {},
+  };
+  const h = harness(agent => { sent.push(agent); return `${agent} hi`; }, { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['main', 'peer:sh1:main', 'dev'] });
+  h.team.setMentionOnly(roomKey, true);
+  assert.deepEqual(h.team.room(roomKey).agents.map(a => a.handle), ['main', 'main-homiabot', 'dev']);
+  await h.team.send(roomKey, { text: '@main-homiabot what version?', userLabel: 'homiabot qa1' });
+  await h.settle();
+  assert.deepEqual(sent, ['peer:sh1:main'], 'only the agent the handle names');
+  sent.length = 0;
+  await h.team.send(roomKey, { text: '@main and you?', userLabel: 'homiabot qa1' });
+  await h.settle();
+  assert.deepEqual(sent, ['main']);
+
+  // Handles never change hands: an agent that leaves keeps its handle taken, and gets it back when it returns.
+  await h.team.removeAgent(roomKey, 'main');
+  assert.deepEqual(h.team.room(roomKey).agents.map(a => a.handle), ['main-homiabot', 'dev']);
+  await h.team.addAgent(roomKey, 'main');
+  assert.deepEqual(h.team.room(roomKey).agents.map(a => [a.agentId, a.handle]), [['peer:sh1:main', 'main-homiabot'], ['dev', 'dev'], ['main', 'main']]);
+});
+
+test('rooms from before handles get them on the next connect, in join order', async () => {
+  const h = harness(agent => `${agent} hi`);
+  // What an older connector left behind: a room with no handles.
+  h.team.store.createRoom('agent:dev:dashboard:old', [{ agentId: 'dev' }, { agentId: 'atlas' }]);
+  assert.deepEqual(h.team.room('agent:dev:dashboard:old').agents.map(a => a.handle), [null, null]);
+  await h.team.refreshNames();
+  assert.deepEqual(h.team.room('agent:dev:dashboard:old').agents.map(a => a.handle), ['dev', 'atlas']);
 });

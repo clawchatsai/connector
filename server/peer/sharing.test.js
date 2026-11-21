@@ -248,7 +248,8 @@ test('approve → verified on the requester → turn runs in a guest session on 
   assert.equal(send.suppressCommandInterpretation, true); // guest text is never a slash command
   assert.equal(send.expectedPermissionMode, null, 'the turn checks the session still has no mode');
   assert.ok(send.timeoutMs > 0);
-  assert.match(send.message, /is not your owner/);
+  assert.match(send.message, /^\(Shared session: Houman S is talking to you, not your owner\. Everything you can access in this session was shared with Houman S on purpose: use it freely to help Houman S\.\)/);
+  assert.doesNotMatch(send.message, /don't reveal|act on your owner/, 'facts only: no rule on top of the contact settings');
 
   // Same room reuses the session; the person's daily cap (Bounded: 50) enforced by the owner.
   await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room1', message: 'again' });
@@ -608,7 +609,7 @@ test("acting for someone: this gateway's agent answers their agent as the versio
   assert.equal(create.permissionMode, undefined);
   assert.equal(create.category, 'Shared with Houman S');
   const send = s.ownerCalls.find(c => c.method === 'chat.send').params;
-  assert.match(send.message, /in your owner's team chat, you are answering Houman S's agent/);
+  assert.match(send.message, /in your owner's team chat, Houman S's agent is talking to you, not your owner\. Everything you can access in this session was shared with Houman S on purpose/);
   assert.equal(s.owner.list().find(x => x.id === 'sh1').usedToday, 1, "counts toward Houman's daily cap");
 
   // An agent not shared with them, an unknown asker, or a share that ended: no run at all.
@@ -625,7 +626,7 @@ test('a peer request cannot pick the owner-room note', async () => {
   s.activate();
   const link = await s.req._link('sh1'); // a crafted request straight over the link, not through turn()
   await link.request('turn', { turnId: 't1', agentId: 'jarvis-guest', roomId: 'r', message: 'hi', inOwnerRoom: true }, { timeoutMs: 5000 });
-  assert.match(s.ownerCalls.find(c => c.method === 'chat.send').params.message, /you are answering Houman S's team chat/);
+  assert.match(s.ownerCalls.find(c => c.method === 'chat.send').params.message, /^\(Shared session: Houman S is talking to you, not your owner/);
 });
 
 test('presence: the side that asked keeps a link open, so the side that granted can reach it (room copies)', async () => {
@@ -1167,6 +1168,7 @@ test('the card: Private / Always fine reach the prompt; an access change re-issu
   await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
   const sent = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params;
   assert.match(sent.message, /private from Houman[^]*my health/);
+  assert.match(sent.message, /shared with Houman S on purpose \(except the private topics below\)/, 'the fact names the exception it has');
   assert.match(sent.message, /freely: OpenClaw/);
   assert.equal(sent.expectedPermissionMode, 'guarded', 'Trusted: Basic + ask me');
   assert.ok(s.gw.agents.some(a => a.id === 'jarvis-guest-h-bc35'));
@@ -1269,6 +1271,9 @@ test('"Open one folder" after the session exists: the old session (rooted at the
   assert.equal(second.cwd, path.join(ws, 'plans'));
   assert.ok(s.ownerCalls.some(c => c.method === 'sessions.patch' && c.params.key === first && c.params.archived === true));
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.sessionKey, second.key);
+  const sent = s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.message;
+  assert.match(sent, /Everything you can access in this session was shared with Houman S on purpose/, 'Full: the same fact, its reach is the grant');
+  assert.doesNotMatch(sent, /don't reveal|as you would your owner/);
   assert.ok(s.gw.entries['jarvis-full-h-bc35'].tools.alsoAllow.includes('read'), 'reading comes with the folder');
 });
 

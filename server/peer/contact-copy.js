@@ -14,12 +14,6 @@ const isValidation = e => /invalid|unexpected property|must not have additional|
 
 export const copyIdFor = (agentId, personKey, kind) => `${agentId}-${kind}-${copySlug(personKey)}`;
 
-/** A small model for Auto-review (one call per command): Haiku when the gateway has Anthropic models, else the agent's own. */
-export function reviewerModelFor(cfg) {
-  const refs = JSON.stringify([cfg?.agents?.defaults?.model, cfg?.agents?.defaults?.models, cfg?.agents?.entries && Object.values(cfg.agents.entries).map(a => a?.model)]);
-  return /"anthropic\//.test(refs) ? 'anthropic/claude-haiku-4-5' : null;
-}
-
 /**
  * Create or update one person's copy of one agent. Returns { copyId, created, changed }.
  * @param {object} o
@@ -35,8 +29,7 @@ export async function ensureContactCopy({ request, contact, agentId, firstName, 
   const src = agents.find(a => a.id === agentId);
   if (!src) throw new Error(`unknown agent: ${agentId}`);
   let cfg = await request('config.get', {}, 30_000);
-  const reviewerModel = reviewerModelFor(cfg?.parsed);
-  const tools = copyTools(contact, { reviewerModel });
+  const tools = copyTools(contact);
   const approvals = approvalsEntry(contact);
   const hash = policyHash({ tools, approvals, kind });
 

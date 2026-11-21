@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { defaultContact, copyTools, copyToolsHold, effectiveTools, sessionMode, approvalsEntry, validateBasicEntry, basicList, gitEntries, toolOverrides, topicsNote, ALWAYS_OFF, copySlug } from './contact-policy.js';
+import { defaultContact, copyTools, copyToolsHold, effectiveTools, sessionMode, approvalsEntry, validateBasicEntry, basicList, gitEntries, toolOverrides, topicsNote, ALWAYS_OFF, copySlug, commandsSetting } from './contact-policy.js';
 
 test('tier defaults: Restricted = Basic only, Trusted = Basic + ask me, Full = Basic + ask me; autonomy Bounded; default skills', () => {
   assert.deepEqual([defaultContact('restricted').commands, defaultContact('trusted').commands, defaultContact('full').commands], ['basic', 'ask', 'ask']);
@@ -44,12 +44,12 @@ test('Full agent: memory read-only (no write tools ever), no file tools unless o
 
 test('Commands tiers: session mode and copy exec mode (Basic only runs with no session mode, spike run 2)', () => {
   const at = commands => ({ ...defaultContact('trusted'), commands });
-  assert.deepEqual(['off', 'basic', 'ask', 'auto'].map(c => sessionMode(at(c))), [null, null, 'guarded', 'workspace']);
-  assert.deepEqual(['off', 'basic', 'ask', 'auto'].map(c => copyTools(at(c)).exec.mode), ['deny', 'allowlist', 'ask', 'auto']);
+  assert.deepEqual(['off', 'basic', 'ask'].map(c => sessionMode(at(c))), [null, null, 'guarded']);
+  assert.deepEqual(['off', 'basic', 'ask'].map(c => copyTools(at(c)).exec.mode), ['deny', 'allowlist', 'ask']);
   const off = copyTools(at('off'));
   assert.ok(off.deny.includes('exec') && !off.alsoAllow.includes('exec'));
-  assert.deepEqual(copyTools(at('auto'), { reviewerModel: 'anthropic/claude-haiku-4-5' }).exec.reviewer, { model: 'anthropic/claude-haiku-4-5' });
-  assert.equal(copyTools(at('ask'), { reviewerModel: 'x' }).exec.reviewer, undefined);
+  assert.equal(copyTools(at('ask')).exec.reviewer, undefined, 'no AI reviewer for contacts');
+  assert.equal(commandsSetting('auto'), 'ask', 'a stored Auto-review reads as Ask');
   assert.deepEqual(approvalsEntry(at('basic')).ask, 'off');
   assert.deepEqual(approvalsEntry(at('ask')).ask, 'on-miss');
   assert.equal(approvalsEntry(at('off')).security, 'deny');

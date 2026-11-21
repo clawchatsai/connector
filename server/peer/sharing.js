@@ -21,7 +21,7 @@ import { createChatAbort } from '../util/chat-abort.js';
 import { ensureGuestRestrictions, findGuestAgent, isGuestAgent } from './guest-agent.js';
 import { ContactBook, personKeyOf } from './contacts.js';
 import { AUTONOMY, ACCESS, sessionMode, toolOverrides as contactOverrides, topicsNote, copyTools, copyToolsHold, copyKind, defaultContact, TOOL_GROUPS, ALWAYS_OFF, BASIC_DEFAULTS, DEFAULT_TOOLS, DEFAULT_COMMANDS } from './contact-policy.js';
-import { ensureContactCopy, retireCopy, reviewerModelFor } from './contact-copy.js';
+import { ensureContactCopy, retireCopy } from './contact-copy.js';
 import { noteCandidates, resolvePicks, picksSignature, syncNotes, removeNotes, NOTES_DIR } from './notes-sync.js';
 import { peerOutdated, outdatedMessage, connectorVersion } from './version.js';
 import { promptIndex, replyAfter } from '../util/turn-reply.js';
@@ -65,12 +65,16 @@ export const defangLocalPaths = text => String(text ?? '')
   .replace(/file:\/\//gi, 'file:\u200b//')
   .replace(/\bMEDIA:/gi, m => `${m.slice(0, -1)}\u200b:`)
   .replace(/(^|[\s"'`(\]])(?=(?:\.\.?[\\/]|[~/\\]|[A-Za-z]:[\\/])[^\s"'`()[\]]*\.[A-Za-z0-9])/g, '$1\u200b');
-const GUEST_NOTE = name => `(Shared session: you are answering ${name}'s team chat on behalf of your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
+// Facts only, never rules (Houman, 2026-11-21): who is talking, and that what this session can reach was shared with
+// them on purpose. What they may see or do is the contact's settings (copy, tools, folder, Commands, Knowledge),
+// enforced in config; a "don't reveal" rule here overrode those settings, and models re-judge any rule against them.
+const SHARED_FACT = (name, topics) => `Everything you can access in this session was shared with ${name} on purpose${topics ? ' (except the private topics below)' : ''}: use it freely to help ${name}.`;
+const GUEST_NOTE = (name, topics) => `(Shared session: ${name} is talking to you, not your owner. ${SHARED_FACT(name, topics)})`;
 const files0 = notes => (notes ? [...notes.candidates.filter(x => x.on).map(x => x.path), ...notes.repoDocs.map(x => x.path)] : null);
 // A copy with picked notes (Knowledge "My notes"): where they are.
-const NOTES_NOTE = name => `(Your owner chose to share the notes in the ${NOTES_DIR}/ folder of your workspace with ${name}: read them and use them freely to answer. Anything that isn't in them stays private.)`;
+const NOTES_NOTE = name => `(Your owner chose to share the notes in the ${NOTES_DIR}/ folder of your workspace with ${name}: read them and use them freely to answer.)`;
 // The same agent in its owner's own team chat, answering another person's agent (localTurnFor).
-const ACTING_FOR_NOTE = (name, byPerson) => `(Shared session: in your owner's team chat, you are answering ${byPerson ? name : `${name}'s agent`}, so you act for ${name}, not for your owner. ${name} is not your owner — don't reveal your owner's private information or act on your owner's accounts for them.)`;
+const ACTING_FOR_NOTE = (name, byPerson, topics) => `(Shared session: in your owner's team chat, ${byPerson ? name : `${name}'s agent`} is talking to you, not your owner. ${SHARED_FACT(name, topics)})`;
 
 /** A guest turn's emit with secrets redacted from streamed text (see _guestTurn). */
 const redacting = emit => emit && ((event, data) => emit(event, event === 'delta' ? redactSecrets(data) : data));
@@ -769,7 +773,7 @@ export class SharingManager {
     // gateway's own CLI uses: configRevisionHash vs appliedConfigHash; missing hashes count as applied).
     const applied = !cfg?.configRevisionHash || !cfg?.appliedConfigHash || cfg.configRevisionHash === cfg.appliedConfigHash;
     if (applied) this._pendingCopies?.delete(copyId);
-    if (!copyToolsHold(cfg?.parsed?.agents?.entries?.[copyId]?.tools, copyTools(contact, { reviewerModel: reviewerModelFor(cfg?.parsed) }))
+    if (!copyToolsHold(cfg?.parsed?.agents?.entries?.[copyId]?.tools, copyTools(contact))
       || this._pendingCopies?.has(copyId)) {
       this.log.warn?.(`[sharing] ${copyId} doesn't hold its contact policy: refusing turn for ${shareId}`);
       throw Object.assign(new Error(`${agent.name} isn't available right now`), { code: 'unavailable' });
@@ -790,7 +794,7 @@ export class SharingManager {
     // Commands that may ask the owner ("Basic + ask me", or Auto-review's unsure cases): the approval connection stays up
     // for this turn, so the gateway keeps the approval pending until the owner answers (no tab open needed), and the
     // turn may run as long as that approval can wait.
-    const asks = contact.commands === 'ask' || contact.commands === 'auto';
+    const asks = contact.commands === 'ask';
     const turnTimeout = asks ? APPROVAL_TURN_TIMEOUT_MS : TURN_TIMEOUT_MS;
     const releaseApprovals = asks && this.holdApprovals ? await this.holdApprovals().catch(() => null) : null;
     const done = new Promise(resolve => {
@@ -806,7 +810,8 @@ export class SharingManager {
       // transcript decides, not the ack. 2026.9.7 forgets its chat.send dedupe on a gateway restart and would start a
       // run with no new input (a reply to nothing). Only this connector reloaded, so its run is still going: the send
       // below is answered "in_flight" and the run's events finish the turn.
-      const notes = [p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson) : GUEST_NOTE(name), contact.access !== 'full' && contact.knowledge === 'notes' ? NOTES_NOTE(name) : '', topicsNote(contact, name.split(/\s/)[0])].filter(Boolean);
+      const priv = !!String(contact.private || '').trim();
+      const notes = [p.inOwnerRoom ? ACTING_FOR_NOTE(name, p.byPerson, priv) : GUEST_NOTE(name, priv), contact.access !== 'full' && contact.knowledge === 'notes' ? NOTES_NOTE(name) : '', topicsNote(contact, name.split(/\s/)[0])].filter(Boolean);
       const sent = defangLocalPaths(`${notes.join('\n')}\n\n${p.message}`);
       if (turn.clientTurnId) {
         const earlier = await this._replyTo(sessionKey, runId);
@@ -1026,7 +1031,6 @@ export class SharingManager {
       skills: skillNames.map(n => { const i = skillInfo.find(x => (x?.name || x?.skillKey) === n); return { name: n, description: String(i?.description || '').slice(0, 160) }; }),
       mcpServers: Object.keys(cfg?.parsed?.mcp?.servers || {}).sort().map(n => ({ name: n, enabled: cfg.parsed.mcp.servers[n]?.enabled !== false })),
       notes, copies: this.book.copies(person), sessions: this._guestSessionKeysOf(person),
-      reviewerModel: reviewerModelFor(cfg?.parsed),
       // What the card draws its controls from (one source with the policy the copies get).
       catalog: { toolGroups: TOOL_GROUPS, alwaysOff: ALWAYS_OFF, basicDefaults: BASIC_DEFAULTS, defaultTools: DEFAULT_TOOLS, defaultCommands: DEFAULT_COMMANDS, autonomy: AUTONOMY, draft: c ? null : { ...view, notes: files0(notes) } },
     };

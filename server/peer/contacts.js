@@ -3,7 +3,7 @@
 // and every share with any of them uses the same settings. Local only: none of it goes into the signed grant except
 // access and autonomy.
 
-import { ACCESS, AUTONOMY, COMMANDS, KNOWLEDGE, defaultContact, DEFAULT_TOOLS, DEFAULT_COMMANDS, validateBasicEntry } from './contact-policy.js';
+import { ACCESS, AUTONOMY, COMMANDS, commandsSetting, KNOWLEDGE, defaultContact, DEFAULT_TOOLS, DEFAULT_COMMANDS, validateBasicEntry } from './contact-policy.js';
 
 const JSON_FIELDS = ['notes', 'repos', 'agents', 'tools', 'basicList', 'skills', 'mcp', 'mcpToolsDeny'];
 const COLUMNS = { basicList: 'basic_list', alwaysFine: 'always_fine', openFolder: 'open_folder', mcpToolsDeny: 'mcp_tools_deny', private: 'private_text' };
@@ -33,7 +33,7 @@ export class ContactBook {
 
   _row(r) {
     if (!r) return null;
-    const c = { personKey: r.person_key, name: r.name, access: r.access, autonomy: r.autonomy, knowledge: r.knowledge, commands: r.commands,
+    const c = { personKey: r.person_key, name: r.name, access: r.access, autonomy: r.autonomy, knowledge: r.knowledge, commands: commandsSetting(r.commands),
       private: r.private_text || '', alwaysFine: r.always_fine || '', openFolder: r.open_folder || null, fullConfirmedAt: r.full_confirmed_at || null,
       migrated: !!r.migrated, notesSync: r.notes_sync ? JSON.parse(r.notes_sync) : null, updatedAt: r.updated_at };
     for (const f of JSON_FIELDS) { try { c[f] = r[col(f)] == null ? null : JSON.parse(r[col(f)]); } catch { c[f] = null; } }
@@ -77,8 +77,9 @@ export class ContactBook {
       case 'autonomy': if (!AUTONOMY[value]) throw new Error('Unknown autonomy'); patch.autonomy = value; break;
       case 'knowledge': if (!KNOWLEDGE.includes(value)) throw new Error('Unknown knowledge setting'); patch.knowledge = value; break;
       case 'commands':
+        value = commandsSetting(value); // a card from before Auto-review was dropped
         if (!COMMANDS.includes(value)) throw new Error('Unknown commands setting');
-        if (c.openFolder && (value === 'off' || value === 'basic')) throw new Error('"Open one folder" needs Commands set to "ask me" or "auto-review"');
+        if (c.openFolder && (value === 'off' || value === 'basic')) throw new Error('"Open one folder" needs Commands set to "ask me"');
         patch.commands = value; break;
       case 'tools': patch.tools = strings(value, 40); break;
       case 'skills': patch.skills = strings(value, 500); break;
@@ -98,7 +99,7 @@ export class ContactBook {
       case 'alwaysFine': patch.alwaysFine = String(value || '').slice(0, 2000); break;
       case 'openFolder':
         if (value && c.access !== 'full') throw new Error('"Open one folder" is for Full agent');
-        if (value && (c.commands === 'off' || c.commands === 'basic')) throw new Error('"Open one folder" needs Commands set to "ask me" or "auto-review"');
+        if (value && (c.commands === 'off' || c.commands === 'basic')) throw new Error('"Open one folder" needs Commands set to "ask me"');
         patch.openFolder = value ? String(value) : null; break;
       case 'name': patch.name = String(value || '').slice(0, 80) || null; break;
       case 'migrated': patch.migrated = value ? 1 : 0; break;
