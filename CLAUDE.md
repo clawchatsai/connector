@@ -1,6 +1,6 @@
 # connector — OpenClaw plugin
 
-> Read `~/repos/CLAUDE.md` first: it holds the rules shared by clawchats and connector (one worktree per chat, never edit the main checkouts, pull before reading).
+> Coding rules for every repo: `~/.openclaw/workspace/memory/dev/coding-rules.md`. Read `~/repos/CLAUDE.md` first: it holds the rules shared by clawchats and connector (one worktree per chat, never edit the main checkouts, pull before reading).
 
 `@clawchatsai/connector`. Runs on the user's machine alongside the OpenClaw gateway. Bridges the ClawChats browser UI to the local gateway via a WebRTC P2P DataChannel after a handshake through `login.clawchats.ai`. See `README.md` for the full architecture diagram and install flow.
 
