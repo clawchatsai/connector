@@ -24,7 +24,7 @@ const idOf = m => entryMeta(m)?.meta.id ?? null;
 
 // Bump when what a chat's documents are made of changes (text.js rules, delta handling): every chat
 // indexed by an older connector is then read again whole.
-export const INDEXER_VERSION = 2;
+export const INDEXER_VERSION = 3; // 3: text from other chats is role 'chat', without its envelope
 const RECONCILE_MS = 10 * 60 * 1000;
 const QUIET_MS = 3000;          // a chat syncs this long after its last change...
 const MAX_WAIT_MS = 20_000;     // ...but no later than this after the first one

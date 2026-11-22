@@ -287,7 +287,7 @@ export class SearchStore {
    * a query of only tags lists those chats, latest first.
    * @param {object} o
    * @param {string} o.q
-   * @param {'user'|'assistant'|null} [o.role]  only documents by this author (title, tag and summary matches still count)
+   * @param {'user'|'assistant'|null} [o.role]  only documents by this author ('chat': another chat or an automation) (title, tag and summary matches still count)
    * @param {boolean} [o.archived=true]  include archived chats
    * @param {number} [o.limit=50]  chats
    * @param {number} [o.perChat=3]  snippets per chat
