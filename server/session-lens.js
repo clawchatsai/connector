@@ -159,6 +159,7 @@ export class SessionLens {
     this.log = logger;
     this.hidden = new Set(); // candidate-shaped keys a row revealed as not a user chat
     this.parents = new Map(); // child key -> parent key (nested children; visible when the chain reaches a chat)
+    this.categories = new Map(); // key -> project (session group) from its rows: project instructions find a chat's project
     this.pending = new Map(); // browser req id -> { method, params }
     // Chats a browser opened with sessions.messages.subscribe (Control UI: one per selected
     // chat). session.message is forwarded only for these. subscriptionId -> session key.
@@ -186,6 +187,10 @@ export class SessionLens {
   observe(key, row) {
     if (this.onboarding.has(key)) return true;
     if (!isChildCandidateKey(key)) return false;
+    if (row && typeof row === 'object' && 'category' in row) {
+      if (typeof row.category === 'string' && row.category) this.categories.set(key, row.category);
+      else this.categories.delete(key);
+    }
     if (this.onRow) { try { this.onRow(key, row); } catch (e) { this.log.warn?.(`[lens] row observer: ${e.message}`); } }
     const verdict = SUBAGENT_KEY.test(key) ? true : rowVerdict(row);
     if (verdict === true) {
@@ -223,6 +228,29 @@ export class SessionLens {
       if (!cur || cur === key) return null;
     }
     return null;
+  }
+
+  /** The project (session group) the lens last saw on this session's rows, or null. */
+  categoryOf(key) { return this.categories.get(key) || null; }
+
+  /**
+   * The chat a session belongs to: itself when it's a top-level chat or a team chat working session, else the first
+   * such ancestor up its parent chain (spawned children at any depth). null when the chain never reaches one.
+   */
+  rootOf(key) {
+    let cur = key;
+    for (let depth = 0; depth <= MAX_CHILD_DEPTH && cur; depth++) {
+      if (this._isTopLevel(cur) || this.team?.isWorkKey(cur)) return cur;
+      cur = this.parents.get(cur);
+      if (cur === key) return null;
+    }
+    return null;
+  }
+
+  /** A group was renamed (to) or deleted (null): its chats' rows may not all be re-sent. */
+  _recategorize(from, to) {
+    if (!from) return;
+    for (const [k, c] of this.categories) if (c === from) { if (to) this.categories.set(k, to); else this.categories.delete(k); }
   }
 
   /** Row/event fields plus the resolved parent link of a nested child. */
@@ -371,10 +399,12 @@ export class SessionLens {
       case 'sessions.groups.rename':
         try { this.extras?.renameProjectStyle(req.params?.name, req.params?.to); }
         catch (e) { this.log.warn?.(`[lens] style rename: ${e.message}`); }
+        this._recategorize(req.params?.name, req.params?.to || null);
         return msg;
       case 'sessions.groups.delete':
         try { this.extras?.deleteProjectStyle(req.params?.name); }
         catch (e) { this.log.warn?.(`[lens] style delete: ${e.message}`); }
+        this._recategorize(req.params?.name, null);
         return msg;
       case 'agents.create':
         this.addOnboardingChat(p.onboarding?.sessionKey);

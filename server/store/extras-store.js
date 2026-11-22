@@ -1,7 +1,7 @@
 // ExtrasStore: ClawChats-only data the gateway has no place for. Lives in the global DB.
 // Registry of what belongs here: EXTRAS.md at the repo root.
 //
-//   project_styles  color/icon and new-chat preset per gateway session group (groups are just {name, position})
+//   project_styles  color/icon, new-chat preset and instructions per gateway session group (groups are just {name, position})
 //   thread_extras   per-session ClawChats data (Intelligence panel etc.), keyed by session key
 //   legacy_created  creation time of chats from before the gateway recorded createdAt
 //   bookmarks       messages the user bookmarked, keyed by id; one per (session key, message id)
@@ -29,6 +29,9 @@ function parsePreset(text) {
   try { return cleanPreset(JSON.parse(text)); } catch { return null; }
 }
 
+// Project instructions: text added to every chat of the project (server/project-instructions.js).
+export const MAX_INSTRUCTIONS = 8000;
+
 const str = (v) => typeof v === 'string' && v.trim() ? v.trim() : '';
 const clip = (v, n) => str(v).slice(0, n);
 
@@ -45,7 +48,10 @@ export function createExtrasStore(getGlobalDb) {
     const g = getGlobalDb();
     if (!ready) {
       g.exec(`CREATE TABLE IF NOT EXISTS project_styles (name TEXT PRIMARY KEY, color TEXT, icon TEXT, updated_at INTEGER NOT NULL)`);
-      if (!g.prepare('PRAGMA table_info(project_styles)').all().some(c => c.name === 'preset')) g.exec('ALTER TABLE project_styles ADD COLUMN preset TEXT');
+      const cols = new Set(g.prepare('PRAGMA table_info(project_styles)').all().map(c => c.name));
+      if (!cols.has('preset')) g.exec('ALTER TABLE project_styles ADD COLUMN preset TEXT');
+      if (!cols.has('instructions')) g.exec('ALTER TABLE project_styles ADD COLUMN instructions TEXT');
+      if (!cols.has('instructions_shared')) g.exec('ALTER TABLE project_styles ADD COLUMN instructions_shared INTEGER NOT NULL DEFAULT 0');
       g.exec(`CREATE TABLE IF NOT EXISTS legacy_created (session_key TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`);
       g.exec(`CREATE TABLE IF NOT EXISTS thread_extras (session_key TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY (session_key, kind))`);
       g.exec(`CREATE TABLE IF NOT EXISTS bookmarks (id TEXT PRIMARY KEY, session_key TEXT NOT NULL, message_id TEXT NOT NULL, role TEXT, label TEXT NOT NULL, snippet TEXT NOT NULL, chat_title TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (session_key, message_id))`);
@@ -55,22 +61,31 @@ export function createExtrasStore(getGlobalDb) {
   }
 
   return {
-    /** { [groupName]: { color, icon, preset } } */
+    /** { [groupName]: { color, icon, preset, instructions, instructionsShared } } */
     getProjectStyles() {
       const out = {};
-      for (const r of db().prepare('SELECT name, color, icon, preset FROM project_styles').all()) {
-        out[r.name] = { color: r.color, icon: r.icon, preset: parsePreset(r.preset) };
+      for (const r of db().prepare('SELECT name, color, icon, preset, instructions, instructions_shared FROM project_styles').all()) {
+        out[r.name] = { color: r.color, icon: r.icon, preset: parsePreset(r.preset), instructions: r.instructions || '', instructionsShared: !!r.instructions_shared };
       }
       return out;
     },
 
-    /** Set color, icon and/or new-chat preset; absent fields keep their value, null clears. */
-    setProjectStyle(name, { color, icon, preset } = {}) {
+    /** A project's instructions: { text, shared }, or null when it has none. */
+    getProjectInstructions(name) {
+      if (!name) return null;
+      const r = db().prepare('SELECT instructions, instructions_shared FROM project_styles WHERE name = ?').get(name);
+      return r?.instructions ? { text: r.instructions, shared: !!r.instructions_shared } : null;
+    },
+
+    /** Set color, icon, new-chat preset and/or instructions; absent fields keep their value, null clears. */
+    setProjectStyle(name, { color, icon, preset, instructions, instructionsShared } = {}) {
       if (!name) return;
-      const cur = db().prepare('SELECT color, icon, preset FROM project_styles WHERE name = ?').get(name) || {};
+      const cur = db().prepare('SELECT color, icon, preset, instructions, instructions_shared FROM project_styles WHERE name = ?').get(name) || {};
       const nextPreset = preset === undefined ? (cur.preset ?? null) : (cleanPreset(preset) ? JSON.stringify(cleanPreset(preset)) : null);
-      db().prepare('INSERT INTO project_styles (name, color, icon, preset, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET color = excluded.color, icon = excluded.icon, preset = excluded.preset, updated_at = excluded.updated_at')
-        .run(name, color !== undefined ? color : (cur.color ?? null), icon !== undefined ? icon : (cur.icon ?? null), nextPreset, Date.now());
+      const nextText = instructions === undefined ? (cur.instructions ?? null) : (clip(instructions, MAX_INSTRUCTIONS) || null);
+      const nextShared = instructionsShared === undefined ? (cur.instructions_shared ?? 0) : (instructionsShared === true ? 1 : 0);
+      db().prepare('INSERT INTO project_styles (name, color, icon, preset, instructions, instructions_shared, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET color = excluded.color, icon = excluded.icon, preset = excluded.preset, instructions = excluded.instructions, instructions_shared = excluded.instructions_shared, updated_at = excluded.updated_at')
+        .run(name, color !== undefined ? color : (cur.color ?? null), icon !== undefined ? icon : (cur.icon ?? null), nextPreset, nextText, nextShared, Date.now());
     },
 
     renameProjectStyle(from, to) {

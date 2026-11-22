@@ -199,6 +199,16 @@ export class TeamCoordinator {
     return !!this.remote?.guestSessionOf?.(key);
   }
 
+  /** The team chat a session belongs to: the room itself, or the room a working session answers in; else null. */
+  roomOf(key) {
+    if (!key) return null;
+    if (this.store.getRoom(key)) return key;
+    return this.store.roomOfWorkKey?.(key) || null;
+  }
+
+  /** A session where an agent of this gateway answers in someone else's team chat (peer/sharing.js). */
+  isGuestSession(key) { return !!this.remote?.guestSessionOf?.(key); }
+
   _workKeysChanged() { this._workKeys = null; }
 
   /** The gateway patched a session: a room of mine that was renamed tells its people's copies (they follow its title). */

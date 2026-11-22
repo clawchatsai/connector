@@ -347,6 +347,11 @@ export function createTeamStore(getGlobalDb) {
       return new Set(db().prepare('SELECT work_key FROM team_members WHERE work_key IS NOT NULL').all().map(r => r.work_key));
     },
 
+    /** The room a working session answers in, or null. */
+    roomOfWorkKey(workKey) {
+      return db().prepare('SELECT room_key FROM team_members WHERE work_key = ?').get(workKey)?.room_key || null;
+    },
+
     /**
      * type 'user' (this gateway's own person), 'person' (someone else; agentId holds their person id
      * and actingFor their name), or 'agent' (actingFor: whose request it answered, if not its owner's).

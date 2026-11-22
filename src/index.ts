@@ -21,6 +21,8 @@ import { createRequire } from 'node:module';
 import { registerHandoff as registerHandoffJs } from '../server/handoff.js';
 // @ts-expect-error server/ is plain JS without type declarations; the hook registers in register()
 import { registerProgressReminder as registerProgressReminderJs, blockedLogLine } from '../server/progress-reminder.js';
+// @ts-expect-error server/ is plain JS without type declarations; the hook registers in register()
+import { registerProjectInstructions as registerProjectInstructionsJs } from '../server/project-instructions.js';
 import type { PluginConfig } from './plugin-config.js';
 import { SignalingClient } from './signaling-client.js';
 // Lazy-imported after ensureNativeModules() builds the native binary.
@@ -165,6 +167,7 @@ let _serviceError = '';
 let _startupRun: Promise<void> | null = null;
 /** Progress-card reminder for claude-cli chats (server/progress-reminder.js): 'active' | 'blocked' | 'off' | 'unsupported'. */
 let _progressReminder = 'off';
+let _projectInstructions = 'off'; // 'active' | 'blocked' | 'off' (server/project-instructions.js)
 let _progressReminderBlockLogged = false;
 
 // Gateway sharing: links this gateway is opening to another gateway (it offers), by share.
@@ -514,6 +517,7 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
     gatewayToken,  // For WS auth to local OpenClaw gateway
     llm:           api.runtime?.llm, // host-run completions (chat-title fallback, /api/title)
     progressCardReminder: () => _progressReminder, // /api/health: the browser explains a blocked reminder
+    projectInstructions: () => _projectInstructions, // /api/health: Project settings says when instructions are inactive
     // Dashboard widgets: the gateway's sandbox listener (/api/gw-board reads its proxy shell there).
     sandboxPort:   ((gwCfg?.['mcp'] as Record<string, unknown> | undefined)?.['apps'] as Record<string, unknown> | undefined)?.['sandboxPort'],
     // Gateway sharing: the server side signs grants and runs guest turns; the host provides the
@@ -1797,6 +1801,9 @@ const plugin: OpenClawPluginDefinition = {
 
     // Progress-card reminder for claude-cli chats, which OpenClaw doesn't remind (opt-in: allowConversationAccess)
     _progressReminder = (registerProgressReminderJs as (a: PluginApi, id: string) => string)(api, PLUGIN_ID);
+    // Project instructions from ClawChats' Project settings, added to that project's chats (same opt-in)
+    _projectInstructions = (registerProjectInstructionsJs as (a: PluginApi, id: string, get: () => unknown) => string)(
+      api, PLUGIN_ID, () => (app as unknown as { projectInstructions?: unknown } | null)?.projectInstructions);
   },
 };
 

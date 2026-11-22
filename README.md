@@ -118,9 +118,26 @@ openclaw config set plugins.entries.connector.hooks.allowConversationAccess true
 
 This needs OpenClaw 2026.11.6 or later: on older gateways a claude-cli agent's `progress_card` calls fail in the gateway, so the connector doesn't add the reminder there. The change applies without a gateway restart. Until it's set, the gateway log says once per start that the reminder is blocked, and ClawChats shows a one-time tip in claude-cli chats.
 
-**What the setting grants:** read access to conversation content in the connector's prompt hooks. The gateway has one switch for every hook that can see a chat's messages, so turning it on would let any such hook of the connector read them. The connector registers exactly one, `before_prompt_build`, and it doesn't read the conversation. It looks only at the chat's model provider and session key, and on claude-cli chats (not the agent's main session, not subagents) it appends one fixed line about `progress_card` to the system prompt. It stores nothing and sends nothing anywhere.
+**What the setting grants:** read access to conversation content in the connector's prompt hooks. The gateway has one switch for every hook that can see a chat's messages, so turning it on would let any such hook of the connector read them. The connector registers two `before_prompt_build` hooks, and neither reads the conversation. This one looks only at the chat's model provider and session key, and on claude-cli chats (not the agent's main session, not subagents) it appends one fixed line about `progress_card` to the system prompt. The other adds [project instructions](#project-instructions). Neither stores nor sends anything anywhere.
 
 **Why it asks:** this is a workaround for a gap in OpenClaw, and it goes away once OpenClaw reminds CLI runtimes itself. It does nothing when progress cards are off (`tools.updatePlan: false`) or prompt hooks are off for the connector (`plugins.entries.connector.hooks.allowPromptInjection: false`). To undo it, set the value back to `false`.
+
+## Project instructions
+
+In ClawChats, **Project settings → Instructions** holds text that every chat in the project follows, like Claude.ai or ChatGPT Projects: the files to read first, the rules to keep. The connector stores it on this machine (`global.db`, table `project_styles`, see `EXTRAS.md`) and adds it to the system prompt of each turn through a `before_prompt_build` hook. It uses the same setting as the progress-card reminder above:
+
+```bash
+openclaw config set plugins.entries.connector.hooks.allowConversationAccess true
+```
+
+Until it's set, the instructions are saved but not used, and the Project settings sheet says so.
+
+**Which chats get them:**
+- Your own chats in the project, and every chat they start (sub-chats and subagents, at any depth), on any model.
+- Team chats in the project only when **Also in team chats** is on: other people read and write there and can see what the agent does with them.
+- Nothing else: chats where your agent answers in someone else's team chat, channel chats (Discord, WhatsApp, …), the agent's main session, automations that don't run in a project chat, and any session the connector can't place.
+
+The decision is per chat, made by the connector, because the gateway has no owner signal for every runtime and turns from people you share with reach it through the connector. If anything fails, the turn runs without the instructions. An edit applies from each chat's next turn, which costs one prompt-cache rewrite per open chat; unchanged turns are cached as before. Instructions are capped at 8,000 characters. When you save, any file path in them that doesn't exist on this machine is flagged under the box (relative paths are read from the agent workspace).
 
 ## Configuration
 

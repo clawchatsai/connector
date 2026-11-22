@@ -7,13 +7,14 @@ test('project preset: stored with the style, kept when only color changes, clear
   const db = new Database(':memory:');
   const extras = createExtrasStore(() => db);
   extras.setProjectStyle('Work', { color: 'red' });
-  assert.deepEqual(extras.getProjectStyles().Work, { color: 'red', icon: null, preset: null });
+  assert.deepEqual(extras.getProjectStyles().Work, { color: 'red', icon: null, preset: null, instructions: '', instructionsShared: false });
 
   extras.setProjectStyle('Work', { preset: { agentId: 'dev', cwd: '/home/u/repos', permissionMode: 'full', thinkingLevel: 'high', fastMode: false } });
   extras.setProjectStyle('Work', { color: 'blue' });
   assert.deepEqual(extras.getProjectStyles().Work, {
     color: 'blue', icon: null,
     preset: { agentId: 'dev', cwd: '/home/u/repos', permissionMode: 'full', thinkingLevel: 'high', fastMode: false },
+    instructions: '', instructionsShared: false,
   });
 
   extras.renameProjectStyle('Work', 'Job');
@@ -29,7 +30,7 @@ test('project preset: adds the column to an existing table', () => {
   db.exec('CREATE TABLE project_styles (name TEXT PRIMARY KEY, color TEXT, icon TEXT, updated_at INTEGER NOT NULL)');
   db.prepare('INSERT INTO project_styles VALUES (?, ?, ?, ?)').run('Old', 'green', null, 1);
   const extras = createExtrasStore(() => db);
-  assert.deepEqual(extras.getProjectStyles().Old, { color: 'green', icon: null, preset: null });
+  assert.deepEqual(extras.getProjectStyles().Old, { color: 'green', icon: null, preset: null, instructions: '', instructionsShared: false });
   extras.setProjectStyle('Old', { preset: { model: 'anthropic/claude-opus-5-5' } });
   assert.deepEqual(extras.getProjectStyles().Old.preset, { model: 'anthropic/claude-opus-5-5' });
 });

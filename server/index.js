@@ -26,6 +26,7 @@ import { createTagHandlers } from './controllers/tags.js';
 import { createPushHandlers } from './controllers/push.js';
 import { createWorkspaceStore } from './store/workspace-store.js';
 import { createExtrasStore } from './store/extras-store.js';
+import { createProjectInstructions, missingPaths } from './project-instructions.js';
 import { createTeamStore } from './store/team-store.js';
 import { SessionLens } from './session-lens.js';
 import { createPush } from './push/index.js';
@@ -112,6 +113,8 @@ export function createApp(config = {}) {
   // Exec Allows the gateway lost after a session change (OpenClaw 2026.9.7+; server/approval-retry.js).
   const lostAllows = new LostAllowRetry({ request: gwRequest });
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
+  // Project instructions: the plugin's before_prompt_build hook asks this for each turn (server/project-instructions.js).
+  const projectInstructions = createProjectInstructions({ lens: gatewayClient.lens, team, extras });
   // Push notifications to the owner's devices (server/push/). While a device wants approval pushes, the
   // approval-client connection stays up with no tab open, so approvals wait for an answer from the phone.
   const push = createPush({ dataDir: DATA_DIR, lens: gatewayClient.lens, request: gwRequest, gatewayId: () => config.peer?.gatewayId?.() || '', requestVapid: config.push?.requestVapid });
@@ -286,7 +289,7 @@ export function createApp(config = {}) {
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);
       if (method === 'PUT' && urlPath === '/api/settings') return await handleSaveSettings(req, res, parseBody);
       if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res, { openaiApiKey });
-      if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime(), progressCardReminder: config.progressCardReminder?.() });
+      if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime(), progressCardReminder: config.progressCardReminder?.(), projectInstructions: config.projectInstructions?.() });
       if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
       if (method === 'POST' && urlPath === '/api/title') return await handleTitle(req, res);
 
@@ -313,9 +316,16 @@ export function createApp(config = {}) {
       }
       if ((p = matchRoute(method, urlPath, 'PUT /api/extras/project-styles/:name'))) {
         const body = await parseBody(req);
-        extras.setProjectStyle(p.name, { color: body.color, icon: body.icon, preset: body.preset });
+        extras.setProjectStyle(p.name, { color: body.color, icon: body.icon, preset: body.preset, instructions: body.instructions, instructionsShared: body.instructionsShared });
         broadcast(JSON.stringify({ type: 'clawchats', event: 'project-styles-changed' }));
-        return send(res, 200, { styles: extras.getProjectStyles() });
+        const styles = extras.getProjectStyles();
+        // Saved instructions: flag the file paths in them that don't exist here (the sheet shows them under the box).
+        const missing = typeof body.instructions === 'string' ? missingPaths(styles[p.name]?.instructions, { workspaceDir }) : undefined;
+        return send(res, 200, { styles, ...(missing ? { missingPaths: missing } : {}) });
+      }
+      // The project sheet flags missing paths in saved instructions when it opens, too.
+      if ((p = matchRoute(method, urlPath, 'GET /api/extras/project-styles/:name/missing-paths'))) {
+        return send(res, 200, { missingPaths: missingPaths(extras.getProjectInstructions(p.name)?.text, { workspaceDir }) });
       }
       if ((p = matchRoute(method, urlPath, 'DELETE /api/extras/project-styles/:name'))) {
         extras.deleteProjectStyle(p.name);
@@ -554,6 +564,7 @@ export function createApp(config = {}) {
     extras,
     team,
     sharing,
+    projectInstructions,
     peerKey,
     push,
     setupBrowserWs,
