@@ -43,6 +43,8 @@ export const ROW_FIELDS = new Set([
   'unread', 'lastReadAt', 'markedUnreadAt',
   'createdAt', 'updatedAt', 'lastActivityAt', 'lastInteractionAt',
   'status', 'hasActiveRun', 'activeRunIds', 'lastRunId', 'lastRunError', 'endedAt', 'agentStatus',
+  // The gateway's first-message title is still being generated (ClawChats waits before retrying an untitled chat).
+  'titlePending',
   'model', 'modelProvider', 'thinkingLevel', 'contextTokens', 'totalTokens', 'totalTokensFresh',
   'inputTokens', 'outputTokens', 'permissionMode', 'workspaceDir', 'contextBudgetStatus', 'fastMode', 'effectiveFastMode',
   'startedAt', 'runtimeMs', 'ccParentKey',
