@@ -1,5 +1,7 @@
 # connector — OpenClaw plugin
 
+> Read `~/repos/CLAUDE.md` first: it holds the rules shared by clawchats and connector (one worktree per chat, never edit the main checkouts, pull before reading).
+
 `@clawchatsai/connector`. Runs on the user's machine alongside the OpenClaw gateway. Bridges the ClawChats browser UI to the local gateway via a WebRTC P2P DataChannel after a handshake through `login.clawchats.ai`. See `README.md` for the full architecture diagram and install flow.
 
 ## Stack
@@ -21,4 +23,4 @@ npm run dev        # tsc --watch
 
 ## Cross-repo context
 
-This repo has a sibling at `../clawchats/` which is the frontend + signaling server side of the same product. When changing wire-level contracts (signaling messages, RPC shapes, API versions), check `clawchats/shared/` for the matching types and update both sides. See `/home/houman/repos/CLAUDE.md` for the full workspace picture.
+This repo has a sibling at `../clawchats/` which is the frontend + signaling server side of the same product. When changing wire-level contracts (signaling messages, RPC shapes, API versions), check `clawchats/shared/` for the matching types and update both sides.
