@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { createGuestAgent, ensureGuestRestrictions, restrictionsPending, unappliedGuests, GUEST_TOOLS, GUEST_TOOLS_DENY, hasGuestRestrictions } from './guest-agent.js';
 
 function fakeGateway() {
@@ -48,6 +51,29 @@ test('guest agent: same model + personality, no private memory, deny list applie
   assert.equal(g.calls.filter(c => c.method === 'agents.create').length, 1);
   // Asking for the guest of a guest returns it as is.
   assert.equal((await createGuestAgent(g.request, 'jarvis-guest')).created, false);
+});
+
+test("guest agent: no first-run birth sequence, when made and when a half-made one is repaired", async () => {
+  const g = fakeGateway();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ga-'));
+  g.agents[0].workspace = path.join(root, 'workspace');
+  const request = g.request;
+  g.request = async (method, params) => {
+    if (method !== 'agents.create') return request(method, params);
+    // Like the real gateway: the new folder gets BOOTSTRAP.md, and agents.list shows the folder.
+    fs.mkdirSync(params.workspace, { recursive: true });
+    fs.writeFileSync(path.join(params.workspace, 'BOOTSTRAP.md'), '# Birth Sequence');
+    const r = await request(method, params);
+    setTimeout(() => { const a = g.agents.find(x => x.id === r.agentId); if (a) a.workspace = params.workspace; }, 40);
+    return { ...r, workspace: params.workspace };
+  };
+  await createGuestAgent(g.request, 'jarvis');
+  const ws = path.join(root, 'workspace-jarvis-guest');
+  assert.equal(fs.existsSync(path.join(ws, 'BOOTSTRAP.md')), false, 'made: gone');
+
+  fs.writeFileSync(path.join(ws, 'BOOTSTRAP.md'), '# Birth Sequence'); // one made by an older connector
+  await createGuestAgent(g.request, 'jarvis');
+  assert.equal(fs.existsSync(path.join(ws, 'BOOTSTRAP.md')), false, 'reused: gone');
 });
 
 test('restrictions go on before anything else; a guest left without them is repaired on reuse', async () => {

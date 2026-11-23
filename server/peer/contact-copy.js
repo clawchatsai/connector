@@ -3,6 +3,7 @@
 // file tools unless one folder is opened). Each copy carries the contact's tool policy in its config entry and its basic
 // commands in the exec approvals document. Writes are idempotent by policy hash (contacts.js peer_copy).
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { copyTools, approvalsEntry, policyHash, copySlug } from './contact-policy.js';
 import { persistedButNotApplied } from './guest-agent.js';
@@ -33,21 +34,30 @@ export async function ensureContactCopy({ request, contact, agentId, firstName, 
   const approvals = approvalsEntry(contact);
   const hash = policyHash({ tools, approvals, kind });
 
+  const wantId = copyIdFor(agentId, contact.personKey, kind);
   let copyId = known?.copyId && agents.some(a => a.id === known.copyId) ? known.copyId : null;
   let created = false;
   if (!copyId) {
-    const wantId = copyIdFor(agentId, contact.personKey, kind);
     copyId = agents.some(a => a.id === wantId) ? wantId : null;
     if (!copyId) {
       copyId = await createCopy(request, src, { wantId, kind, firstName });
       created = true;
     }
   }
-  if (!created && known?.policyHash === hash && copyId === known.copyId && toolsWritten(cfg, copyId, tools)) return { copyId, created, changed: false, hash };
+  // Full: made in a staging folder (createCopy), then pointed at the original's workspace once its policy is on. A copy
+  // a failed write left in the staging folder is pointed there on its next ensure.
+  const home = kind === 'full' ? homeOf(src) : null;
+  const at = created ? stagingDir(home, wantId) : agents.find(a => a.id === copyId)?.workspace;
+  const moveHome = !!home && String(at || '').replace(/\/+$/, '') !== home;
+  if (!created && !moveHome && known?.policyHash === hash && copyId === known.copyId && toolsWritten(cfg, copyId, tools)) return { copyId, created, changed: false, hash };
 
   // Policy first: if anything after this fails, the copy is still locked down.
   const pending = await patchTools(request, copyId, tools, cfg);
   await setApprovals(request, copyId, approvals);
+  if (moveHome) {
+    await setWorkspace(request, copyId, home);
+    fs.rmSync(stagingDir(home, wantId), { recursive: true, force: true });
+  }
   if (created) {
     if (!(await waitForAgent(request, copyId))) throw new Error("The gateway didn't load the copy yet; try again");
     if (kind === 'guest') await copyPersonality(request, src.id, copyId);
@@ -59,10 +69,21 @@ export async function ensureContactCopy({ request, contact, agentId, firstName, 
 async function createCopy(request, src, { wantId, kind, firstName }) {
   const name = `${agentName(src)} (${kind === 'full' ? 'full' : 'guest'} · ${firstName})`;
   const model = typeof src.model === 'string' ? src.model : src.model?.primary;
-  // Guest: its own folder beside the original's workspace (never inside it). Full: the original's workspace (§12).
-  const base = typeof src.workspace === 'string' && src.workspace.startsWith('/') ? src.workspace.replace(/\/+$/, '') : null;
-  const workspace = kind === 'full' ? base : base ? path.join(path.dirname(base), `workspace-${wantId}`) : undefined;
+  // Guest: its own folder beside the original's workspace (never inside it). Full: the original's workspace (§12), but
+  // made in a staging folder and pointed there afterwards (ensureContactCopy): agents.create on an existing, set-up folder
+  // writes the new agent's name into its IDENTITY.md and runs the gateway's first-run check in it (2026.11.6), which
+  // rewrote the owner's own IDENTITY.md (clawchats specs/bugs/2026-11-23-full-copy-owner-identity.md). Setting the
+  // workspace in config touches no files.
+  const base = homeOf(src);
+  const workspace = kind === 'full' ? stagingDir(base, wantId) : base ? path.join(path.dirname(base), `workspace-${wantId}`) : undefined;
   const params = { name, ...(workspace ? { workspace } : {}), ...(model ? { model } : {}), ...(src.identity?.emoji ? { emoji: src.identity.emoji } : {}) };
+  return createAgent(request, params, wantId);
+}
+
+const homeOf = src => (typeof src.workspace === 'string' && src.workspace.startsWith('/') ? src.workspace.replace(/\/+$/, '') : null);
+const stagingDir = (home, wantId) => (home ? path.join(path.dirname(home), `.clawchats-staging-${wantId}`) : undefined);
+
+async function createAgent(request, params, wantId) {
   try {
     return (await request('agents.create', { ...params, agentId: wantId }, 60_000)).agentId;
   } catch (e) {
@@ -73,6 +94,24 @@ async function createCopy(request, src, { wantId, kind, firstName }) {
     catch (e2) {
       if (!/exist|already|duplicate|taken|in use/i.test(e2.message)) throw e2;
       return (await request('agents.create', { ...params, name: `${params.name.slice(0, -1)} ${wantId.slice(-4)})` }, 60_000)).agentId;
+    }
+  }
+}
+
+/** Point an agent at a folder in config (no files written there). */
+async function setWorkspace(request, agentId, workspace) {
+  for (let attempt = 0; ; attempt++) {
+    const cfg = await request('config.get', {}, 30_000);
+    try {
+      await request('config.patch', {
+        raw: JSON.stringify({ agents: { entries: { [agentId]: { workspace } } } }),
+        ...(cfg?.hash ? { baseHash: cfg.hash } : {}),
+        note: `ClawChats sharing: ${agentId} works in its original's workspace`,
+      }, 60_000);
+      return;
+    } catch (e) {
+      if (e?.gatewayCode === 'UNAVAILABLE' && e.details?.persistedConfig) return; // saved; applies with the copy's policy
+      if (!/hash|changed since|conflict/i.test(e.message) || attempt >= 2) throw e;
     }
   }
 }

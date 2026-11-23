@@ -13,6 +13,7 @@
 // permission mode. Created only when the owner asks for it (ClawChats → Sharing).
 
 import path from 'node:path';
+import { retireFirstRun } from './copy-workspace.js';
 
 /** The guest's tool policy (gateway `agents.entries.<id>.tools`; tool groups per docs/gateway/config-tools/tool-policy.md). */
 export const GUEST_TOOLS = Object.freeze({
@@ -136,6 +137,7 @@ export async function createGuestAgent(request, agentId, { known = new Set() } =
   if (!src) throw new Error(`unknown agent: ${agentId}`);
   if (isGuestAgent(src, known)) {
     await ensureGuestRestrictions(request, src.id); // repairs a guest agent left without them
+    retireFirstRun(src.workspace);
     return { agentId: src.id, name: agentName(src), created: false };
   }
   const existing = findGuestAgent(agents, agentId, known);
@@ -144,6 +146,7 @@ export async function createGuestAgent(request, agentId, { known = new Set() } =
     // crash between create and copy would have skipped (only missing files; never clobber edits).
     await ensureGuestRestrictions(request, existing.id);
     await copyPersonality(request, src.id, existing.id, { onlyMissing: true });
+    retireFirstRun(existing.workspace);
     return { agentId: existing.id, name: agentName(existing), created: false };
   }
 
@@ -164,6 +167,8 @@ export async function createGuestAgent(request, agentId, { known = new Set() } =
   if (!(await waitForAgent(request, id))) throw new Error(`The gateway didn't load ${name} yet; try again`);
 
   await copyPersonality(request, src.id, id);
+  // The gateway's first-run ritual isn't the guest's to run (copy-workspace.js).
+  retireFirstRun(created.workspace || workspace);
   return { agentId: id, name, created: true };
 }
 

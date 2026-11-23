@@ -44,11 +44,24 @@ function setup({ reply = p => `jarvis says: ${p.message.split('\n\n').pop()}`, c
     if (method === 'agents.create') {
       const id = params.agentId || params.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       gw.agents.push({ id, name: params.name, workspace: params.workspace });
+      // Like the real gateway: a brand-new folder gets the first-run BOOTSTRAP.md; an existing, set-up one gets the new
+      // agent's name written into its IDENTITY.md and its BOOTSTRAP.md retired (2026.11.6 agent-create.ts, workspace.ts).
+      if (params.workspace && !fs.existsSync(params.workspace)) {
+        fs.mkdirSync(params.workspace, { recursive: true });
+        fs.writeFileSync(path.join(params.workspace, 'BOOTSTRAP.md'), '# BOOTSTRAP.md - Birth Sequence');
+      } else if (params.workspace) {
+        fs.writeFileSync(path.join(params.workspace, 'IDENTITY.md'), `- Name: ${params.name}\n`);
+        fs.rmSync(path.join(params.workspace, 'BOOTSTRAP.md'), { force: true });
+      }
       return { ok: true, agentId: id, name: params.name, workspace: params.workspace };
     }
     if (method === 'agents.delete') { gw.agents = gw.agents.filter(x => x.id !== params.agentId); delete gw.entries[params.agentId]; return { ok: true }; }
     if (method === 'config.patch') {
-      for (const [id, e] of Object.entries(JSON.parse(params.raw).agents?.entries || {})) gw.entries[id] = { ...(gw.entries[id] || {}), ...e };
+      for (const [id, e] of Object.entries(JSON.parse(params.raw).agents?.entries || {})) {
+        gw.entries[id] = { ...(gw.entries[id] || {}), ...e };
+        const a = e.workspace && gw.agents.find(x => x.id === id);
+        if (a) a.workspace = e.workspace; // a workspace set in config is what agents.list shows
+      }
       return { ok: true };
     }
     if (method === 'exec.approvals.get') return { hash: 'a', file: gw.approvals };
@@ -1229,6 +1242,64 @@ test('Knowledge "My notes": the default picks are copied read-only into the pers
   await s.owner.setContact('h@x.dev', 'knowledge', 'none');
   for (let i = 0; i < 50 && fs.existsSync(path.join(copyWs, 'notes')); i++) await wait(5);
   assert.equal(fs.existsSync(path.join(copyWs, 'notes')), false, 'None: the copies go');
+});
+
+test("a guest copy never runs the gateway's first-run birth sequence: its BOOTSTRAP.md goes, new copies and older ones alike", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'trusted' });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  const copyWs = s.gw.agents.find(a => a.id === 'jarvis-guest-h-bc35').workspace;
+  assert.ok(fs.existsSync(copyWs), 'the copy has its own folder');
+  assert.equal(fs.existsSync(path.join(copyWs, 'BOOTSTRAP.md')), false, 'a new copy: gone before its first turn ran');
+
+  // A copy made by an older connector still has it: gone after its next turn. Its other files stay.
+  fs.writeFileSync(path.join(copyWs, 'BOOTSTRAP.md'), '# BOOTSTRAP.md - Birth Sequence');
+  fs.writeFileSync(path.join(copyWs, 'SOUL.md'), 'be kind');
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'again' });
+  assert.equal(fs.existsSync(path.join(copyWs, 'BOOTSTRAP.md')), false, 'an existing copy: gone on its next turn');
+  assert.equal(fs.readFileSync(path.join(copyWs, 'SOUL.md'), 'utf8'), 'be kind');
+});
+
+test("Full agent: making it leaves the owner's workspace byte for byte as it was (IDENTITY.md, BOOTSTRAP.md, every file)", async () => {
+  const s = setup();
+  const ownWs = path.join(s.gw.root, 'ws');
+  fs.mkdirSync(ownWs, { recursive: true });
+  fs.writeFileSync(path.join(ownWs, 'IDENTITY.md'), '- **Name:** Ownerbot\n');
+  fs.writeFileSync(path.join(ownWs, 'BOOTSTRAP.md'), '# the owner is still onboarding');
+  fs.writeFileSync(path.join(ownWs, 'SOUL.md'), 'be kind');
+  const snap = () => Object.fromEntries(fs.readdirSync(ownWs).sort().map(f => [f, fs.readFileSync(path.join(ownWs, f), 'utf8')]));
+  const before = snap();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'full', confirmFull: true });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' });
+  assert.equal(s.gw.agents.find(a => a.id === 'jarvis-full-h-bc35')?.workspace, ownWs, "the Full agent runs in the owner's workspace");
+  assert.deepEqual(snap(), before, "the owner's files are untouched");
+  assert.deepEqual(fs.readdirSync(s.gw.root).filter(f => /stag/i.test(f)), [], 'no folder left behind from making it');
+});
+
+test("Full agent left in its staging folder by a failed config write: pointed at the owner's workspace on the next turn", async () => {
+  const s = setup();
+  const ownWs = path.join(s.gw.root, 'ws');
+  fs.mkdirSync(ownWs, { recursive: true });
+  fs.writeFileSync(path.join(ownWs, 'IDENTITY.md'), '- **Name:** Ownerbot\n');
+  const request = s.owner.request;
+  let failed = false;
+  s.owner.request = async (method, params) => {
+    if (method === 'config.patch' && !failed && /"workspace"/.test(params.raw)) { failed = true; throw new Error('gateway went away'); }
+    return request(method, params);
+  };
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis', name: 'Jarvis' }], access: 'full', confirmFull: true });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't1', roomId: 'r', message: 'hi' }).catch(() => {});
+  const full = () => s.gw.agents.find(a => a.id === 'jarvis-full-h-bc35');
+  assert.match(full().workspace, /\.clawchats-staging-jarvis-full-h-bc35$/, 'the write failed: still in its staging folder');
+  assert.ok(s.gw.entries['jarvis-full-h-bc35'].tools.deny.includes('write'), 'but already locked down');
+
+  await s.req.turn('peer:sh1:jarvis', { turnId: 't2', roomId: 'r', message: 'again' });
+  assert.equal(full().workspace, ownWs);
+  assert.equal(fs.existsSync(path.join(s.gw.root, '.clawchats-staging-jarvis-full-h-bc35')), false, 'staging folder removed');
+  assert.equal(fs.readFileSync(path.join(ownWs, 'IDENTITY.md'), 'utf8'), '- **Name:** Ownerbot\n');
 });
 
 test("the card lists what our agents were asked by them (label, last activity, newest first); archived ones drop out", async () => {

@@ -23,6 +23,7 @@ import { ContactBook, personKeyOf } from './contacts.js';
 import { AUTONOMY, ACCESS, sessionMode, toolOverrides as contactOverrides, topicsNote, copyTools, copyToolsHold, copyKind, defaultContact, TOOL_GROUPS, ALWAYS_OFF, BASIC_DEFAULTS, DEFAULT_TOOLS, DEFAULT_COMMANDS } from './contact-policy.js';
 import { ensureContactCopy, retireCopy } from './contact-copy.js';
 import { noteCandidates, resolvePicks, picksSignature, syncNotes, removeNotes, NOTES_DIR } from './notes-sync.js';
+import { retireFirstRun } from './copy-workspace.js';
 import { peerOutdated, outdatedMessage, connectorVersion } from './version.js';
 import { promptIndex, replyAfter } from '../util/turn-reply.js';
 
@@ -917,7 +918,11 @@ export class SharingManager {
       this.book.putCopy(c.personKey, sourceId, kind, r.copyId, r.hash);
       if (r.pending) (this._pendingCopies ??= new Set()).add(r.copyId); // saved, not applied yet: not served until it is
       if (r.created) this._changed(); // agent pickers hide it
-      if (kind === 'guest') await this._syncNotesFor(c, r.copyId);
+      if (kind === 'guest') {
+        // Never the gateway's first-run ritual for the person it serves; copies made by older connectors lose it here too.
+        if (retireFirstRun(await this._copyWorkspace(r.copyId))) this.log.info?.(`[sharing] ${r.copyId}: first-run BOOTSTRAP.md removed`);
+        await this._syncNotesFor(c, r.copyId);
+      }
       return r.copyId;
     })();
     this._copying.set(key, job);
@@ -939,9 +944,14 @@ export class SharingManager {
     return { cands, files: resolvePicks(picks, cands) };
   }
 
+  /** A copy's folder, as the gateway lists it (a copy made a moment ago may not be in the cached list yet). */
+  async _copyWorkspace(copyId) {
+    return (this._agentsCache || []).find(a => a.id === copyId)?.workspace || (await this._agents()).find(a => a.id === copyId)?.workspace;
+  }
+
   /** Copy the picked notes into a guest copy's folder when they changed (or `force`); "None" removes them. */
   async _syncNotesFor(contact, copyId, { force = false } = {}) {
-    const ws = (this._agentsCache || []).find(a => a.id === copyId)?.workspace || (await this._agents()).find(a => a.id === copyId)?.workspace;
+    const ws = await this._copyWorkspace(copyId);
     if (!ws || !ws.startsWith('/')) return null;
     if (contact.knowledge !== 'notes') { removeNotes(ws); return null; }
     const { files } = await this._notePicks(contact);
