@@ -46,7 +46,24 @@ const ROUND_LIMITS = Object.fromEntries(Object.entries(AUTONOMY).filter(([, t]) 
 
 const norm = s => String(s || '').toLowerCase().replace(/\s+/g, '');
 /** Room entries up to and including `id` (all of them when it's not given or not among them). */
-const upTo = (entries, id) => { const i = id ? entries.findIndex(e => e.id === id) : -1; return i >= 0 ? entries.slice(0, i + 1) : entries; };
+const upTo = (entries, id) => { const i = id ? entries.findIndex(e => e.id === id) : -1; return i >= 0 ? Object.assign(entries.slice(0, i + 1), { older: entries.older }) : entries; };
+/** The line an agent gets where its view of the chat was cut: n left out (more: and an unknown number before those). */
+const notShown = (n, more) => {
+  const what = more ? (n ? `More than ${n} earlier messages aren't` : "Some earlier messages aren't") : n === 1 ? "1 earlier message isn't" : `${n} earlier messages aren't`;
+  return `(${what} shown here. If you're asked about something that isn't shown, say you can't see that far back in this chat; don't guess.)`;
+};
+/**
+ * What a lane is shown of the entries it hasn't seen: the newest FIRST_TURN_MAX, after a line saying what's left out,
+ * here or before the fetched window (`history.older`) when the lane's last turn is older than the window. Never cut
+ * silently: an agent that takes part of the chat for all of it answers from that, and named the wrong first topic (QA 2026-11-22).
+ * The line is an entry, in the place of what it stands for, with the oldest kept entry's time (_setSeen, _turnFor).
+ */
+const laneView = (fresh, history, seenAt) => {
+  const cut = Math.max(0, fresh.length - FIRST_TURN_MAX);
+  const shown = fresh.slice(cut);
+  const more = !!history.older && !(history[0]?.ts <= seenAt);
+  return cut || more ? [{ id: null, ts: shown[0].ts, text: '', omitted: notShown(cut, more) }, ...shown] : shown;
+};
 /** How a line this gateway sent to a host's room comes back in its copy (a stopped reply gets a marker there). */
 const vouchText = t => String(t || '').replace(/\n\n\*\[stopped\]\*\s*$/, '').trim().slice(0, 32_000);
 
@@ -797,16 +814,17 @@ export class TeamCoordinator {
       const last = fresh.filter(e => !e.self).at(-1);
       if (last.remote || last.person) return room.host ? null : this._turn(roomKey, agentId, agents, history, mode, stopped, this._askerOf(authors[last.id]));
     }
-    if (fresh.length > FIRST_TURN_MAX) fresh.splice(0, fresh.length - FIRST_TURN_MAX); // a new session catching up on a long chat
+    const shown = laneView(fresh, history, seenAt);
     // First turn: the chat's earlier history too (a chat turned into a team chat), unless it was
     // added "from now on". The chat's own agent already has it in its session.
     const earlier = seenAt === 0 && member.history !== 'now' ? await this._earlier(room, member) : '';
 
     const notes = this._reactionNotes(roomKey, seenAt, history, authors, isSelf);
-    if (remoteAgent) return this._remoteTurn(roomKey, self, fresh, agents, mode, stopped, earlier, notes);
-    if (actingFor) return this._turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history, earlier, lane, notes);
+    const first = seenAt === 0;
+    if (remoteAgent) return this._remoteTurn(roomKey, self, shown, agents, mode, stopped, earlier, notes, first);
+    if (actingFor) return this._turnFor(roomKey, self, shown, agents, mode, stopped, actingFor, history, earlier, lane, notes, first);
     const workKey = member.workKey || await this._createWorkSession(roomKey, self);
-    const message = this._prompt(self, agents, fresh, mode, earlier, { owner: true, notes });
+    const message = this._prompt(self, agents, shown, mode, earlier, { owner: true, notes, first });
     const runId = `team-${crypto.randomUUID()}`;
     const live = this._live(roomKey);
     const done = this._waitRun(runId);
@@ -822,7 +840,7 @@ export class TeamCoordinator {
       // Stop pressed while the send was on its way (or being retried while the gateway starts): its abort reached the
       // gateway before the run existed and was a no-op (an unknown runId aborts nothing), so the run is stopped now.
       if (stopped()) this.chatAbort.abort({ sessionKey: workKey, runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`));
-      this._setSeen(roomKey, agentId, OWNER_LANE, fresh);
+      this._setSeen(roomKey, agentId, OWNER_LANE, shown);
       result = await done;
     } finally {
       this._cancelWait(runId);
@@ -858,7 +876,7 @@ export class TeamCoordinator {
    * A turn of someone else's agent: runs on their gateway over the peer link (peer/sharing.js).
    * Streamed text reaches the browser as `team-remote-delta` (there's no local working session).
    */
-  async _remoteTurn(roomKey, self, fresh, agents, mode, stopped, earlier = '', notes = '') {
+  async _remoteTurn(roomKey, self, fresh, agents, mode, stopped, earlier = '', notes = '', first = false) {
     if (!this.remote) throw new Error('sharing is not available');
     const agentId = self.agentId;
     const runId = `team-${crypto.randomUUID()}`;
@@ -873,11 +891,11 @@ export class TeamCoordinator {
       if (w) live.waiting.set(agentId, w); else live.waiting.delete(agentId);
       this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-remote-status', roomKey, agentId, runId, waiting: w || null }));
     };
-    let result, partial = '';
+    let result, partial = '', unsee = null;
     try {
-      this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
+      unsee = this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
       const round = live.round || 1;
-      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes }), trigger: round > 1 ? 'agent' : 'person', round };
+      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, first }), trigger: round > 1 ? 'agent' : 'person', round };
       this.store.inflightStart(roomKey, { agentId, round, kind: 'remote', runId, mode, turn, post: { name: self.name, via: REMOTE_LANE, marker: mode === 'addressed' } });
       const ask = () => this.remote.turn(agentId, turn,
         {
@@ -894,7 +912,9 @@ export class TeamCoordinator {
         return ask();
       });
     } catch (e) {
-      throw Object.assign(e, { partial: (e.partial || partial || '').trim(), via: REMOTE_LANE });
+      const said = (e.partial || partial || '').trim();
+      if (!said && !this._closed) unsee?.(); // it never got to answer: its next turn gets these too (QA 2026-11-22: "Too many replies at once")
+      throw Object.assign(e, { partial: said, via: REMOTE_LANE });
     } finally {
       live.running.delete(agentId);
       if (live.waiting?.has(agentId)) waiting(null);
@@ -917,7 +937,7 @@ export class TeamCoordinator {
    * that person, under their grant (peer/sharing.js localTurnFor), streamed like a remote agent.
    * Not shared with them: it stays out, saying so when their agent asked it by name.
    */
-  async _turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history, earlier = '', lane = `guest:${actingFor}`, notes = '') {
+  async _turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history, earlier = '', lane = `guest:${actingFor}`, notes = '', first = false) {
     const agentId = self.agentId;
     const asker = agents.find(a => a.agentId === actingFor);
     // Whom it answers, by the name they have in this chat ("homiabot qa2", not a first word): the person, or the agent's owner.
@@ -929,21 +949,24 @@ export class TeamCoordinator {
     const delta = (text, done = false) => this.broadcast(JSON.stringify({ type: 'clawchats', event: 'team-remote-delta', roomKey, agentId, runId, text, ...(done ? { done: true } : {}) }));
     live.running.set(agentId, { actingFor, runId });
     this._status(roomKey);
-    let result, partial = '';
+    let result, partial = '', unsee = null;
     try {
-      this._setSeen(roomKey, agentId, lane, fresh);
-      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, asker: actingFor }), round: live.round || 1 };
+      unsee = this._setSeen(roomKey, agentId, lane, fresh);
+      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, asker: actingFor, first }), round: live.round || 1 };
       this.store.inflightStart(roomKey, { agentId, round: turn.round, kind: 'for', runId, mode, turn, post: { name: self.name, via: lane, actingFor, forName } });
       result = await this.remote?.localTurnFor(agentId, actingFor, turn,
         { onDelta: text => { partial = text; delta(text); } });
     } catch (e) {
-      throw Object.assign(e, { partial: (e.partial || partial || '').trim(), via: lane, actingFor: forName });
+      const said = (e.partial || partial || '').trim();
+      if (!said && !this._closed) unsee?.(); // as in _remoteTurn
+      throw Object.assign(e, { partial: said, via: lane, actingFor: forName });
     } finally {
       live.running.delete(agentId);
       delta('', true);
       this._status(roomKey);
     }
     if (!result) {
+      unsee(); // not shared with them: it didn't run
       const authors = this.store.authors(roomKey);
       const isAsker = a => a?.agentId === actingFor || (a?.type === 'person' && `person:${a.personId}` === actingFor);
       const askedByName = history.some(e => isAsker(authors[e.id]) && e.ts >= Math.min(...fresh.map(f => f.ts))
@@ -1020,17 +1043,24 @@ export class TeamCoordinator {
     return from ? from - 1 : 0;
   }
 
+  /** Returns how to undo it, for a turn that then didn't run. */
   _setSeen(roomKey, agentId, lane, fresh) {
     const ts = Math.max(...fresh.map(e => e.ts));
-    if (lane === OWNER_LANE || lane === REMOTE_LANE) this.store.setSeenAt(roomKey, agentId, ts);
-    else this.store.setLaneSeenAt(roomKey, agentId, lane, ts);
+    if (lane === OWNER_LANE || lane === REMOTE_LANE) {
+      const before = this.store.getRoom(roomKey)?.members.find(m => m.agentId === agentId)?.seenAt || 0;
+      this.store.setSeenAt(roomKey, agentId, ts);
+      return () => this.store.resetSeenAt(roomKey, agentId, null, before);
+    }
+    const before = this.store.laneSeenAt(roomKey, agentId, lane);
+    this.store.setLaneSeenAt(roomKey, agentId, lane, ts);
+    return () => this.store.resetSeenAt(roomKey, agentId, lane, before);
   }
 
   /**
    * owner: the agent answers its owner (full strength); others' quoted words are then context, never requests.
    * asker: whom it answers instead ('person:<gw>' or an agent id; _turnFor): their lines are what it answers.
    */
-  _prompt(self, agents, fresh, mode, earlier = '', { owner = false, notes = '', asker = null } = {}) {
+  _prompt(self, agents, fresh, mode, earlier = '', { owner = false, notes = '', asker = null, first = false } = {}) {
     // The roster: what to write to address each agent, and whose it is ("@jarvis (Jarvis, Kamil's agent)").
     const host = this._hostName();
     const whose = a => { const [base, owner] = String(a.name).split('·').map(x => x.trim()); return `${base || a.name}, ${owner || (TeamCoordinator.isRemote(a.agentId) ? 'someone else' : host)}'s agent`; };
@@ -1040,6 +1070,7 @@ export class TeamCoordinator {
     const quote = body => defangLocalPaths(body).split('\n').map(l => `> ${l}`).join('\n');
     const othersHere = fresh.some(e => e.remote || e.person || e.forOther);
     const lines = fresh.map(e => {
+      if (e.omitted) return e.omitted;
       const { label, body } = splitLabel(e.text);
       // What it said itself from another session of this chat: its own words, marked as such.
       if (e.self) return `[${label || self.name} (you, ${e.self.actingFor ? `answering for ${e.self.actingFor}` : e.self.via === OWNER_LANE ? 'for your owner' : 'in another session'})]: ${body}`;
@@ -1066,7 +1097,7 @@ export class TeamCoordinator {
       `[Team chat] You are ${at(self)}. Other agents here: ${others.join(', ') || 'none'}. Your reply is posted to the team chat as ${self.name}; address an agent with its @handle.`,
       '',
       ...(earlier ? ['Earlier in this chat (before you joined):', '', earlier, ''] : []),
-      'New messages since your last turn:',
+      first && !earlier ? 'Messages in this chat so far:' : 'New messages since your last turn:', // after the earlier part, "so far" reads as all of it
       '',
       lines.join('\n\n'),
       '',
@@ -1094,9 +1125,12 @@ export class TeamCoordinator {
   /** Room transcript entries, oldest first: { id, ts, text }. */
   async _roomEntries(roomKey) {
     const h = await this.request('chat.history', { sessionKey: roomKey, limit: HISTORY_LIMIT }, 30_000);
-    return (h?.messages || [])
+    const entries = (h?.messages || [])
       .map(m => ({ id: entryId(m), ts: Number(m.timestamp) || 0, text: messageText(m) }))
       .filter(e => e.id && e.text);
+    // The chat goes back further than these (laneView says so to a lane that last saw something before them).
+    entries.older = !!h?.olderCursor || (h?.messages?.length || 0) >= HISTORY_LIMIT;
+    return entries;
   }
 
   /** Newest assistant text after the last user message (a final without a message). */
@@ -1400,7 +1434,8 @@ export class TeamCoordinator {
   /** The chat's earlier history, for an agent's first turn ('' if none, or it's the chat's own agent). */
   async _earlier(room, member) {
     if (!room?.sourceKey || member.workKey === room.sourceKey) return '';
-    const h = await this.request('chat.history', { sessionKey: room.sourceKey, limit: 40 }, 30_000).catch(() => null);
+    const limit = 40;
+    const h = await this.request('chat.history', { sessionKey: room.sourceKey, limit }, 30_000).catch(() => null);
     const agentName = (await this._named([/^agent:([^:]+):/.exec(room.sourceKey)?.[1] || 'agent']))[0]?.name || 'Agent';
     const lines = [];
     for (const m of h?.messages || []) {
@@ -1409,7 +1444,9 @@ export class TeamCoordinator {
       lines.push(`[${m.role === 'user' ? this._hostLabel || 'User' : agentName}]: ${text}`);
     }
     const all = lines.join('\n\n');
-    return all.length > 12_000 ? `…${all.slice(-12_000)}` : all;
+    const text = all.length > 12_000 ? `…${all.slice(-12_000)}` : all;
+    const cut = text !== all || !!h?.olderCursor || (h?.messages?.length || 0) >= limit;
+    return text && cut ? `${notShown(0, true)}\n\n${text}` : text;
   }
 
   /** A request from another gateway over the sharing link (peer/sharing.js _wireRooms). fromGw is authenticated. */

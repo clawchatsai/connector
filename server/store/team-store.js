@@ -284,6 +284,13 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('INSERT INTO team_lanes (room_key, agent_id, lane, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(room_key, agent_id, lane) DO UPDATE SET seen_at = MAX(seen_at, excluded.seen_at)').run(roomKey, agentId, lane, seenAt);
     },
 
+    /** Put a seen point back as it was (a turn that never ran). Lane `null`: the agent's own; seenAt null: before the lane's first turn. */
+    resetSeenAt(roomKey, agentId, lane, seenAt) {
+      if (!lane) db().prepare('UPDATE team_members SET seen_at = ? WHERE room_key = ? AND agent_id = ?').run(seenAt || 0, roomKey, agentId);
+      else if (seenAt === null) db().prepare('DELETE FROM team_lanes WHERE room_key = ? AND agent_id = ? AND lane = ?').run(roomKey, agentId, lane);
+      else db().prepare('INSERT INTO team_lanes (room_key, agent_id, lane, seen_at) VALUES (?, ?, ?, ?) ON CONFLICT(room_key, agent_id, lane) DO UPDATE SET seen_at = excluded.seen_at').run(roomKey, agentId, lane, seenAt);
+    },
+
     setDiscuss(roomKey, discuss) {
       db().prepare('UPDATE team_rooms SET discuss = ?, updated_at = ? WHERE room_key = ?').run(discuss ? 1 : 0, Date.now(), roomKey);
     },

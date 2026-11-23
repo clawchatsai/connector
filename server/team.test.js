@@ -838,6 +838,7 @@ test('a chat turned into a team chat: agents added later get its earlier history
   await h.settle();
   const devPrompt = h.calls.find(c => c.method === 'chat.send' && c.params.sessionKey.startsWith('agent:dev:')).params.message;
   assert.match(devPrompt, /Earlier in this chat[\s\S]*how do I fix the gateway crash\?[\s\S]*restart with --safe/);
+  assert.match(devPrompt, /New messages since your last turn:/, 'after the earlier part, "so far" would read as all of it');
   assert.ok(h.room(roomKey).includes('[Dev]\n\ndev: saw history'));
   // "From now on": no earlier history, and it starts at the newest entry.
   const atlas = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'atlas');
@@ -1647,4 +1648,181 @@ test("someone's agent answers only once its owner has our room's copy: a person 
   await settle();
   assert.equal(asks, 1);
   assert.match(H.room(roomKey).at(-1), /Couldn't finish this reply: Jarvis only answers in chats Kamil is in: add Kamil to this chat/);
+});
+
+/** Lines from the owner straight into the room, as if posted long ago (no turn runs). */
+const fill = async (h, roomKey, n, from = 1) => {
+  for (let i = from; i < from + n; i++) await h.team.request('chat.inject', { sessionKey: roomKey, message: `topic ${i}`, label: 'Houman' });
+};
+const promptOf = (h, agent) => h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey.startsWith(`agent:${agent}:`)).at(-1)?.params.message;
+
+test("a lane catching up on a long chat is told how many earlier messages it isn't shown, and not to guess", async () => {
+  const h = harness(() => 'ok');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await fill(h, roomKey, 65);
+  await h.team.send(roomKey, { text: '@atlas what was the first topic?', userLabel: 'Houman' });
+  await h.settle();
+  const p = promptOf(h, 'atlas');
+  assert.match(p, /Messages in this chat so far:\n\n\(6 earlier messages aren't shown here\. If you're asked about something that isn't shown, say you can't see that far back in this chat; don't guess\.\)\n\n\[Houman\]: topic 7\n/);
+  assert.doesNotMatch(p, /topic 6\n/);
+  assert.doesNotMatch(p, /New messages since your last turn/, 'a first turn has no last turn');
+});
+
+test('a room longer than the fetched window: the lane is told more were left out than it can count', async () => {
+  const h = harness(() => 'ok');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await fill(h, roomKey, 100);
+  await h.team.send(roomKey, { text: '@atlas what was the first topic?', userLabel: 'Houman' });
+  await h.settle();
+  assert.match(promptOf(h, 'atlas'), /\(More than 20 earlier messages aren't shown here\. [^)]*don't guess\.\)\n\n\[Houman\]: topic 42\n/);
+});
+
+test('a lane far behind: counted when the window reaches back to its last turn, "more than" when it does not', async () => {
+  const h = harness(() => 'ok');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await fill(h, roomKey, 20);
+  await h.team.send(roomKey, { text: '@atlas hi', userLabel: 'Houman' });
+  await h.settle();
+  assert.doesNotMatch(promptOf(h, 'atlas'), /aren't shown/, 'nothing cut, no marker');
+  await fill(h, roomKey, 70, 21);
+  await h.team.send(roomKey, { text: '@atlas still there?', userLabel: 'Houman' });
+  await h.settle();
+  let p = promptOf(h, 'atlas');
+  assert.match(p, /New messages since your last turn:\n\n\(11 earlier messages aren't shown here\. [^)]*\)\n\n\[Houman\]: topic 32\n/);
+  await fill(h, roomKey, 100, 91);
+  await h.team.send(roomKey, { text: '@atlas and now?', userLabel: 'Houman' });
+  await h.settle();
+  p = promptOf(h, 'atlas');
+  assert.match(p, /New messages since your last turn:\n\n\(More than 20 earlier messages aren't shown here\. [^)]*\)\n\n\[Houman\]: topic 132\n/);
+});
+
+test('a short room: no marker; the first turn is "so far", the next "since your last turn"', async () => {
+  const h = harness(() => 'ok');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@dev hello', userLabel: 'Houman' });
+  await h.settle();
+  assert.match(promptOf(h, 'dev'), /Messages in this chat so far:\n\n\[Houman\]: @dev hello\n/);
+  await h.team.send(roomKey, { text: '@dev again', userLabel: 'Houman' });
+  await h.settle();
+  const p = promptOf(h, 'dev');
+  assert.match(p, /New messages since your last turn:\n\n\[Houman\]: @dev again\n/);
+  assert.doesNotMatch(p, /aren't shown|isn't shown/);
+});
+
+test("the guest session for someone else's agent, and someone else's agent itself, get the marker too", async () => {
+  const forPrompts = [], remotePrompts = [];
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (id, turn) => { remotePrompts.push(turn.message); return { state: 'final', text: remotePrompts.length === 1 ? '@dev what was the first topic?' : 'thanks' }; },
+    abort: async () => {},
+    actingForName: () => 'Kamil',
+    laneFor: who => (who === 'peer:sh1:jarvis' ? 'guest:sh1' : null),
+    localTurnFor: async (localId, remoteId, args) => { forPrompts.push(args.message); return { state: 'final', text: "I can't see that far back." }; },
+  };
+  const h = harness(() => 'NO_REPLY', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  h.team.setDiscuss(roomKey, true);
+  await fill(h, roomKey, 65);
+  await h.team.send(roomKey, { text: '@jarvis ask dev about the first topic', userLabel: 'Houman' });
+  await h.settle();
+  assert.match(remotePrompts[0], /Messages in this chat so far:\n\n\(6 earlier messages aren't shown here\. [^)]*\)\n\n\[Houman\]: topic 7\n/);
+  assert.match(forPrompts[0], /Messages in this chat so far:\n\n\(7 earlier messages aren't shown here\. [^)]*\)\n\n\[Houman\]: topic 8\n/);
+});
+
+test("a chat turned into a team chat with more history than an agent is given: the earlier part says so", async () => {
+  const h = harness(() => 'ok');
+  const src = 'agent:main:dashboard:orig';
+  h.sessions.set(src, Array.from({ length: 45 }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: i % 2 ? [{ type: 'text', text: `answer ${i}` }] : `question ${i}`, timestamp: i + 1, __m: { id: `o${i}` } })));
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev'], sourceKey: src });
+  const dev = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'dev');
+  const earlier = await h.team._earlier(h.team.store.getRoom(roomKey), dev);
+  assert.match(earlier, /^\(Some earlier messages aren't shown here\. [^)]*don't guess\.\)\n\n/);
+  assert.doesNotMatch(earlier, /question 4\n/);
+  h.sessions.set(src, h.sessions.get(src).slice(-3));
+  assert.doesNotMatch(await h.team._earlier(h.team.store.getRoom(roomKey), dev), /aren't shown/, 'all of it fits: no marker');
+});
+
+test("a lane whose turn failed before it ran isn't marked as caught up: the retry gets what the failed turn would have", async () => {
+  const forPrompts = [];
+  let busy = true;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async () => ({ state: 'final', text: '@dev what was the first topic?' }),
+    abort: async () => {},
+    actingForName: () => 'Kamil',
+    laneFor: who => (who === 'peer:sh1:jarvis' ? 'guest:sh1' : null),
+    localTurnFor: async (localId, remoteId, args) => {
+      if (busy) { busy = false; throw Object.assign(new Error('Too many replies at once; try again shortly'), { code: 'busy' }); }
+      forPrompts.push(args.message);
+      return { state: 'final', text: "I can't see that far back." };
+    },
+  };
+  const h = harness(() => 'NO_REPLY', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  h.team.setDiscuss(roomKey, true);
+  await fill(h, roomKey, 65);
+  await h.team.send(roomKey, { text: '@jarvis ask dev about the first topic', userLabel: 'Houman' });
+  await h.settle();
+  assert.equal(forPrompts.length, 0, 'the first copy turn never ran');
+  assert.equal(h.team.store.laneSeenAt(roomKey, 'dev', 'guest:sh1'), null, 'its lane is still before its first turn');
+  const authors = h.team.store.authors(roomKey);
+  const note = Object.values(authors).find(x => x.agentId === 'dev' && x.via !== 'owner' && x.type === 'agent');
+  assert.equal(note?.via, 'guest:sh1', "the failed turn's note is on the copy's lane, not the owner's");
+  await h.team.send(roomKey, { text: '@jarvis ask dev again', userLabel: 'Houman' });
+  await h.settle();
+  assert.equal(forPrompts.length, 1);
+  assert.match(forPrompts[0], /Messages in this chat so far:\n\n\(\d+ earlier messages aren't shown here\. [^)]*\)\n\n/);
+  assert.match(forPrompts[0], /\[Houman\]: topic 65\n/);
+});
+
+test("someone else's agent whose turn failed before it ran isn't marked as caught up either", async () => {
+  const prompts = [];
+  let busy = true;
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (id, turn) => {
+      if (busy) { busy = false; throw Object.assign(new Error('Too many replies at once; try again shortly'), { code: 'busy' }); }
+      prompts.push(turn.message);
+      return { state: 'final', text: "I can't see that far back." };
+    },
+    abort: async () => {},
+  };
+  const h = harness(() => 'NO_REPLY', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await fill(h, roomKey, 65);
+  const seen = () => h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'peer:sh1:jarvis').seenAt;
+  await h.team.send(roomKey, { text: '@jarvis what was the first topic?', userLabel: 'Houman' });
+  await h.settle();
+  assert.equal(prompts.length, 0);
+  assert.equal(seen(), 0, 'still before its first turn');
+  await h.team.send(roomKey, { text: '@jarvis again?', userLabel: 'Houman' });
+  await h.settle();
+  assert.match(prompts[0], /Messages in this chat so far:\n\n\(\d+ earlier messages aren't shown here\. [^)]*\)\n\n/);
+  assert.match(prompts[0], /\[Houman\]: topic 65\n/);
+});
+
+test('a copy turn that said something before failing keeps its seen point; one not shared with them puts it back', async () => {
+  let mode = 'partial';
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async () => ({ state: 'final', text: '@dev hello?' }),
+    abort: async () => {},
+    actingForName: () => 'Kamil',
+    laneFor: who => (who === 'peer:sh1:jarvis' ? 'guest:sh1' : null),
+    localTurnFor: async (localId, remoteId, args, { onDelta }) => {
+      if (mode === 'partial') { onDelta('Half an answer'); throw new Error('link dropped'); }
+      return null; // not shared with them
+    },
+  };
+  const h = harness(() => 'NO_REPLY', { remote });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  h.team.setDiscuss(roomKey, true);
+  await h.team.send(roomKey, { text: '@jarvis say hi to dev', userLabel: 'Houman' });
+  await h.settle();
+  const after = h.team.store.laneSeenAt(roomKey, 'dev', 'guest:sh1');
+  assert.ok(after > 0, 'it saw them and started answering');
+  mode = 'unshared';
+  await h.team.send(roomKey, { text: '@jarvis and again', userLabel: 'Houman' });
+  await h.settle();
+  assert.equal(h.team.store.laneSeenAt(roomKey, 'dev', 'guest:sh1'), after, "a turn that didn't run leaves it where it was");
 });
