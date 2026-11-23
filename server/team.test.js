@@ -5,6 +5,7 @@ import { createTeamStore } from './store/team-store.js';
 import { TeamCoordinator, parseMentions, assignHandle, namedIn, splitLabel, entryId } from './team.js';
 import { SessionLens } from './session-lens.js';
 import { createChatAbort } from './util/chat-abort.js';
+import { createHelperSessions } from './helper-sessions.js';
 
 const AGENTS = [{ id: 'main', identity: {} }, { id: 'dev', identity: { name: 'Dev' } }, { id: 'atlas', identity: { name: 'Atlas' } }];
 
@@ -13,6 +14,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
   const sessions = new Map(); // key -> [{ role, content, timestamp, __m: { id } }]
   const calls = [];
   const labels = new Map(); // session key -> label
+  const surfaces = new Map(); // session key -> creation surface ('plugin-dock': a hidden helper)
   let clock = clockStart, seq = 0;
   const events = [];
   let team;
@@ -23,13 +25,13 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
       case 'sessions.create': case 'sessions.patch': {
         // Labels are unique per gateway, as on the real one.
         if (params.label && [...labels].some(([k, l]) => l === params.label && k !== params.key)) throw new Error(`label already in use: ${params.label}`);
-        if (method === 'sessions.create') sessions.set(params.key, []);
+        if (method === 'sessions.create') { sessions.set(params.key, []); if (params.surface) surfaces.set(params.key, params.surface); }
         if (params.label) labels.set(params.key, params.label);
         return { ok: true, key: params.key };
       }
-      case 'sessions.describe': return { session: { key: params.key, ...(labels.has(params.key) ? { label: labels.get(params.key) } : {}) } };
+      case 'sessions.describe': return { session: { key: params.key, sessionId: `sid-${params.key}`, ...(labels.has(params.key) ? { label: labels.get(params.key) } : {}), ...(surfaces.has(params.key) ? { createdSurface: surfaces.get(params.key), isDock: true } : {}) } };
       case 'sessions.title.prepare': return { title: preparedTitle };
-      case 'sessions.delete': labels.delete(params.key); return { ok: true };
+      case 'sessions.delete': labels.delete(params.key); surfaces.delete(params.key); return { ok: true };
       case 'chat.inject': {
         const id = `m${++seq}`;
         sessions.get(params.sessionKey).push({ role: 'assistant', content: [{ type: 'text', text: `[${params.label}]\n\n${params.message}` }], timestamp: ++clock, __m: { id } });
@@ -72,7 +74,7 @@ function harness(reply, { preparedTitle = 'Team title', titler = null, remote = 
     team = new TeamCoordinator({ store: createTeamStore(() => db), request, titler, remote, broadcast: d => events.push(JSON.parse(d)), logger: { warn() {}, error() {}, log() {} } });
     return team;
   };
-  return { team, calls, room, settle, events, sessions, labels, restart, get current() { return team; } };
+  return { team, calls, room, settle, events, sessions, labels, surfaces, restart, get current() { return team; } };
 }
 
 test('handles: the name, else with the owner\'s first name, else the whole owner name, else numbered; never all/everyone', () => {
@@ -1902,4 +1904,251 @@ test('a copy turn that said something before failing keeps its seen point; one n
   await h.team.send(roomKey, { text: '@jarvis and again', userLabel: 'Houman' });
   await h.settle();
   assert.equal(h.team.store.laneSeenAt(roomKey, 'dev', 'guest:sh1'), after, "a turn that didn't run leaves it where it was");
+});
+
+// ── F5: the room's own sessions are hidden dock conversations (helper-sessions.js) ──
+
+/** The connector on a gateway of version `v` (hello-ok server.version). */
+const onGateway = (h, v) => { h.team.helpers = createHelperSessions({ request: (m, p) => h.team.request(m, p), gatewayVersion: () => v, log: { info() {}, warn() {} } }); };
+
+test('working sessions are made as dock conversations; the room itself is an ordinary chat', async () => {
+  const h = harness(agent => `${agent} ok`);
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'], label: 'Plan' });
+  await h.team.send(roomKey, { text: '@all hi', userLabel: 'H' });
+  await h.settle();
+  const creates = h.calls.filter(c => c.method === 'sessions.create').map(c => c.params);
+  assert.equal(creates.find(c => c.key === roomKey).surface, undefined, 'the room is a chat people see');
+  const work = creates.filter(c => c.key !== roomKey);
+  assert.equal(work.length, 2);
+  assert.deepEqual(work.map(c => c.surface), ['plugin-dock', 'plugin-dock']);
+});
+
+test('team chats need OpenClaw 2026.11.6: an older gateway refuses with an update message, makes nothing and deletes nothing', async () => {
+  const h = harness(() => 'ok');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  h.sessions.set('agent:dev:dashboard:pre-f5', []);
+  h.team.store.setWorkKey(roomKey, 'dev', 'agent:dev:dashboard:pre-f5');
+  onGateway(h, '2026.11.5');
+  const before = h.calls.filter(c => c.method === 'sessions.create').length;
+  await assert.rejects(h.team.createRoom({ agentIds: ['dev', 'atlas'] }), /Team chats need OpenClaw 2026\.11\.6 or newer/);
+  assert.equal(h.calls.filter(c => c.method === 'sessions.create').length, before);
+  assert.deepEqual(await h.team.cleanUpHelpers(), { deleted: [], skipped: [] }, 'old sessions kept: they could not be made again');
+  assert.equal(h.calls.filter(c => c.method === 'sessions.delete').length, 0);
+});
+
+test('cleanup at start: visible working sessions from before are deleted; rooms, converted chats and dock sessions stay', async () => {
+  const h = harness(agent => `${agent} ok`);
+  onGateway(h, '2026.11.6');
+  const source = 'agent:atlas:dashboard:old-chat';
+  h.sessions.set(source, []);
+  const converted = await h.team.createRoom({ sourceKey: source, agentIds: ['dev'], label: 'Converted' });
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'], label: 'Plan' });
+  // An earlier connector made dev's working session here as a plain chat (no surface).
+  const old = 'agent:dev:dashboard:pre-f5';
+  const oldLabel = `Dev · team chat ${roomKey.slice(-8)}`;
+  h.sessions.set(old, []);
+  h.labels.set(old, oldLabel);
+  h.team.store.setWorkKey(roomKey, 'dev', old);
+  h.team._workKeysChanged();
+  await h.team.send(roomKey, { text: '@all hi', userLabel: 'H' });
+  await h.settle();
+  assert.ok(h.calls.some(c => c.method === 'chat.send' && c.params.sessionKey === old), 'dev answered in its old session');
+  const dockAtlas = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'atlas').workKey;
+
+  const out = await h.team.cleanUpHelpers();
+  assert.deepEqual(out.deleted.map(d => [d.key, d.kind, d.label]), [[old, 'work', oldLabel]]);
+  const deleted = h.calls.filter(c => c.method === 'sessions.delete').map(c => c.params);
+  assert.deepEqual(deleted, [{ key: old, expectedSessionId: `sid-${old}` }]);
+  for (const kept of [roomKey, converted.roomKey, source, dockAtlas]) assert.ok(!deleted.some(d => d.key === kept), `kept ${kept}`);
+  assert.equal(h.team.isWorkKey(old), false);
+  assert.ok(h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'dev').seenAt > 0, 'its cursor stays: what it saw was handled (N2)');
+  assert.equal(await h.team.cleanUpHelpers(), out, 'once per start');
+
+  // Its next turn makes a new, hidden one (same label, now free) that gets the room so far.
+  await h.team.send(roomKey, { text: '@dev again', userLabel: 'H' });
+  await h.settle();
+  const made = h.calls.filter(c => c.method === 'sessions.create' && /^agent:dev:/.test(c.params.key)).at(-1).params;
+  assert.notEqual(made.key, old);
+  assert.deepEqual([made.surface, made.label], ['plugin-dock', oldLabel]);
+  const prompt = h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey === made.key).at(-1).params.message;
+  const [before, asked] = prompt.split('New messages since your last turn:');
+  assert.match(before, /Earlier in this chat \(already handled[^\n]*\):\n\n[\s\S]*@all hi/, 'the room so far, as handled context');
+  assert.match(asked, /@dev again/);
+  assert.doesNotMatch(asked, /@all hi/);
+  // Once given, it isn't given again.
+  await h.team.send(roomKey, { text: '@dev and once more', userLabel: 'H' });
+  await h.settle();
+  assert.doesNotMatch(h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey === made.key).at(-1).params.message, /already handled/);
+});
+
+test('cleanup keeps a working session whose turn is still running', async () => {
+  let release;
+  const h = harness(agent => (agent === 'dev' ? new Promise(r => { release = r; }) : 'ok'));
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  const old = 'agent:dev:dashboard:pre-f5-busy';
+  h.sessions.set(old, []);
+  h.team.store.setWorkKey(roomKey, 'dev', old);
+  h.team._workKeysChanged();
+  h.team.send(roomKey, { text: '@dev slow one', userLabel: 'H' });
+  for (let i = 0; i < 20; i++) await new Promise(r => setImmediate(r));
+  const out = await h.team.cleanUpHelpers();
+  assert.deepEqual(out.skipped.map(s => [s.key, s.why]), [[old, 'running']]);
+  assert.equal(h.calls.filter(c => c.method === 'sessions.delete').length, 0);
+  release('done');
+  await h.settle();
+});
+
+test('cleanup at start: our agents\' visible guest sessions are deleted; their lane catches up in rooms hosted here', async () => {
+  const rows = [];
+  const remote = { guestSessionRows: () => rows, isRunningIn: key => key === 'agent:main-guest-a:dashboard:busy', remoteAgents: () => [] };
+  const h = harness(() => 'ok', { remote });
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  rows.push({ key: 'agent:main-guest-a:dashboard:g1', shareId: 'sh1', roomId: roomKey, agentId: 'main-guest-a' },
+    { key: 'agent:main-guest-a:dashboard:busy', shareId: 'sh2', roomId: roomKey, agentId: 'main-guest-a' },
+    { key: roomKey, shareId: 'sh3', roomId: roomKey, agentId: 'dev' }); // never a room, whatever a store says
+  for (const r of rows) h.sessions.set(r.key, []);
+  h.team.store.setLaneSeenAt(roomKey, 'dev', 'guest:sh1', 5_000);
+  const out = await h.team.cleanUpHelpers();
+  assert.deepEqual(out.deleted.map(d => [d.key, d.kind]), [['agent:main-guest-a:dashboard:g1', 'guest']]);
+  assert.deepEqual(out.skipped.map(s => [s.key, s.why]), [['agent:main-guest-a:dashboard:busy', 'running']]);
+  assert.equal(h.team.store.laneSeenAt(roomKey, 'dev', 'guest:sh1'), 5_000, 'its cursor stays (N2)');
+  assert.equal(h.team.store.laneRebuilt(roomKey, 'dev', 'guest:sh1'), true, 'its next turn gets the room so far as handled context');
+});
+
+test('N2: a working session re-made by cleanup is not handed an ask that was already handled as a new request', async () => {
+  // QA r1 N2: an ask whose run ended without posting a reply (here: it passed) sat before the cut; the re-made session
+  // got it as one of the chat's messages and ran the command again.
+  const h = harness((agent, prompt) => (/sleep 200/.test(prompt.split('Messages in this chat so far:').at(-1).split('New messages since your last turn:').at(-1)) ? 'NOTHING_TO_ADD' : `${agent} ok`));
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  const old = 'agent:dev:dashboard:pre-f5-n2';
+  h.sessions.set(old, []);
+  h.team.store.setWorkKey(roomKey, 'dev', old);
+  h.team._workKeysChanged();
+  await h.team.send(roomKey, { text: '@dev run exactly: sleep 200 && echo SLEPT-OK', userLabel: 'H' });
+  await h.settle();
+  assert.ok(h.calls.some(c => c.method === 'chat.send' && c.params.sessionKey === old), 'dev took the ask in its old session');
+  assert.equal((await h.team.cleanUpHelpers()).deleted.length, 1);
+  await h.team.send(roomKey, { text: '@dev what is the codeword?', userLabel: 'H' });
+  await h.settle();
+  const made = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'dev').workKey;
+  const prompt = h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey === made).at(-1).params.message;
+  const asked = prompt.split(/Messages in this chat so far:|New messages since your last turn:/).at(-1);
+  assert.match(asked, /what is the codeword/);
+  assert.doesNotMatch(asked, /sleep 200/, 'the handled ask is context at most, never among the messages to answer');
+});
+
+test('N2: handled context is its own block before the new messages, labelled like them', () => {
+  const h = harness(() => 'ok');
+  const msg = h.team._prompt({ agentId: 'dev', name: 'Dev' }, [], [{ id: 'x', ts: 2, text: '[H]\n\nnew line' }], 'addressed', '',
+    { handled: [{ id: 'y', ts: 1, text: '[H]\n\nthe codeword is MANGO-7' }] });
+  assert.match(msg, /Earlier in this chat \(already handled[^\n]*\):\n\n\[H\]: the codeword is MANGO-7\n\nNew messages since your last turn:\n\n\[H\]: new line/);
+  assert.doesNotMatch(h.team._prompt({ agentId: 'dev', name: 'Dev' }, [], [{ id: 'x', ts: 2, text: '[H]\n\nnew line' }], 'addressed', ''), /already handled/);
+});
+
+test('N2: a "from now on" agent whose session is re-made is not shown what came before it joined', async () => {
+  const h = harness(() => 'ok');
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.request('chat.inject', { sessionKey: roomKey, message: 'SECRET-BEFORE', label: 'H' });
+  const joinedAt = Math.max(...(h.sessions.get(roomKey) || []).map(m => m.timestamp)); // "from now on" = after the newest line
+  const realNow = Date.now;
+  Date.now = () => joinedAt;
+  try { await h.team.addAgent(roomKey, 'main', { history: 'now' }); } finally { Date.now = realNow; }
+  await h.team.send(roomKey, { text: '@main hi', userLabel: 'H' });
+  await h.settle();
+  const first = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'main').workKey;
+  assert.ok(first, 'it answered once');
+  await h.team.request('sessions.delete', { key: first }); // deleted in the Control UI
+  h.team.onSessionDeleted(first); // made again on its next turn
+  await h.team.send(roomKey, { text: '@main again', userLabel: 'H' });
+  await h.settle();
+  const made = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'main').workKey;
+  assert.notEqual(made, first);
+  const prompt = h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey === made).at(-1).params.message;
+  assert.doesNotMatch(prompt, /SECRET-BEFORE/);
+  assert.match(prompt, /@main hi/, 'what it was part of is handled context');
+});
+
+test('B1: the agent owner says its session is new; the host asks again once with the room so far as handled context', async () => {
+  const calls = [];
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (agentId, args) => {
+      calls.push(args);
+      if (calls.length === 2) throw Object.assign(new Error('session is new'), { code: 'lane_new' }); // its session was re-made there
+      return { state: 'final', text: `jarvis ${calls.length}` };
+    },
+    abort: async () => {},
+  };
+  const h = harness(() => 'ok', { remote });
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await h.team.send(roomKey, { text: '@jarvis·kamil the codeword is KIWI-3, remember it', userLabel: 'H' });
+  await h.settle();
+  assert.equal(calls[0].first, true, 'its first turn says so');
+  await h.team.send(roomKey, { text: '@jarvis·kamil what is the codeword?', userLabel: 'H' });
+  await h.settle();
+  assert.equal(calls.length, 3);
+  assert.equal(calls[1].first, false);
+  assert.notEqual(calls[2].turnId, calls[1].turnId, 'a new turn, not a resend of the refused one');
+  assert.equal(calls[2].first, true);
+  const [before, asked] = calls[2].message.split('New messages since your last turn:');
+  assert.match(before, /already handled[\s\S]*KIWI-3/);
+  assert.match(asked, /what is the codeword/);
+  assert.doesNotMatch(asked, /KIWI-3/);
+  assert.match(h.room(roomKey).at(-1), /jarvis 3/);
+});
+
+test('B1: an agent owner that never says lane_new (older connector) gets one turn, as before', async () => {
+  const calls = [];
+  const remote = { remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }], turn: async (a, args) => { calls.push(args); return { state: 'final', text: 'ok' }; }, abort: async () => {} };
+  const h = harness(() => 'ok', { remote });
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await h.team.send(roomKey, { text: '@jarvis·kamil one', userLabel: 'H' });
+  await h.team.send(roomKey, { text: '@jarvis·kamil two', userLabel: 'H' });
+  await h.settle();
+  assert.deepEqual(calls.map(c => c.first), [true, false]);
+  assert.doesNotMatch(calls[1].message, /already handled/);
+});
+
+test('B1: lane_new with nothing the lane may be shown ("from now on" agent from before join times were kept): asked again, no error', async () => {
+  const calls = [];
+  const remote = {
+    remoteAgents: () => [{ agentId: 'peer:sh1:jarvis', name: 'Jarvis · Kamil', ownerName: 'Kamil' }],
+    turn: async (agentId, args) => { calls.push(args); if (calls.length === 2) throw Object.assign(new Error('new'), { code: 'lane_new' }); return { state: 'final', text: `j${calls.length}` }; },
+    abort: async () => {},
+  };
+  const h = harness(() => 'ok', { remote });
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis'] });
+  await h.team.send(roomKey, { text: '@jarvis·kamil one', userLabel: 'H' });
+  await h.settle();
+  h.team._handled = () => []; // e.g. added "from now on" by an older connector (no join time kept): nothing it may be shown
+  await h.team.send(roomKey, { text: '@jarvis·kamil two', userLabel: 'H' });
+  await h.settle();
+  assert.equal(calls.length, 3);
+  assert.deepEqual([calls[1].first, calls[2].first], [false, true]);
+  assert.doesNotMatch(calls[2].message, /already handled/);
+  assert.match(h.room(roomKey).at(-1), /j3/);
+});
+
+test("M1: a re-made lane's handled context includes its own last reply", async () => {
+  const h = harness((agent, prompt) => (/count the files/.test(prompt) ? 'there are 7 files' : `${agent} ok`));
+  onGateway(h, '2026.11.6');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@dev count the files', userLabel: 'H' });
+  await h.settle();
+  const first = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'dev').workKey;
+  await h.team.request('sessions.delete', { key: first });
+  h.team.onSessionDeleted(first);
+  await h.team.send(roomKey, { text: '@dev how many files were there?', userLabel: 'H' });
+  await h.settle();
+  const made = h.team.store.getRoom(roomKey).members.find(m => m.agentId === 'dev').workKey;
+  const [before, asked] = h.calls.filter(c => c.method === 'chat.send' && c.params.sessionKey === made).at(-1).params.message.split('New messages since your last turn:');
+  assert.match(before, /count the files[\s\S]*\(you, for your owner\)\]: there are 7 files/, 'its own answer is part of what it handled');
+  assert.doesNotMatch(asked, /there are 7 files/);
 });

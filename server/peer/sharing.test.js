@@ -103,6 +103,7 @@ test('a guest session deleted on the gateway is made again on the next turn, wit
   s.activate();
   await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi' });
   const first = s.ownerCalls.find(c => c.method === 'sessions.create').params;
+  assert.equal(first.surface, 'plugin-dock', 'hidden from the Control UI like the room\'s other sessions (F5)');
 
   // Deleted (e.g. in the Control UI): the gateway no longer has it.
   const request = s.owner.request;
@@ -111,7 +112,7 @@ test('a guest session deleted on the gateway is made again on the next turn, wit
   const creates = s.ownerCalls.filter(c => c.method === 'sessions.create').map(c => c.params);
   assert.equal(creates.length, 2);
   // Restricted runs Basic only: no session mode (a mode would override the copy's exec allowlist).
-  assert.deepEqual([creates[1].key, creates[1].label, creates[1].category, creates[1].permissionMode], [first.key, first.label, undefined, undefined]);
+  assert.deepEqual([creates[1].key, creates[1].label, creates[1].category, creates[1].permissionMode, creates[1].surface], [first.key, first.label, undefined, undefined, 'plugin-dock']);
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').at(-1).params.sessionKey, first.key);
 
   // Still there: reused, no new session.
@@ -1439,4 +1440,26 @@ test('a turn that may ask the owner holds the approval connection for its whole 
   assert.equal(send2.timeoutMs, 10 * 60_000);
   s.owner.onGatewayEvent({ event: 'chat', payload: { runId: send2.idempotencyKey, state: 'final', message: { content: [{ type: 'text', text: 'ok' }] } } });
   await t2;
+});
+
+test("B1: a guest session made again while the host's lane isn't new: refused as lane_new before running; older hosts as before", async () => {
+  const s = setup();
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }], access: 'restricted', dailyCap: 10 });
+  s.activate();
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't1', roomId: 'room1', roomTitle: 'Rivers', message: 'hi', first: true });
+  const key = s.ownerCalls.find(c => c.method === 'sessions.create').params.key;
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
+  // Deleted (F5 cleanup, or the Control UI): the next turn makes it again.
+  const request = s.owner.request;
+  let gone = true;
+  s.owner.request = async (method, params) => (method === 'sessions.describe' && params.key === key && gone ? { session: null } : request(method, params));
+  await assert.rejects(s.req.turn('peer:sh1:jarvis-guest', { turnId: 't2', roomId: 'room1', message: 'codeword?', first: false }), e => e.code === 'lane_new');
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1, "nothing ran in the new session");
+  gone = false;
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't3', roomId: 'room1', message: 'room so far + codeword?', first: true });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 2);
+  // A host that doesn't say (older connector): runs as before.
+  gone = true;
+  await s.req.turn('peer:sh1:jarvis-guest', { turnId: 't4', roomId: 'room1', message: 'old host' });
+  assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 3);
 });

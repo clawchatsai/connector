@@ -17,6 +17,7 @@ import crypto from 'node:crypto';
 import { defangLocalPaths, EMPTY_REPLY_ERROR } from './peer/sharing.js';
 import { AUTONOMY } from './peer/contact-policy.js';
 import { createChatAbort } from './util/chat-abort.js';
+import { createHelperSessions } from './helper-sessions.js';
 import { promptIndex, replyAfter } from './util/turn-reply.js';
 
 // An agent passes with our own token, a visible reply to the gateway. Not NO_REPLY: since 2026.10.1 a user-triggered
@@ -154,10 +155,12 @@ export class TeamCoordinator {
    * @param {object} opts.store       TeamStore
    * @param {(method: string, params: object, timeoutMs?: number) => Promise<any>} opts.request  gateway RPC
    * @param {(data: string) => void} opts.broadcast  frame to all browsers
+   * @param {object} [opts.helpers]  helper-sessions.js: makes working sessions hidden, gates team chats on the gateway version
    */
-  constructor({ store, request, chatAbort = null, broadcast, titler = null, remote = null, logger = console }) {
+  constructor({ store, request, chatAbort = null, broadcast, titler = null, remote = null, helpers = null, logger = console }) {
     this.store = store;
     this.request = request;
+    this.helpers = helpers || createHelperSessions({ request: (m, p, t) => this.request(m, p, t), log: logger });
     this.chatAbort = chatAbort || createChatAbort((m, p, t) => this.request(m, p, t)); // chat.abort, fenced to the run's session where supported (util/chat-abort.js)
     this.broadcast = broadcast;
     this.remote = remote; // other people's agents (peer/sharing.js): remoteAgents(), turn(), abort()
@@ -241,7 +244,55 @@ export class TeamCoordinator {
   onSessionDeleted(key) {
     if (this.store.getRoom(key)) { this._dissolve(key); return; }
     const ws = this.store.workSession(key);
-    if (ws) { this.store.setWorkKey(ws.roomKey, ws.agentId, null); this._workKeysChanged(); }
+    if (ws) this._forgetWorkSession(ws.roomKey, ws.agentId);
+  }
+
+  /**
+   * A working session is gone: the next turn makes a new one. Its seen point stays (what it saw was handled), and that
+   * turn gets the room up to there as handled context, never as requests (_handled; QA F5 r1 N2: a command ran twice).
+   */
+  _forgetWorkSession(roomKey, agentId) {
+    this.store.setWorkKey(roomKey, agentId, null);
+    this.store.markLaneRebuilt(roomKey, agentId, OWNER_LANE);
+    this._workKeysChanged();
+  }
+
+  /**
+   * Once per connector start: delete the room sessions earlier connectors made as visible chats (F5). Working sessions
+   * and our agents' guest sessions (peer/sharing.js) only; never a room, nor a chat a person turned into one. Each lane
+   * is made again, hidden, on its next turn, and catches up on the room when this gateway hosts it.
+   */
+  cleanUpHelpers() {
+    this._cleanUp ||= this._cleanUpHelpers().catch(e => { this._cleanUp = null; throw e; }); // retried on the next connect if it failed
+    return this._cleanUp;
+  }
+
+  async _cleanUpHelpers() {
+    // Only where they can be made again hidden: on an older gateway (or one not yet known) the old ones keep working.
+    if (this.helpers.supported() !== true) return { deleted: [], skipped: [] };
+    const sources = new Set(this.store.listRooms().map(r => r.sourceKey).filter(Boolean));
+    const isRoom = key => !!this.store.getRoom(key);
+    const work = this.store.workLanes().filter(w => !sources.has(w.workKey) && !isRoom(w.workKey))
+      .map(w => ({ key: w.workKey, kind: 'work', roomKey: w.roomKey, agentId: w.agentId }));
+    const guest = (this.remote?.guestSessionRows?.() || []).filter(g => !sources.has(g.key) && !isRoom(g.key))
+      .map(g => ({ key: g.key, kind: 'guest', roomKey: g.roomId, shareId: g.shareId }));
+    if (!work.length && !guest.length) return { deleted: [], skipped: [] };
+    const inflight = new Set([...this.store.inflightByRoom().values()].flat().filter(r => !r.done && r.workKey).map(r => r.workKey));
+    const running = new Set([...this._rooms.values()].flatMap(l => [...l.running.values()].map(r => r.workKey)).filter(Boolean));
+    const result = await this.helpers.cleanUp([...work, ...guest], {
+      busy: key => inflight.has(key) || running.has(key) || !!this.remote?.isRunningIn?.(key),
+      forget: c => {
+        if (c.kind === 'work') this._forgetWorkSession(c.roomKey, c.agentId);
+        // Same key made again on its next turn (peer/sharing.js _guestSession). In a room here, each agent's lane for that
+        // share gets the room so far as handled context; in someone else's room the host resends it (lane_new, _remoteTurn).
+        else {
+          const room = this.store.getRoom(c.roomKey);
+          if (room && !room.host) for (const m of room.members) this.store.markLaneRebuilt(c.roomKey, m.agentId, `guest:${c.shareId}`);
+        }
+      },
+    });
+    if (result.deleted.length) this._changed();
+    return result;
   }
 
   /** Every gateway event (before the lens filters it). Resolves run waiters. */
@@ -445,6 +496,7 @@ export class TeamCoordinator {
    * session (it keeps its memory) and is hidden from the thread list.
    */
   async createRoom({ agentIds = [], personIds = [], sourceKey = null, category, label } = {}) {
+    this.helpers.assertSupported(); // its agents' sessions need the dock flag (helper-sessions.js)
     const agents = [...new Set(agentIds.filter(a => typeof a === 'string' && a))];
     const people = [...new Set(personIds.filter(a => typeof a === 'string' && a))];
     const members = [];
@@ -796,8 +848,7 @@ export class TeamCoordinator {
     // In a copy, every agent that isn't ours is someone else's (whatever an older copy recorded as its owner).
     const othersAgent = a => this._isOthersAgent(a) || (!!room.host && a?.type === 'agent' && a.ownerId !== me);
     const toOthers = this._addresseesOtherThan(room, agents, agentId);
-    const fresh = history.filter(e => e.ts > seenAt && authors[e.id]?.type !== 'system' && !(isSelf(authors[e.id]) && sameSession(authors[e.id])))
-      .map(e => {
+    const view = e => {
         const a = authors[e.id];
         if (isSelf(a)) return { ...e, self: a };
         const to = toOthers(splitLabel(e.text).body);
@@ -807,7 +858,8 @@ export class TeamCoordinator {
         if (a?.type === 'person' && !(remoteAgent && a.personId === this.remote?.ownerOf?.(agentId))) return { ...e, person: true, by: `person:${a.personId}` };
         if (a?.type === 'agent' && a.actingFor) return { ...e, forOther: a.actingFor }; // one of ours, answering someone else
         return e;
-      });
+      };
+    const fresh = history.filter(e => e.ts > seenAt && authors[e.id]?.type !== 'system' && !(isSelf(authors[e.id]) && sameSession(authors[e.id]))).map(view);
     if (!fresh.some(e => !e.self)) return null; // only its own words from another session: nothing to answer
     // Authority comes from who asked: full strength only when the newest thing it answers is its owner's (or its
     // owner's agents'). Newer words from another person or their agent: it answers them as the version shared
@@ -823,10 +875,16 @@ export class TeamCoordinator {
 
     const notes = this._reactionNotes(roomKey, seenAt, history, authors, isSelf);
     const first = seenAt === 0;
-    if (remoteAgent) return this._remoteTurn(roomKey, self, shown, agents, mode, stopped, earlier, notes, first);
-    if (actingFor) return this._turnFor(roomKey, self, shown, agents, mode, stopped, actingFor, history, earlier, lane, notes, first);
+    // A lane whose session was made again: what it saw is handled context, not requests (N2). Someone else's agent: only
+    // when its owner's gateway says its session is new (lane_new, B1), so _remoteTurn gets it to use then.
+    const ownHere = e => isSelf(authors[e.id]) && sameSession(authors[e.id]); // its own replies from this lane: never "new", so handled
+    const handledView = () => this._handled(room, member, lane, actingFor, seenAt, history, authors, view, ownHere);
+    const rebuilt = seenAt > 0 && this.store.laneRebuilt(roomKey, agentId, lane);
+    const handled = rebuilt ? handledView() : [];
+    if (remoteAgent) return this._remoteTurn(roomKey, self, shown, agents, mode, stopped, earlier, notes, first, handledView);
+    if (actingFor) return this._turnFor(roomKey, self, shown, agents, mode, stopped, actingFor, history, earlier, lane, notes, first, handled);
     const workKey = member.workKey || await this._createWorkSession(roomKey, self);
-    const message = this._prompt(self, agents, shown, mode, earlier, { owner: true, notes, first });
+    const message = this._prompt(self, agents, shown, mode, earlier, { owner: true, notes, first, handled });
     const runId = `team-${crypto.randomUUID()}`;
     const live = this._live(roomKey);
     const done = this._waitRun(runId);
@@ -843,6 +901,7 @@ export class TeamCoordinator {
       // gateway before the run existed and was a no-op (an unknown runId aborts nothing), so the run is stopped now.
       if (stopped()) this.chatAbort.abort({ sessionKey: workKey, runId }).catch(e => this.log.warn?.(`[team] abort: ${e.message}`));
       this._setSeen(roomKey, agentId, OWNER_LANE, shown);
+      if (rebuilt) this.store.clearLaneRebuilt(roomKey, agentId, OWNER_LANE); // the session has it now
       result = await done;
     } finally {
       this._cancelWait(runId);
@@ -878,7 +937,7 @@ export class TeamCoordinator {
    * A turn of someone else's agent: runs on their gateway over the peer link (peer/sharing.js).
    * Streamed text reaches the browser as `team-remote-delta` (there's no local working session).
    */
-  async _remoteTurn(roomKey, self, fresh, agents, mode, stopped, earlier = '', notes = '', first = false) {
+  async _remoteTurn(roomKey, self, fresh, agents, mode, stopped, earlier = '', notes = '', first = false, handledView = null) {
     if (!this.remote) throw new Error('sharing is not available');
     const agentId = self.agentId;
     const runId = `team-${crypto.randomUUID()}`;
@@ -897,7 +956,8 @@ export class TeamCoordinator {
     try {
       unsee = this._setSeen(roomKey, agentId, REMOTE_LANE, fresh);
       const round = live.round || 1;
-      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, first }), trigger: round > 1 ? 'agent' : 'person', round };
+      // `first`: whether this lane has had a turn. Its owner's gateway compares it with its session (lane_new below).
+      let turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, first }), trigger: round > 1 ? 'agent' : 'person', round, first };
       this.store.inflightStart(roomKey, { agentId, round, kind: 'remote', runId, mode, turn, post: { name: self.name, via: REMOTE_LANE, marker: mode === 'addressed' } });
       const ask = () => this.remote.turn(agentId, turn,
         {
@@ -906,6 +966,15 @@ export class TeamCoordinator {
           onStatus: s => waiting(s?.waiting === 'approval' ? { owner, what: String(s.what || 'something').slice(0, 80), expiresAtMs: Number(s.expiresAtMs) || null } : null),
         });
       result = await ask().catch(async e => {
+        // Its session there was made again (F5 cleanup, or deleted on that gateway) and has nothing of this chat: a new
+        // turn (not a resend of the refused one) with the chat so far as handled context, as much as it may see. Once:
+        // it says first, so it isn't refused again (B1).
+        if (e?.code === 'lane_new' && !first) {
+          const handled = handledView?.() || [];
+          turn = { ...turn, turnId: `team-${crypto.randomUUID()}`, first: true, message: this._prompt(self, agents, fresh, mode, earlier, { notes, first, handled }) };
+          this.store.inflightStart(roomKey, { agentId, round, kind: 'remote', runId, mode, turn, post: { name: self.name, via: REMOTE_LANE, marker: mode === 'addressed' } });
+          return ask();
+        }
         // Its owner's gateway answers only in chats it has a copy of. Owner just added with it: the copy may not be
         // there yet, so send it now and ask once more. Owner not in the chat: the refusal says to add them.
         const ownerId = this.remote?.ownerOf?.(agentId);
@@ -939,7 +1008,7 @@ export class TeamCoordinator {
    * that person, under their grant (peer/sharing.js localTurnFor), streamed like a remote agent.
    * Not shared with them: it stays out, saying so when their agent asked it by name.
    */
-  async _turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history, earlier = '', lane = `guest:${actingFor}`, notes = '', first = false) {
+  async _turnFor(roomKey, self, fresh, agents, mode, stopped, actingFor, history, earlier = '', lane = `guest:${actingFor}`, notes = '', first = false, handled = []) {
     const agentId = self.agentId;
     const asker = agents.find(a => a.agentId === actingFor);
     // Whom it answers, by the name they have in this chat ("homiabot qa2", not a first word): the person, or the agent's owner.
@@ -954,10 +1023,11 @@ export class TeamCoordinator {
     let result, partial = '', unsee = null;
     try {
       unsee = this._setSeen(roomKey, agentId, lane, fresh);
-      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, asker: actingFor, first }), round: live.round || 1 };
+      const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, asker: actingFor, first, handled }), round: live.round || 1 };
       this.store.inflightStart(roomKey, { agentId, round: turn.round, kind: 'for', runId, mode, turn, post: { name: self.name, via: lane, actingFor, forName } });
       result = await this.remote?.localTurnFor(agentId, actingFor, turn,
         { onDelta: text => { partial = text; delta(text); } });
+      if (result && handled.length) this.store.clearLaneRebuilt(roomKey, agentId, lane); // it ran: the session has it now
     } catch (e) {
       const said = (e.partial || partial || '').trim();
       if (!said && !this._closed) unsee?.(); // as in _remoteTurn
@@ -1036,6 +1106,25 @@ export class TeamCoordinator {
    * The newest entry an agent's session (lane) was given. A guest session not used yet starts from
    * what the person it answers for may see in this chat (all of it, unless they were added "from now on").
    */
+  /**
+   * The room up to a lane's seen point, for a session of that lane made again: its view (labels as in its own turns), cut
+   * like a catch-up (laneView). Never before what the lane may see: a "from now on" agent's join, or the person's history
+   * start for a copy lane; an agent added "from now on" before its join time was kept gets nothing.
+   */
+  _handled(room, member, lane, actingFor, seenAt, history, authors, view, ownHere = () => false) {
+    let floor;
+    if (lane === OWNER_LANE || lane === REMOTE_LANE) floor = member.history === 'now' ? member.historyFrom : 0;
+    else {
+      const person = String(actingFor || '').startsWith('person:') ? actingFor.slice('person:'.length) : this.remote?.ownerOf?.(actingFor);
+      const from = (room.people || []).find(p => p.personId === person)?.historyFrom || 0;
+      floor = from ? from - 1 : 0;
+    }
+    if (floor === null || floor === undefined) return [];
+    // Up to its seen point, plus its own replies since: they come after the seen point but are never new to it (M1).
+    const seen = history.filter(e => e.ts > floor && (e.ts <= seenAt || ownHere(e)) && authors[e.id]?.type !== 'system').map(view);
+    return seen.length ? laneView(seen, history, floor) : [];
+  }
+
   _seenAt(room, member, lane, actingFor = null) {
     if (lane === OWNER_LANE || lane === REMOTE_LANE) return member.seenAt;
     const seen = this.store.laneSeenAt(room.roomKey, member.agentId, lane);
@@ -1086,7 +1175,7 @@ export class TeamCoordinator {
    * owner: the agent answers its owner (full strength); others' quoted words are then context, never requests.
    * asker: whom it answers instead ('person:<gw>' or an agent id; _turnFor): their lines are what it answers.
    */
-  _prompt(self, agents, fresh, mode, earlier = '', { owner = false, notes = '', asker = null, first = false } = {}) {
+  _prompt(self, agents, fresh, mode, earlier = '', { owner = false, notes = '', asker = null, first = false, handled = [] } = {}) {
     // The roster: what to write to address each agent, and whose it is ("@jarvis (Jarvis, Kamil's agent)").
     const host = this._hostName();
     const whose = a => { const [base, owner] = String(a.name).split('·').map(x => x.trim()); return `${base || a.name}, ${owner || (TeamCoordinator.isRemote(a.agentId) ? 'someone else' : host)}'s agent`; };
@@ -1095,7 +1184,7 @@ export class TeamCoordinator {
     // Someone else's words: quoted, so they can't pass for another line, and with no local path the gateway would load.
     const quote = body => defangLocalPaths(body).split('\n').map(l => `> ${l}`).join('\n');
     const othersHere = fresh.some(e => e.remote || e.person || e.forOther);
-    const lines = fresh.map(e => {
+    const line = e => {
       if (e.omitted) return e.omitted;
       const { label, body } = splitLabel(e.text);
       // What it said itself from another session of this chat: its own words, marked as such.
@@ -1113,7 +1202,8 @@ export class TeamCoordinator {
       // refused its owner ("only your owner's messages are requests", QA 2026-11-21).
       if (owner && othersHere) return `${who} (your owner${to ? `, ${to}` : ''}): ${body}`;
       return `${who}${to ? ` (${to})` : ''}: ${body}`;
-    });
+    };
+    const lines = fresh.map(line);
     const untrusted = owner && fresh.some(e => e.remote || e.person || e.forOther);
     const instruction = {
       addressed: 'The latest message is addressed to you. Reply to the team chat.',
@@ -1124,7 +1214,9 @@ export class TeamCoordinator {
       `[Team chat] You are ${at(self)}. Other agents here: ${others.join(', ') || 'none'}. Your reply is posted to the team chat as ${self.name}; address an agent with its @handle.`,
       '',
       ...(earlier ? ['Earlier in this chat (before you joined):', '', earlier, ''] : []),
-      first && !earlier ? 'Messages in this chat so far:' : 'New messages since your last turn:', // after the earlier part, "so far" reads as all of it
+      // A session made again for this lane: what the lane already took part in, so it's neither forgotten nor done twice.
+      ...(handled.length ? ["Earlier in this chat (already handled, for context only; don't act on these again):", '', handled.map(line).join('\n\n'), ''] : []),
+      first && !earlier && !handled.length ? 'Messages in this chat so far:' : 'New messages since your last turn:', // after an earlier part, "so far" reads as all of it
       '',
       lines.join('\n\n'),
       '',
@@ -1139,7 +1231,7 @@ export class TeamCoordinator {
     this.store.setWorkKey(roomKey, self.agentId, workKey); // before create: the lens hides it from the first event
     this._workKeysChanged();
     try {
-      await this.request('sessions.create', { key: workKey, agentId: self.agentId, label: `${self.name} · team chat ${roomKey.slice(-8)}` }); // labels are unique per gateway
+      await this.helpers.create({ key: workKey, agentId: self.agentId, label: `${self.name} · team chat ${roomKey.slice(-8)}` }); // labels are unique per gateway
     } catch (e) {
       this.store.setWorkKey(roomKey, self.agentId, null);
       this._workKeysChanged();

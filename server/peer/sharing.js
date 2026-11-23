@@ -18,6 +18,7 @@ import { PeerLink } from './link.js';
 import { canonicalJson, verifySignature, fingerprint } from './keys.js';
 import { redactSecrets } from '../util/redact.js';
 import { createChatAbort } from '../util/chat-abort.js';
+import { createHelperSessions } from '../helper-sessions.js';
 import { ensureGuestRestrictions, findGuestAgent, isGuestAgent } from './guest-agent.js';
 import { ContactBook, personKeyOf } from './contacts.js';
 import { AUTONOMY, ACCESS, sessionMode, toolOverrides as contactOverrides, topicsNote, copyTools, copyToolsHold, copyKind, defaultContact, TOOL_GROUPS, ALWAYS_OFF, BASIC_DEFAULTS, DEFAULT_TOOLS, DEFAULT_COMMANDS } from './contact-policy.js';
@@ -103,9 +104,11 @@ export class SharingManager {
    * @param {(msg: object) => void} o.signal  send a message to the signal server
    * @param {(shareId: string) => Promise<{ dc, dtls }>} o.openPeer  open a peer DataChannel (requester)
    * @param {(data: string) => void} o.broadcast  frame to this gateway's browsers
+   * @param {object} [o.helpers]  helper-sessions.js: makes guest sessions hidden
    */
-  constructor({ getDb, request, chatAbort = null, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console, resendBackoffMs = RESEND_BACKOFF_MS, recovery = { waitMs: RECOVERY_WAIT_MS, pollMs: RECOVERY_POLL_MS }, version = connectorVersion(), holdApprovals = null }) {
+  constructor({ getDb, request, chatAbort = null, key, gatewayId, signal, openPeer, broadcast = () => {}, log = console, resendBackoffMs = RESEND_BACKOFF_MS, recovery = { waitMs: RECOVERY_WAIT_MS, pollMs: RECOVERY_POLL_MS }, version = connectorVersion(), holdApprovals = null, helpers = null }) {
     Object.assign(this, { getDb, request, key, gatewayId, signal, openPeer, broadcast, log, resendBackoffMs, recovery, version, holdApprovals });
+    this.helpers = helpers || createHelperSessions({ request: (m, p, t) => this.request(m, p, t), log }); // guest sessions, hidden
     this.chatAbort = chatAbort || createChatAbort((m, p, t) => this.request(m, p, t)); // Stop, fenced where supported
     this._shares = [];            // latest share-list from the signal server
     this.serverEnabled = false;   // the signal server sends a share-list only to accounts with sharing on
@@ -611,6 +614,17 @@ export class SharingManager {
     return this._guestKeys.get(key) || null;
   }
 
+  /** Every guest session of this gateway: [{ key, shareId, roomId, agentId }] (TeamCoordinator.cleanUpHelpers). */
+  guestSessionRows() {
+    return this._db().prepare('SELECT share_id, room_id, agent_id, session_key FROM peer_sessions').all()
+      .map(r => ({ key: r.session_key, shareId: r.share_id, roomId: r.room_id, agentId: r.agent_id }));
+  }
+
+  /** Whether a guest turn is running in session `key` now. */
+  isRunningIn(key) {
+    return [...this._turns.values()].some(t => t.sessionKey === key); // a finished turn leaves _turns
+  }
+
   /** The gateway id of whoever owns a shared agent ('peer:<share>:<agent>'), or null. */
   ownerOf(remoteAgentId) {
     const id = SharingManager.parseRemoteId(remoteAgentId);
@@ -804,7 +818,11 @@ export class SharingManager {
     const permissionMode = sessionMode(contact);
     const skillNames = await this._skillNames(copyId);
     const toolOverrides = contactOverrides(contact, { skillNames, mcpServers: Object.keys(cfg?.parsed?.mcp?.servers || {}) });
-    const sessionKey = await this._guestSession(shareId, roomId, copyId, { name, roomTitle: String(p.roomTitle || 'team chat').slice(0, 80), permissionMode, toolOverrides, cwd: contact.access === 'full' ? contact.openFolder : null });
+    const { sessionKey, created } = await this._guestSession(shareId, roomId, copyId, { name, roomTitle: String(p.roomTitle || 'team chat').slice(0, 80), permissionMode, toolOverrides, cwd: contact.access === 'full' ? contact.openFolder : null });
+    // Its session here was made just now, while the host's lane for it has had turns (F5 cleanup deleted the old one,
+    // or it was deleted on this gateway): it has nothing of the chat. Say so before running; the host sends a new turn
+    // with the chat so far (team.js _remoteTurn). A host that doesn't send `first` (older connector) runs as before.
+    if (created && p.first === false) throw Object.assign(new Error('This chat is new on this side; send it with the chat so far'), { code: 'lane_new' });
     // Made from the requester's turn id when there is one: a resend (after a dropped link, or after this connector
     // restarted) reuses the idempotency key, so the gateway answers with the first run instead of starting another.
     const runId = turn.clientTurnId
@@ -1220,7 +1238,7 @@ export class SharingManager {
       .catch(() => false);
   }
 
-  /** The (share, room, agent) session on this gateway: the room's, out of the chat list; read in Settings → People → <name>. */
+  /** The (share, room, agent) session on this gateway: the room's, out of the chat list; read in Settings → People → <name>. { sessionKey, created } */
   async _guestSession(shareId, roomId, agentId, { name, roomTitle, permissionMode, toolOverrides, cwd = null }) {
     const db = this._db();
     const row = db.prepare('SELECT session_key FROM peer_sessions WHERE share_id = ? AND room_id = ? AND agent_id = ?').get(shareId, roomId, agentId);
@@ -1237,14 +1255,15 @@ export class SharingManager {
       // Re-apply the policy each turn: the owner may have changed the card since. Basic only and Off clear the mode
       // (null): a session mode would override the copy's exec allowlist (spike run 1).
       await this.request('sessions.patch', { key: row.session_key, permissionMode, toolOverrides }).catch(() => {});
-      return row.session_key;
+      return { sessionKey: row.session_key, created: false };
     }
     const key = (!wrongRoot && row?.session_key) || `agent:${agentId}:dashboard:${crypto.randomUUID()}`;
     // Labels are unique per gateway, and untitled rooms all fall back to "team chat": tag each room.
     const tag = crypto.createHash('sha256').update(`${shareId}|${roomId}`).digest('hex').slice(0, 6);
-    const create = label => this.request('sessions.create', {
-      key, agentId, ...(permissionMode ? { permissionMode } : {}), toolOverrides, label: label.slice(0, 200),
-      ...(cwd ? { cwd } : {}), // Full agent's "Open one folder": the session root (§12)
+    // Hidden like the room's other sessions (helper-sessions.js).
+    const create = label => this.helpers.create({
+      key, agentId, permissionMode, toolOverrides, label: label.slice(0, 200),
+      cwd, // Full agent's "Open one folder": the session root (§12)
     });
     try { await create(`${name} · ${roomTitle} · ${tag}`); }
     catch (e) {
@@ -1254,7 +1273,7 @@ export class SharingManager {
     db.prepare('INSERT OR REPLACE INTO peer_sessions (share_id, room_id, agent_id, session_key) VALUES (?, ?, ?, ?)').run(shareId, roomId, agentId, key);
     this._guestKeys = null;
     this._changed(); // the room's list of answering sessions grew: the app needs it before the agent asks for an approval
-    return key;
+    return { sessionKey: key, created: true };
   }
 
   /** The input sent under `runId` and the reply to it, if that input is in the session: { input, text } (text '' when none), else null. */
@@ -1448,12 +1467,12 @@ export class SharingManager {
    * turn's timeout): the owner attaches it to the run still going there, or answers from the finished one, so the
    * turn never runs twice. `stopped()`: the room was stopped, so it isn't sent again.
    */
-  async turn(agentId, { turnId, roomId, roomTitle, message, trigger = 'person', round = 0 }, { onDelta, onStatus, stopped = () => false } = {}) {
+  async turn(agentId, { turnId, roomId, roomTitle, message, trigger = 'person', round = 0, first }, { onDelta, onStatus, stopped = () => false } = {}) {
     const id = SharingManager.parseRemoteId(agentId);
     if (!id) throw new Error('not a shared agent');
     // trigger/round: what started this turn (a person's message, or another agent's reply in round N), for the
     // owner's autonomy tier.
-    const params = { turnId, agentId: id.remoteId, roomId, roomTitle, message, trigger, round };
+    const params = { turnId, agentId: id.remoteId, roomId, roomTitle, message, trigger, round, ...(typeof first === 'boolean' ? { first } : {}) }; // first: lane_new (_runGuestTurn)
     const onEvent = (event, data) => {
       if (event === 'delta' && typeof data === 'string') onDelta?.(data);
       else if (event === 'status' && data && typeof data === 'object') onStatus?.(data);

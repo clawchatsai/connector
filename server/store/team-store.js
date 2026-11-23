@@ -42,7 +42,7 @@ function roomRow(r, members, people = []) {
     rounds: r.rounds || DISCUSS_ROUNDS,
     sourceKey: r.source_key || null,
     createdAt: r.created_at,
-    members: members.map(m => ({ agentId: m.agent_id, workKey: m.work_key || null, seenAt: m.seen_at || 0, history: m.history || 'all', handle: m.handle || null })),
+    members: members.map(m => ({ agentId: m.agent_id, workKey: m.work_key || null, seenAt: m.seen_at || 0, history: m.history || 'all', historyFrom: m.history_from ?? null, handle: m.handle || null })),
     people: people.map(p => ({ personId: p.person_id, name: p.name, email: p.email || null, historyFrom: p.history_from || 0 })),
     ...(r.host_gateway_id ? { host: { gatewayId: r.host_gateway_id, roomId: r.host_room, name: r.host_name || 'Someone', ended: r.host_ended || null, ...JSON.parse(r.replica_json || '{}') } } : {}),
   };
@@ -64,6 +64,7 @@ export function createTeamStore(getGlobalDb) {
       if (!cols('team_members').has('history')) g.exec('ALTER TABLE team_members ADD COLUMN history TEXT');
       // The @handle the room gives the agent (team.js assignHandle): unique in the room, kept after it leaves.
       if (!cols('team_members').has('handle')) g.exec('ALTER TABLE team_members ADD COLUMN handle TEXT');
+      if (!cols('team_members').has('history_from')) g.exec('ALTER TABLE team_members ADD COLUMN history_from INTEGER'); // "from now on": when it joined
       const rc = cols('team_rooms');
       for (const c of ['host_gateway_id', 'host_room', 'host_name', 'host_ended', 'replica_json']) if (!rc.has(c)) g.exec(`ALTER TABLE team_rooms ADD COLUMN ${c} TEXT`);
       if (!rc.has('mention_only')) g.exec('ALTER TABLE team_rooms ADD COLUMN mention_only INTEGER NOT NULL DEFAULT 0');
@@ -74,6 +75,9 @@ export function createTeamStore(getGlobalDb) {
       g.exec(`CREATE TABLE IF NOT EXISTS team_people (room_key TEXT NOT NULL, person_id TEXT NOT NULL, name TEXT NOT NULL, email TEXT, history_from INTEGER NOT NULL DEFAULT 0, added_at INTEGER NOT NULL, removed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (room_key, person_id))`);
       if (!ec.has('via')) g.exec('ALTER TABLE team_entries ADD COLUMN via TEXT');
       g.exec(`CREATE TABLE IF NOT EXISTS team_lanes (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, lane TEXT NOT NULL, seen_at INTEGER NOT NULL, PRIMARY KEY (room_key, agent_id, lane))`);
+      // A lane whose session was made again (cleanup, or deleted on the gateway): its next turn gets the room up to its
+      // seen point as handled context (team.js _handled). Cleared once that turn has run.
+      g.exec(`CREATE TABLE IF NOT EXISTS team_rebuilt (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, lane TEXT NOT NULL, PRIMARY KEY (room_key, agent_id, lane))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_mirror (room_key TEXT NOT NULL, host_entry_id TEXT NOT NULL, message_id TEXT, PRIMARY KEY (room_key, host_entry_id))`);
       g.exec(`CREATE TABLE IF NOT EXISTS team_inflight (room_key TEXT NOT NULL, agent_id TEXT NOT NULL, round INTEGER NOT NULL, kind TEXT NOT NULL, run_id TEXT NOT NULL, work_key TEXT, mode TEXT, turn_json TEXT, post_json TEXT, started_at INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0, text TEXT, authority TEXT, PRIMARY KEY (room_key, agent_id))`);
       // Reactions on room entries (message_id: this gateway's entry id; a copy's are mirrored from the host's), and the
@@ -120,8 +124,8 @@ export function createTeamStore(getGlobalDb) {
     addMember(roomKey, agentId, { history = 'all', seenAt = 0 } = {}) {
       if (!this.getRoom(roomKey)) return false;
       const pos = db().prepare('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM team_members WHERE room_key = ?').get(roomKey).p;
-      db().prepare('INSERT INTO team_members (room_key, agent_id, work_key, seen_at, position, history) VALUES (?, ?, NULL, ?, ?, ?) ON CONFLICT(room_key, agent_id) DO UPDATE SET removed = 0, position = excluded.position WHERE removed = 1')
-        .run(roomKey, agentId, seenAt, pos, history === 'now' ? 'now' : 'all');
+      db().prepare('INSERT INTO team_members (room_key, agent_id, work_key, seen_at, position, history, history_from) VALUES (?, ?, NULL, ?, ?, ?, ?) ON CONFLICT(room_key, agent_id) DO UPDATE SET removed = 0, position = excluded.position WHERE removed = 1')
+        .run(roomKey, agentId, seenAt, pos, history === 'now' ? 'now' : 'all', history === 'now' ? seenAt : null);
       return true;
     },
 
@@ -271,6 +275,19 @@ export function createTeamStore(getGlobalDb) {
       db().prepare('UPDATE team_members SET work_key = ? WHERE room_key = ? AND agent_id = ?').run(workKey, roomKey, agentId);
     },
 
+    /** The session of an agent's lane ('owner' or 'guest:<share>') was made again: see team_rebuilt. */
+    markLaneRebuilt(roomKey, agentId, lane) {
+      db().prepare('INSERT OR IGNORE INTO team_rebuilt (room_key, agent_id, lane) VALUES (?, ?, ?)').run(roomKey, agentId, lane);
+    },
+
+    laneRebuilt(roomKey, agentId, lane) {
+      return !!db().prepare('SELECT 1 FROM team_rebuilt WHERE room_key = ? AND agent_id = ? AND lane = ?').get(roomKey, agentId, lane);
+    },
+
+    clearLaneRebuilt(roomKey, agentId, lane) {
+      db().prepare('DELETE FROM team_rebuilt WHERE room_key = ? AND agent_id = ? AND lane = ?').run(roomKey, agentId, lane);
+    },
+
     setSeenAt(roomKey, agentId, seenAt) {
       db().prepare('UPDATE team_members SET seen_at = MAX(seen_at, ?) WHERE room_key = ? AND agent_id = ?').run(seenAt, roomKey, agentId);
     },
@@ -308,6 +325,7 @@ export function createTeamStore(getGlobalDb) {
       g.prepare('DELETE FROM team_people WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_mirror WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_lanes WHERE room_key = ?').run(roomKey);
+      g.prepare('DELETE FROM team_rebuilt WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_inflight WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_reactions WHERE room_key = ?').run(roomKey);
       g.prepare('DELETE FROM team_reaction_log WHERE room_key = ?').run(roomKey);
@@ -352,6 +370,12 @@ export function createTeamStore(getGlobalDb) {
     /** Set of every working session key (the lens hides these). */
     workKeys() {
       return new Set(db().prepare('SELECT work_key FROM team_members WHERE work_key IS NOT NULL').all().map(r => r.work_key));
+    },
+
+    /** Every working session, removed members' included: [{ roomKey, agentId, workKey }]. */
+    workLanes() {
+      return db().prepare('SELECT room_key, agent_id, work_key FROM team_members WHERE work_key IS NOT NULL').all()
+        .map(r => ({ roomKey: r.room_key, agentId: r.agent_id, workKey: r.work_key }));
     },
 
     /** The room a working session answers in, or null. */

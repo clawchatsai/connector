@@ -113,6 +113,9 @@ export function rowVerdict(row) {
   // top-level chat. ClawChats deviation: forks of main-linked chats (ClawChats edit/regen
   // branches via sessions.fork) stay top level instead of nesting under the main session.
   if (row.spawnedBy) return true;
+  // Dock conversations (sessions.create surface 'plugin-dock'): the Control UI's lists leave them out (excludeDock),
+  // and so do we. Team chats' own sessions are made this way (helper-sessions.js).
+  if (row.isDock === true || row.createdSurface === 'plugin-dock') return true;
   if (typeof row.spawnDepth === 'number' && row.spawnDepth > 0) return true;
   // sessions.fork makes the source chat the parent (Control UI nests it there). ClawChats has
   // no nesting and shows edit/regenerate branches as their own chats: a fork whose parent is

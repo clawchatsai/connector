@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionLens, isCandidateKey, trimRow } from './session-lens.js';
+import { SessionLens, isCandidateKey, trimRow, rowVerdict } from './session-lens.js';
 
 const CHAT = 'agent:main:dashboard:abc';
 const LEGACY = 'agent:main:proxmox:chat:1234';
@@ -341,4 +341,12 @@ test('onboarding chat: an agent created from ClawChats shows its main session; o
   // Only main-session keys qualify.
   l.addOnboardingChat('agent:main:discord:channel:1');
   assert.equal(l.isVisible('agent:main:discord:channel:1'), false);
+});
+
+test('dock conversations (surface plugin-dock) are hidden, as in the Control UI', () => {
+  const chat = { key: CHAT, kind: 'direct', createdVia: 'operator', createdActor: { type: 'human' } };
+  assert.equal(rowVerdict(chat), false);
+  assert.equal(rowVerdict({ ...chat, isDock: true, createdSurface: 'plugin-dock' }), true);
+  assert.equal(rowVerdict({ ...chat, createdSurface: 'plugin-dock' }), true);
+  assert.equal(rowVerdict({ key: CHAT, isDock: true }), true, 'decided even on a partial event');
 });

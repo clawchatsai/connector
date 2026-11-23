@@ -41,6 +41,7 @@ import { Tagger } from './tags/tagger.js';
 import { readLegacyThreadSummaries } from './store/legacy-threads.js';
 import { checkRepoDoc } from './peer/notes-sync.js';
 import { connectorVersion } from './peer/version.js';
+import { createHelperSessions } from './helper-sessions.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -103,13 +104,16 @@ export function createApp(config = {}) {
   // Gateway sharing (server/peer/): other people's agents in team chats, and ours in theirs. The
   // plugin host (src/index.ts) supplies the signal server link and the peer transport (config.peer).
   const peerKey = loadOrCreatePeerKey(DATA_DIR);
+  // A team chat's own sessions (agents' working sessions, guest sessions), made hidden (server/helper-sessions.js).
+  const helpers = createHelperSessions({ request: gwRequest, gatewayVersion: () => gatewayClient.hello?.server?.version });
   const sharing = config.peer ? new SharingManager({
+    helpers,
     holdApprovals: () => gatewayClient.holdApprovals(),
     getDb: () => globalDbCache.get(), request: gwRequest, chatAbort, key: peerKey, broadcast,
     gatewayId: config.peer.gatewayId, signal: config.peer.signal, openPeer: config.peer.openPeer,
   }) : null;
   // Team chats: several agents in one thread (server/team.js).
-  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, chatAbort, broadcast, titler: createTitler(config.llm), remote: sharing });
+  const team = new TeamCoordinator({ store: createTeamStore(() => globalDbCache.get()), request: gwRequest, chatAbort, broadcast, titler: createTitler(config.llm), remote: sharing, helpers });
   // Exec Allows the gateway lost after a session change (OpenClaw 2026.9.7+; server/approval-retry.js).
   const lostAllows = new LostAllowRetry({ request: gwRequest });
   gatewayClient.lens = new SessionLens({ broadcast, request: gwRequest, extras, team });
@@ -166,7 +170,8 @@ export function createApp(config = {}) {
   gatewayClient.onConnected = () => {
     sharing?.migrateGuestAgents().catch(e => console.warn(`[sharing] guest migration failed: ${e.message}`)); searchIndexer?.onConnected();
     // A previous connector stopped mid-round or mid-Allow (a plugin reload hands running turns over to this one).
-    team.recover(); lostAllows.recheckRecent();
+    team.recover().then(() => team.cleanUpHelpers()).catch(e => console.warn(`[team] helper cleanup failed: ${e.message}`));
+    lostAllows.recheckRecent();
   };
   gatewayClient.onDisconnected = () => searchIndexer?.onDisconnected();
   // Renamed agents: shares re-issued with the new names, copies of rooms here told (peer/sharing.js, team.js).
