@@ -1435,6 +1435,65 @@ test('rounds are capped by the strictest autonomy tier either way, and Notify on
   assert.deepEqual(turns.map(t => t.round), [1]);
 });
 
+test('mention rounds follow the autonomy tier: Extended both ways reaches 10 rounds without "discuss", Bounded either way stops at 3', async () => {
+  const { H, settle, net } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  const rounds = [];
+  // A working session: each agent hands back to the other by @mention, every time.
+  H.team.remote.turn = async (agentId, args) => { rounds.push(args.round); return { state: 'final', text: `@Dev over to you (${args.round})` }; };
+  H.team.remote.localTurnFor = async (localId, who, args) => { rounds.push(args.round); return { state: 'final', text: `@Jarvis over to you (${args.round})` }; };
+  net.limits.gwH = { mine: { access: 'trusted', autonomy: 'extended' }, theirs: { access: 'trusted', autonomy: 'extended' } };
+  assert.equal(H.team.room(roomKey).discuss, false);
+  await H.team.send(roomKey, { text: '@Jarvis let\'s work this out' });
+  await settle();
+  assert.deepEqual(rounds, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'Extended: ten rounds, then it stops');
+
+  net.limits.gwH = { mine: { access: 'trusted', autonomy: 'extended' }, theirs: { access: 'trusted', autonomy: 'bounded' } };
+  rounds.length = 0;
+  await H.team.send(roomKey, { text: '@Jarvis again' });
+  await settle();
+  assert.deepEqual(rounds, [1, 2, 3], 'Bounded either way: three');
+});
+
+test('mention rounds in a room with no other person stay at three', async () => {
+  const h = harness(agent => (agent === 'dev' ? '@Atlas your turn' : '@Dev your turn'));
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await h.team.send(roomKey, { text: '@Dev start', userLabel: 'H' });
+  await h.settle();
+  assert.equal(h.room(roomKey).length, 1 + 3, 'the message, then three replies');
+});
+
+test('a failed turn\'s note stays on the lane the turn ran on (a copy turn, a remote turn), never the owner\'s', async () => {
+  const { H, settle } = twoGateways();
+  const { roomKey } = await H.team.createRoom({ agentIds: ['dev', 'peer:sh1:jarvis-guest'] });
+  await H.team.addPerson(roomKey, 'gwK', { history: 'all' });
+  H.team.remote.turn = async () => ({ state: 'final', text: '@Dev your turn' });
+  H.team.remote.localTurnFor = async () => { throw Object.assign(new Error('Hourly limit reached (60 replies an hour)'), { code: 'cap' }); };
+  await H.team.send(roomKey, { text: '@Jarvis start' });
+  await settle();
+  const noteOf = re => { const m = H.sessions.get(roomKey).find(x => re.test(x.content[0].text)); return m && H.team.room(roomKey).authors[m.__m.id]; };
+  const copyNote = noteOf(/Couldn't finish this reply: Hourly limit/);
+  assert.ok(copyNote, 'the note is in the room');
+  assert.equal(copyNote.agentId, 'dev');
+  assert.notEqual(copyNote.via, 'owner');
+  assert.equal(copyNote.via, 'guest:peer:sh1:jarvis-guest');
+  assert.equal(copyNote.actingFor, 'Kamil');
+
+  H.team.remote.turn = async () => { throw new Error('Jarvis isn\'t available right now'); };
+  await H.team.send(roomKey, { text: '@Jarvis once more' });
+  await settle();
+  const remoteNote = noteOf(/Couldn't finish this reply: Jarvis isn't available/);
+  assert.ok(remoteNote);
+  assert.equal(remoteNote.via, 'guest:host');
+});
+
+test('_post needs the lane it posts on', async () => {
+  const h = harness(() => 'ok');
+  const { roomKey } = await h.team.createRoom({ agentIds: ['dev', 'atlas'] });
+  await assert.rejects(h.team._post(roomKey, { agentId: 'dev', name: 'Dev' }, 'hi'), /lane/);
+});
+
 test('reactions: the host\'s person reacts to room entries; agents hear about it on their next turn', async () => {
   const prompts = [];
   const h = harness((agent, prompt) => { prompts.push([agent, prompt]); return agent === 'dev' ? 'dev answer' : 'NOTHING_TO_ADD'; });

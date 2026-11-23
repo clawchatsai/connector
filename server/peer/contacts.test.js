@@ -58,9 +58,11 @@ test('one counter per person: day and hour windows, per tier; a failed reply giv
   assert.equal(b.overCap('k@x.dev', 'bounded', now), null);
   b.count('k@x.dev', 1, now);
   assert.match(b.overCap('k@x.dev', 'bounded', now), /Daily limit reached \(50/);
-  assert.match(b.overCap('k@x.dev', 'extended', now), /Hourly limit reached \(12/);
+  assert.equal(b.overCap('k@x.dev', 'extended', now), null, 'Extended: 50 of 60 this hour');
+  b.count('k@x.dev', 10, now);
+  assert.match(b.overCap('k@x.dev', 'extended', now), /Hourly limit reached \(60 replies an hour/);
   assert.equal(b.overCap('k@x.dev', 'extended', now + 3_600_000), null, 'next hour');
-  b.count('k@x.dev', -1, now);
+  b.count('k@x.dev', -11, now);
   assert.equal(b.usage('k@x.dev', now).day, 49);
   b.forget('k@x.dev');
   assert.equal(b.get('k@x.dev'), null);

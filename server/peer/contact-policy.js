@@ -20,12 +20,13 @@ export const KNOWLEDGE = ['none', 'notes'];
 /**
  * Autonomy tiers (D10): how much this gateway's agents answer the person's agents on their own. One counter per
  * person counts both their own questions and agent replies. `rounds` caps agent-to-agent rounds per human message
- * (0: agents never answer the person's agents; the person can still ask).
+ * (0: agents never answer the person's agents; the person can still ask). A tier's limits fit several full runs of its
+ * rounds an hour, and a freer tier is never stricter on any limit (contact-policy.test.js checks both).
  */
 export const AUTONOMY = Object.freeze({
   notify: Object.freeze({ rounds: 0, perDay: 50 }),
   bounded: Object.freeze({ rounds: 3, perDay: 50 }),
-  extended: Object.freeze({ rounds: 10, perDay: 288, perHour: 12 }),
+  extended: Object.freeze({ rounds: 10, perDay: 400, perHour: 60 }),
 });
 
 /**

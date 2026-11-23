@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { defaultContact, copyTools, copyToolsHold, effectiveTools, sessionMode, approvalsEntry, validateBasicEntry, basicList, gitEntries, toolOverrides, topicsNote, ALWAYS_OFF, copySlug, commandsSetting } from './contact-policy.js';
+import { defaultContact, copyTools, copyToolsHold, effectiveTools, sessionMode, approvalsEntry, validateBasicEntry, basicList, gitEntries, toolOverrides, topicsNote, ALWAYS_OFF, copySlug, commandsSetting, AUTONOMY } from './contact-policy.js';
 
 test('tier defaults: Restricted = Basic only, Trusted = Basic + ask me, Full = Basic + ask me; autonomy Bounded; default skills', () => {
   assert.deepEqual([defaultContact('restricted').commands, defaultContact('trusted').commands, defaultContact('full').commands], ['basic', 'ask', 'ask']);
@@ -116,4 +116,23 @@ test('a copy holds its policy only while nothing was widened; ids are per person
   assert.equal(copyToolsHold({ ...want, fs: {} }, want), false);
   assert.notEqual(copySlug('kamil@a.dev'), copySlug('kamil@b.dev'));
   assert.match(copySlug('Kamil.G@x.dev'), /^kamil-g-[0-9a-f]{4}$/);
+});
+
+test('autonomy tiers: Notify 0 rounds, Bounded 3 rounds and 50 a day, Extended 10 rounds, 60 an hour and 400 a day', () => {
+  assert.deepEqual(AUTONOMY, { notify: { rounds: 0, perDay: 50 }, bounded: { rounds: 3, perDay: 50 }, extended: { rounds: 10, perDay: 400, perHour: 60 } });
+});
+
+test('autonomy tiers are coherent: each allows several full runs of its rounds an hour, and a freer tier is never stricter', () => {
+  // A run costs one side at most its question plus a reply per round (one counter, D10).
+  const RUNS_PER_HOUR = 5;
+  const perHour = t => t.perHour ?? t.perDay;
+  for (const [name, t] of Object.entries(AUTONOMY)) {
+    if (t.rounds) assert.ok(perHour(t) >= RUNS_PER_HOUR * (t.rounds + 1), `${name}: ${perHour(t)} an hour can't fit ${RUNS_PER_HOUR} runs of ${t.rounds} rounds`);
+    assert.ok(t.perDay >= perHour(t), `${name}: the day allows less than an hour`);
+  }
+  const order = ['notify', 'bounded', 'extended'];
+  for (let i = 1; i < order.length; i++) {
+    const [a, b] = [AUTONOMY[order[i - 1]], AUTONOMY[order[i]]];
+    for (const [what, f] of [['rounds', t => t.rounds], ['an hour', perHour], ['a day', t => t.perDay]]) assert.ok(f(b) >= f(a), `${order[i]} is stricter than ${order[i - 1]} on ${what}`);
+  }
 });

@@ -15,6 +15,7 @@
 
 import crypto from 'node:crypto';
 import { defangLocalPaths, EMPTY_REPLY_ERROR } from './peer/sharing.js';
+import { AUTONOMY } from './peer/contact-policy.js';
 import { createChatAbort } from './util/chat-abort.js';
 import { promptIndex, replyAfter } from './util/turn-reply.js';
 
@@ -38,10 +39,10 @@ const TURN_TIMEOUT_MS = 15 * 60_000;
 const HISTORY_LIMIT = 80;
 const AGENTS_TTL_MS = 60_000;
 const ALL_WORDS = new Set(['all', 'everyone']);
-/** Rounds of @mention replies when agents don't "discuss": an agent a reply names answers once, and so on. */
+/** Rounds of @mention replies when agents don't "discuss" and no autonomy tier applies (no other person's agents). */
 const MENTION_ROUNDS = 3;
-// Rounds per human message each autonomy tier allows (peer/contact-policy.js AUTONOMY; Notify only: none).
-const ROUND_LIMITS = { bounded: 3, extended: 10 };
+// Rounds per human message each autonomy tier allows (Notify only: none, handled by `quiet`).
+const ROUND_LIMITS = Object.fromEntries(Object.entries(AUTONOMY).filter(([, t]) => t.rounds).map(([k, t]) => [k, t.rounds]));
 
 const norm = s => String(s || '').toLowerCase().replace(/\s+/g, '');
 /** Room entries up to and including `id` (all of them when it's not given or not among them). */
@@ -674,11 +675,13 @@ export class TeamCoordinator {
     // strength); this gateway never runs them for that person's messages.
     if (fromPerson) targets = targets.filter(id => !(TeamCoordinator.isRemote(id) && this.remote?.ownerOf?.(id) === fromPerson));
 
-    // Without "discuss" an agent still answers once when a reply @mentions it (a few rounds at most). Either way no
-    // more rounds than the strictest autonomy tier between this gateway and the people in the chat (both directions).
+    // Without "discuss" an agent still answers once when a reply @mentions it: with other people's agents in the chat,
+    // for as many rounds as the strictest autonomy tier between this gateway and them allows (both directions), else
+    // a few. With "discuss", the room's rounds, never more than that tier.
     const limits = this._limits(room);
-    const maxRounds = Math.min(room.discuss ? room.rounds : MENTION_ROUNDS, limits.roundsCap?.n ?? Infinity);
-    const maxTurns = room.discuss ? agents.length * Math.max(2, room.rounds - 1) : agents.length * 2;
+    const cap = limits.roundsCap?.n;
+    const maxRounds = room.discuss ? Math.min(room.rounds, cap ?? Infinity) : cap ?? MENTION_ROUNDS;
+    const maxTurns = agents.length * Math.max(2, (room.discuss ? room.rounds : maxRounds) - 1);
     let turns = 0;
     // Authority comes from who asked (specs/sharing-people.md): the first round answers the owner,
     // so this gateway's agents run as themselves. A follow-up answers the previous round's replies:
@@ -714,7 +717,8 @@ export class TeamCoordinator {
             this.log.warn?.(`[team] ${agentId} in ${roomKey}: ${e.message}`);
             const self = agents.find(a => a.agentId === agentId) || { agentId, name: agentId };
             const note = `${e.partial ? `${e.partial}\n\n` : ''}⚠️ *Couldn't finish this reply: ${e.message}*`;
-            await this._post(roomKey, self, note).catch(() => this._status(roomKey, `${agentId}: ${e.message}`));
+            // On the lane the turn ran on (_turnFor, _remoteTurn say which); one of its own turns: the owner's.
+            await this._post(roomKey, self, note, { via: e.via || OWNER_LANE, actingFor: e.actingFor || null }).catch(() => this._status(roomKey, `${agentId}: ${e.message}`));
             return null;
           })));
       const replied = results.filter(r => r?.text);
@@ -835,7 +839,7 @@ export class TeamCoordinator {
       // (a normal chat keeps a stopped reply's partial text the same way).
       const partial = clean(result.partialText);
       if (result.state === 'aborted') {
-        if (partial && !SILENT.test(partial)) await this._post(roomKey, self, `${partial}\n\n*[stopped]*`);
+        if (partial && !SILENT.test(partial)) await this._post(roomKey, self, `${partial}\n\n*[stopped]*`, { via: OWNER_LANE });
         // Some runtimes (claude-cli) finish the reply after the abort was acknowledged: post it once it lands.
         else this._recoverAfterAbort(roomKey, self, workKey, { marker: mode === 'addressed' });
         return { agentId, text: null };
@@ -845,7 +849,7 @@ export class TeamCoordinator {
     }
     const text = clean(result.message ? messageText(result.message) : await this._lastReply(workKey));
     if (!text || SILENT.test(text)) return { agentId, text: null };
-    await this._post(roomKey, self, text);
+    await this._post(roomKey, self, text, { via: OWNER_LANE });
     // A reply that finished after Stop is still posted (the agent said it), but starts no new round.
     return { agentId, text: stopped() ? null : text };
   }
@@ -890,7 +894,7 @@ export class TeamCoordinator {
         return ask();
       });
     } catch (e) {
-      throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
+      throw Object.assign(e, { partial: (e.partial || partial || '').trim(), via: REMOTE_LANE });
     } finally {
       live.running.delete(agentId);
       if (live.waiting?.has(agentId)) waiting(null);
@@ -933,7 +937,7 @@ export class TeamCoordinator {
       result = await this.remote?.localTurnFor(agentId, actingFor, turn,
         { onDelta: text => { partial = text; delta(text); } });
     } catch (e) {
-      throw Object.assign(e, { partial: (e.partial || partial || '').trim() });
+      throw Object.assign(e, { partial: (e.partial || partial || '').trim(), via: lane, actingFor: forName });
     } finally {
       live.running.delete(agentId);
       delta('', true);
@@ -981,8 +985,8 @@ export class TeamCoordinator {
         const s = (await this.request('sessions.describe', { key: workKey }, 5000))?.session;
         if (s?.hasActiveRun && ++n < tries) { setTimeout(check, intervalMs).unref?.(); return; }
         const text = (await this._lastReply(workKey) || '').trim();
-        if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`);
-        else if (marker) await this._post(roomKey, self, STOPPED_EARLY);
+        if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`, { via: OWNER_LANE });
+        else if (marker) await this._post(roomKey, self, STOPPED_EARLY, { via: OWNER_LANE });
       } catch (e) { this.log.warn?.(`[team] recover after stop: ${e.message}`); }
     };
     setTimeout(check, intervalMs).unref?.();
@@ -992,7 +996,8 @@ export class TeamCoordinator {
   _askerOf(a) { return a?.type === 'person' ? `person:${a.personId}` : a?.agentId || 'unknown'; }
 
   /** Post an agent's message into the room (actingFor: whose request it answered, if not its owner's). */
-  async _post(roomKey, self, text, { actingFor = null, via = OWNER_LANE } = {}) {
+  async _post(roomKey, self, text, { actingFor = null, via = null } = {}) {
+    if (!via) throw new Error(`_post: say which lane ${self?.agentId} posts on (via)`); // a missed lane would read as the owner's
     if (this._closed) throw new Error('connector stopping'); // the next connector posts it (recover)
     const room = this.store.getRoom(roomKey);
     if (room?.host) return this._replicaPostAgent(room, self, text); // a live copy: the host's room gets it (its owner's session)
@@ -1213,7 +1218,7 @@ export class TeamCoordinator {
       text = String(result.text || '').trim();
     }
     if (this._closed) return null;
-    const opts = { ...(post.forName ? { actingFor: post.forName } : {}), ...(post.via ? { via: post.via } : {}) };
+    const opts = { ...(post.forName ? { actingFor: post.forName } : {}), via: post.via || (row.kind === 'own' ? OWNER_LANE : null) }; // own turns' rows don't store it
     if (state === 'aborted') {
       const body = text && !SILENT.test(text) ? `${text}\n\n*[stopped]*` : post.marker ? STOPPED_EARLY : '';
       if (body && !await this._postedSince(roomKey, body, row.startedAt)) await this._post(roomKey, self, body, opts);
