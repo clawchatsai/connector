@@ -129,9 +129,9 @@ export function createTeamStore(getGlobalDb) {
       return true;
     },
 
-    /** Every agent the room ever had, removed ones too, in join order: [{ agentId, handle }] (handles stay taken). */
+    /** Every agent the room ever had, removed ones too, in join order: [{ agentId, handle, removed }] (handles stay taken). */
     handles(roomKey) {
-      return db().prepare('SELECT agent_id, handle FROM team_members WHERE room_key = ? ORDER BY position').all(roomKey).map(m => ({ agentId: m.agent_id, handle: m.handle || null }));
+      return db().prepare('SELECT agent_id, handle, removed FROM team_members WHERE room_key = ? ORDER BY position').all(roomKey).map(m => ({ agentId: m.agent_id, handle: m.handle || null, removed: !!m.removed }));
     },
 
     setHandle(roomKey, agentId, handle) {

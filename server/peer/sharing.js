@@ -326,11 +326,13 @@ export class SharingManager {
     for (const link of this._served) if (link.shareId === shareId) link.close();
     // Runs already going stop too: "Stop sharing" must not leave a guest run working for minutes. One still
     // being set up is marked, so it never starts (or is aborted the moment it has started).
-    for (const t of this._turns.values()) if (t.shareId === shareId) this._abortTurn(t);
+    for (const t of this._turns.values()) if (t.shareId === shareId) this._abortTurn(t, 'revoked');
   }
 
-  _abortTurn(t) {
+  /** `reason` ('revoked') goes back with the aborted turn, so the room can say why the reply stopped. */
+  _abortTurn(t, reason = null) {
     t.aborted = true;
+    if (reason) t.abortReason ??= reason;
     if (t.runId) this.chatAbort.abort({ sessionKey: t.sessionKey, runId: t.runId, sessionId: t.sessionId }).catch(() => {});
   }
 
@@ -840,9 +842,10 @@ export class SharingManager {
       this._runs.set(runId, { resolve, timer, text: '', emit, sessionKey });
     });
     Object.assign(turn, { sessionKey, runId });
+    const aborted = text => ({ state: 'aborted', text, ...(turn.abortReason ? { reason: turn.abortReason } : {}) });
     try {
       if (!this._grant(shareId)) throw Object.assign(new Error('Sharing has ended'), { code: 'revoked' }); // revoked while setting up
-      if (turn.aborted) return { state: 'aborted', text: '' }; // stopped while setting up
+      if (turn.aborted) return aborted(''); // stopped while setting up
       // A resend this connector has no record of (it restarted): if the turn's input is already in the session, the
       // transcript decides, not the ack. 2026.9.7 forgets its chat.send dedupe on a gateway restart and would start a
       // run with no new input (a reply to nothing). Only this connector reloaded, so its run is still going: the send
@@ -869,13 +872,13 @@ export class SharingManager {
       // The session the run started in: a later Stop is fenced to it.
       this.chatAbort.sessionIdOf(sessionKey).then(id => { turn.sessionId = id; });
       // Stopped or revoked while the send was on its way (the abort may have reached the gateway before the run).
-      if (turn.aborted || !this._grant(shareId)) this._abortTurn(turn);
+      if (turn.aborted || !this._grant(shareId)) this._abortTurn(turn, this._grant(shareId) ? null : 'revoked');
       // The gateway already has this input and nothing here tracked it (a resend after a restart): its reply is, or
       // will be, in the session. "in_flight" means it is still going: its events arrive as for a new run.
       if (ack?.status === 'ok') return this._afterRestart(sessionKey, runId, turn);
       const r = await done;
       if (r.state === 'final') return { state: 'final', text: r.message ? messageText(r.message) : await this._lastReply(sessionKey) };
-      if (r.state === 'aborted') return { state: 'aborted', text: r.text || '' };
+      if (r.state === 'aborted') return aborted(r.text || '');
       // A host on an older connector still asks for NO_REPLY: on 2026.10.1+ that ends the run with an empty-reply
       // error and no final. Report it as an empty reply; the host treats that as a pass.
       if (!r.text && EMPTY_REPLY_ERROR.test(r.errorMessage || '')) return { state: 'final', text: '' };
@@ -1640,11 +1643,7 @@ export class SharingManager {
    * session in "Shared with <name>". Returns null when that agent isn't shared with them.
    */
   async localTurnFor(localAgentId, remoteAgentId, { turnId, roomId, roomTitle, message, round = 0 }, { onDelta } = {}) {
-    const g = this._grantToOwnerOf(remoteAgentId);
-    if (!g) return null;
-    const agents = (await this.request('agents.list', {}))?.agents || [];
-    const guestId = findGuestAgent(agents, localAgentId, this.guestAgentIds())?.id;
-    const shared = g.grant.agents.find(a => a.id === guestId) || g.grant.agents.find(a => a.id === localAgentId);
+    const { g, shared } = await this._sharedFor(localAgentId, remoteAgentId) || {};
     if (!shared) return null;
     const byPerson = String(remoteAgentId).startsWith('person:');
     // Their gateway is too old to share with: nothing runs for them here either.
@@ -1653,6 +1652,19 @@ export class SharingManager {
     return this._guestTurn(g.shareId, { turnId, agentId: shared.id, roomId, roomTitle, message, inOwnerRoom: true, byPerson, trigger: byPerson ? 'person' : 'agent', round },
       (event, data) => { if (event === 'delta' && typeof data === 'string') onDelta?.(data); });
   }
+
+  /** The grant and its entry that let `localAgentId` answer `who` (a person or their agent), or null. */
+  async _sharedFor(localAgentId, who) {
+    const g = this._grantToOwnerOf(who);
+    if (!g) return null;
+    const agents = (await this.request('agents.list', {}))?.agents || [];
+    const guestId = findGuestAgent(agents, localAgentId, this.guestAgentIds())?.id;
+    const shared = g.grant.agents.find(a => a.id === guestId) || g.grant.agents.find(a => a.id === localAgentId);
+    return shared ? { g, shared } : null;
+  }
+
+  /** Whether one of this gateway's agents answers `who` in a team chat here (what localTurnFor would run). */
+  async sharesAgentWith(localAgentId, who) { return !!await this._sharedFor(localAgentId, who); }
 
   async abortLocalFor(localAgentId, remoteAgentId, turnId) {
     const g = this._grantToOwnerOf(remoteAgentId);

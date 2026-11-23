@@ -659,6 +659,22 @@ test("acting for someone: this gateway's agent answers their agent as the versio
   assert.equal(s.ownerCalls.filter(c => c.method === 'chat.send').length, 1);
 });
 
+test('stop sharing while our agent answers someone in a team chat here: the aborted turn says why', async () => {
+  const s = setup({ reply: () => null }); // the run stays open until it's aborted
+  s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });
+  const active = s.activate();
+  const theirs = { id: 'sh2', as: 'requester', status: 'active', requester: s.people.owner, owner: s.people.requester, agents: [{ id: 'main-guest', name: 'main' }] };
+  s.owner.setShares([{ ...active, as: 'owner' }, theirs]);
+  assert.equal(await s.owner.sharesAgentWith('jarvis', 'peer:sh2:main-guest'), true);
+  assert.equal(await s.owner.sharesAgentWith('dev', 'peer:sh2:main-guest'), false);
+  const run = s.owner.localTurnFor('jarvis', 'peer:sh2:main-guest', { turnId: 'r1', roomId: 'kamils-room', message: 'write the essay' });
+  for (let i = 0; i < 50 && !s.ownerCalls.some(c => c.method === 'chat.send'); i++) await wait(2);
+  await wait(5);
+  s.owner.revoke('sh1');
+  assert.deepEqual(await run, { state: 'aborted', text: 'jar', reason: 'revoked' });
+  assert.equal(await s.owner.sharesAgentWith('jarvis', 'peer:sh2:main-guest'), false);
+});
+
 test('a peer request cannot pick the owner-room note', async () => {
   const s = setup();
   s.owner.approve('sh1', { agents: [{ id: 'jarvis-guest', name: 'Jarvis' }] });

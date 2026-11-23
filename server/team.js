@@ -26,8 +26,17 @@ import { promptIndex, replyAfter } from './util/turn-reply.js';
 // (older prompts, peers on older connectors).
 export const PASS_TOKEN = 'NOTHING_TO_ADD';
 export const SILENT = /^\s*[`*]*(?:NOTHING_TO_ADD|NO_REPLY)[`*.]*\s*$/i;
-/** Room entry for an agent asked directly whose run was stopped before it said anything. */
-const STOPPED_EARLY = '*[stopped before replying]*';
+const STOP_REASONS = { revoked: 'sharing ended' };
+/**
+ * What the room shows for a turn that ended aborted, on every lane: what it said so far marked stopped, else (only
+ * when it was asked directly) that it stopped before replying, else nothing. `reason` ('revoked') says why.
+ */
+export function endedBody(text, { marker = false, reason = null } = {}) {
+  const why = STOP_REASONS[reason] ? `: ${STOP_REASONS[reason]}` : '';
+  const t = String(text || '').trim();
+  if (t && !SILENT.test(t)) return `${t}\n\n*[stopped${why}]*`;
+  return marker ? `*[stopped before replying${why}]*` : '';
+}
 // Sessions ("lanes") an agent can answer a room from (team-store team_entries.via / team_lanes):
 // its owner's own session, the guest session its owner's gateway runs for this host (another
 // person's agent here), or 'guest:<share>' (one of ours answering someone else's agent or person).
@@ -65,8 +74,8 @@ const laneView = (fresh, history, seenAt) => {
   const more = !!history.older && !(history[0]?.ts <= seenAt);
   return cut || more ? [{ id: null, ts: shown[0].ts, text: '', omitted: notShown(cut, more) }, ...shown] : shown;
 };
-/** How a line this gateway sent to a host's room comes back in its copy (a stopped reply gets a marker there). */
-const vouchText = t => String(t || '').replace(/\n\n\*\[stopped\]\*\s*$/, '').trim().slice(0, 32_000);
+/** How a line this gateway sent to a host's room comes back in its copy: exactly as sent, or it isn't ours. */
+const vouchText = t => String(t || '').trim().slice(0, 32_000);
 
 const emojiSegmenter = new Intl.Segmenter('en', { granularity: 'grapheme' });
 const EMOJI_SEQUENCE = /^(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\u{1F3F4}[\u{E0061}-\u{E007A}]+\u{E007F}|\p{Extended_Pictographic}\uFE0F?\p{Emoji_Modifier}?(?:\u200D\p{Extended_Pictographic}\uFE0F?\p{Emoji_Modifier}?)*)$/u;
@@ -199,7 +208,7 @@ export class TeamCoordinator {
   _ref(agentId) {
     if (!TeamCoordinator.isRemote(agentId)) return `${this._selfId() || 'local'}:${agentId}`;
     const id = /^peer:([^:]+):(.+)$/.exec(agentId);
-    const owner = this.remote?.ownerOf?.(agentId);
+    const owner = this._ownerOf(agentId);
     return owner && id ? `${owner}:${id[2]}` : agentId;
   }
 
@@ -339,8 +348,18 @@ export class TeamCoordinator {
     try { list = (this.remote?.remoteAgents() || []).map(a => ({ agentId: a.agentId, name: a.name, remote: true, ownerName: a.ownerName })); }
     catch { /* sharing unavailable */ }
     // Names outlive the share: a room keeps showing "Jarvis · Kamil" after the owner stops sharing.
-    for (const a of list) (this._remoteNames ??= new Map()).set(a.agentId, { name: a.name, ownerName: a.ownerName });
+    for (const a of list) {
+      (this._remoteNames ??= new Map()).set(a.agentId, { name: a.name, ownerName: a.ownerName });
+      this._ownerOf(a.agentId);
+    }
     return list;
+  }
+
+  /** Whose gateway someone else's agent is on; remembered, so a reply that stops at the revoke keeps its owner. */
+  _ownerOf(agentId) {
+    const now = this.remote?.ownerOf?.(agentId) || null;
+    if (now) (this._remoteOwners ??= new Map()).set(agentId, now);
+    return now || this._remoteOwners?.get(agentId) || null;
   }
 
   /** The project for this person's chats changed: our copies of the chats they host move there. Returns how many. */
@@ -395,6 +414,11 @@ export class TeamCoordinator {
   async _roomAgents(room) {
     const handles = await this._ensureHandles(room.roomKey);
     return (await this._named(room.members.map(m => m.agentId))).map(a => ({ ...a, handle: handles.get(a.agentId) || null }));
+  }
+
+  /** Agents that were in the room and left, with the handle they had there ({ agentId, handle }). */
+  _formerMembers(roomKey) {
+    return this.store.handles(roomKey).filter(r => r.removed && r.handle);
   }
 
   /** Hands out missing handles in join order (rooms from before handles, agents just added). Returns agentId → handle. */
@@ -734,9 +758,18 @@ export class TeamCoordinator {
     if (room.host) return this._replicaRunOwn(room, text, stopped);
     const agents = await this._roomAgents(room);
     const mention = parseMentions(text, agents);
+    // Agents that left (no longer shared, or removed) keep their handle: a mention of one is addressed to it, so the
+    // room says it can't answer, and the line never falls through to its sender's own agents.
+    const gone = mention.all ? [] : parseMentions(text, this._formerMembers(roomKey)).agentIds;
+    for (const id of gone) {
+      const name = await this._agentName(roomKey, id);
+      const unshared = TeamCoordinator.isRemote(id) && !this._remoteAgents().some(a => a.agentId === id);
+      await this._note(roomKey, unshared ? `${name} is no longer shared, so it can't answer` : `${name} isn't in this chat any more`);
+    }
     let targets, mode;
     if (mention.all) { targets = agents.map(a => a.agentId); mode = 'addressed'; }
     else if (mention.agentIds.length) { targets = mention.agentIds; mode = 'addressed'; }
+    else if (gone.length) { targets = []; mode = 'addressed'; }
     // No mention: context only, unless it's this gateway's person alone with one of its agents.
     else { targets = !fromPerson && !room.people.length && agents.length === 1 && !TeamCoordinator.isRemote(agents[0].agentId) ? [agents[0].agentId] : []; mode = 'addressed'; }
     // A person's own agents answer them on their own gateway (their connector runs them at full
@@ -918,7 +951,7 @@ export class TeamCoordinator {
       // (a normal chat keeps a stopped reply's partial text the same way).
       const partial = clean(result.partialText);
       if (result.state === 'aborted') {
-        if (partial && !SILENT.test(partial)) await this._post(roomKey, self, `${partial}\n\n*[stopped]*`, { via: OWNER_LANE });
+        if (partial && !SILENT.test(partial)) await this._post(roomKey, self, endedBody(partial), { via: OWNER_LANE });
         // Some runtimes (claude-cli) finish the reply after the abort was acknowledged: post it once it lands.
         else this._recoverAfterAbort(roomKey, self, workKey, { marker: mode === 'addressed' });
         return { agentId, text: null };
@@ -984,8 +1017,12 @@ export class TeamCoordinator {
       });
     } catch (e) {
       const said = (e.partial || partial || '').trim();
-      if (!said && !this._closed) unsee?.(); // it never got to answer: its next turn gets these too (QA 2026-11-22: "Too many replies at once")
-      throw Object.assign(e, { partial: said, via: REMOTE_LANE });
+      // Its owner stopped sharing it mid-reply (the link closed and the resend was refused): a stopped reply, not a failure.
+      if (e?.code === 'revoked') result = { state: 'aborted', text: said, reason: 'revoked' };
+      else {
+        if (!said && !this._closed) unsee?.(); // it never got to answer: its next turn gets these too (QA 2026-11-22: "Too many replies at once")
+        throw Object.assign(e, { partial: said, via: REMOTE_LANE });
+      }
     } finally {
       live.running.delete(agentId);
       if (live.waiting?.has(agentId)) waiting(null);
@@ -994,8 +1031,8 @@ export class TeamCoordinator {
     }
     const text = String(result?.text || '').trim();
     if (result?.state === 'aborted') {
-      if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`, { via: REMOTE_LANE });
-      else if (mode === 'addressed') await this._post(roomKey, self, STOPPED_EARLY, { via: REMOTE_LANE });
+      const body = endedBody(text, { marker: mode === 'addressed', reason: result.reason });
+      if (body) await this._post(roomKey, self, body, { via: REMOTE_LANE });
       return { agentId, text: null };
     }
     if (!text || SILENT.test(text)) return { agentId, text: null };
@@ -1012,7 +1049,7 @@ export class TeamCoordinator {
     const agentId = self.agentId;
     const asker = agents.find(a => a.agentId === actingFor);
     // Whom it answers, by the name they have in this chat ("homiabot qa2", not a first word): the person, or the agent's owner.
-    const askerGw = String(actingFor).startsWith('person:') ? actingFor.slice('person:'.length) : this.remote?.ownerOf?.(actingFor);
+    const askerGw = String(actingFor).startsWith('person:') ? actingFor.slice('person:'.length) : this._ownerOf(actingFor);
     const forName = this.store.getRoom(roomKey)?.people.find(p => p.personId === askerGw)?.name
       || this.remote?.actingForName?.(actingFor) || asker?.ownerName || 'someone else';
     const runId = `team-${crypto.randomUUID()}`;
@@ -1024,7 +1061,7 @@ export class TeamCoordinator {
     try {
       unsee = this._setSeen(roomKey, agentId, lane, fresh);
       const turn = { turnId: runId, roomId: roomKey, roomTitle: await this._roomTitle(roomKey), message: this._prompt(self, agents, fresh, mode, earlier, { notes, asker: actingFor, first, handled }), round: live.round || 1 };
-      this.store.inflightStart(roomKey, { agentId, round: turn.round, kind: 'for', runId, mode, turn, post: { name: self.name, via: lane, actingFor, forName } });
+      this.store.inflightStart(roomKey, { agentId, round: turn.round, kind: 'for', runId, mode, turn, post: { name: self.name, via: lane, actingFor, forName, marker: mode === 'addressed' } });
       result = await this.remote?.localTurnFor(agentId, actingFor, turn,
         { onDelta: text => { partial = text; delta(text); } });
       if (result && handled.length) this.store.clearLaneRebuilt(roomKey, agentId, lane); // it ran: the session has it now
@@ -1040,15 +1077,19 @@ export class TeamCoordinator {
     if (!result) {
       unsee(); // not shared with them: it didn't run
       const authors = this.store.authors(roomKey);
-      const isAsker = a => a?.agentId === actingFor || (a?.type === 'person' && `person:${a.personId}` === actingFor);
-      const askedByName = history.some(e => isAsker(authors[e.id]) && e.ts >= Math.min(...fresh.map(f => f.ts))
+      // The asker: the person, or any of their agents (one writing from their copy answers with its person's authority).
+      const isAsker = a => a?.agentId === actingFor || (a?.type === 'person' && `person:${a.personId}` === actingFor)
+        || (!!askerGw && a?.type === 'agent' && TeamCoordinator.isRemote(a.agentId) && this._ownerOf(a.agentId) === askerGw);
+      const asked = history.findLast(e => isAsker(authors[e.id]) && e.ts >= Math.min(...fresh.map(f => f.ts))
         && parseMentions(splitLabel(e.text).body, agents).agentIds?.includes(agentId));
-      if (askedByName) await this._post(roomKey, self, `*${self.name} isn't shared with ${forName}, so it doesn't answer ${forName}'s agents.*`, { via: lane });
+      const whom = authors[asked?.id]?.type === 'person' ? 'them' : `${forName}'s agents`; // by who wrote the line that asked
+      if (asked) await this._post(roomKey, self, `*${self.name} isn't shared with ${forName}, so it doesn't answer ${whom}.*`, { via: lane });
       return { agentId, text: null };
     }
     const text = String(result.text || '').trim();
     if (result.state === 'aborted') {
-      if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`, { actingFor: forName, via: lane });
+      const body = endedBody(text, { marker: mode === 'addressed', reason: result.reason });
+      if (body) await this._post(roomKey, self, body, { actingFor: forName, via: lane });
       return { agentId, text: null };
     }
     if (!text || SILENT.test(text)) return { agentId, text: null };
@@ -1080,8 +1121,8 @@ export class TeamCoordinator {
         const s = (await this.request('sessions.describe', { key: workKey }, 5000))?.session;
         if (s?.hasActiveRun && ++n < tries) { setTimeout(check, intervalMs).unref?.(); return; }
         const text = (await this._lastReply(workKey) || '').trim();
-        if (text && !SILENT.test(text)) await this._post(roomKey, self, `${text}\n\n*[stopped]*`, { via: OWNER_LANE });
-        else if (marker) await this._post(roomKey, self, STOPPED_EARLY, { via: OWNER_LANE });
+        const body = endedBody(text, { marker });
+        if (body) await this._post(roomKey, self, body, { via: OWNER_LANE });
       } catch (e) { this.log.warn?.(`[team] recover after stop: ${e.message}`); }
     };
     setTimeout(check, intervalMs).unref?.();
@@ -1348,7 +1389,7 @@ export class TeamCoordinator {
   async _finishTurn(roomKey, row, live, stopped) {
     const { agentId, runId, post } = row;
     const self = { agentId, name: post.name || agentId };
-    let state = 'final', text = '';
+    let state = 'final', text = '', reason = null;
     if (row.kind === 'own') {
       live.running.set(agentId, { workKey: row.workKey, runId, sessionId: null });
       this._status(roomKey);
@@ -1365,15 +1406,19 @@ export class TeamCoordinator {
       let result;
       // The same turn id: the other side answers with that turn's reply instead of running it again.
       try { result = row.kind === 'remote' ? await this.remote.turn(agentId, row.turn, { stopped }) : await this.remote.localTurnFor(agentId, post.actingFor, row.turn); }
+      catch (e) { if (e?.code !== 'revoked') throw e; result = { state: 'aborted', text: e.partial || '', reason: 'revoked' }; } // sharing ended meanwhile
       finally { live.running.delete(agentId); this._status(roomKey); }
+      // No longer shared with whom it answered (it was when the turn started): sharing ended while it ran.
+      if (!result && row.kind === 'for') result = { state: 'aborted', text: '', reason: 'revoked' };
       if (!result) return null;
       state = result.state === 'aborted' ? 'aborted' : 'final';
       text = String(result.text || '').trim();
+      reason = result.reason || null;
     }
     if (this._closed) return null;
     const opts = { ...(post.forName ? { actingFor: post.forName } : {}), via: post.via || (row.kind === 'own' ? OWNER_LANE : null) }; // own turns' rows don't store it
     if (state === 'aborted') {
-      const body = text && !SILENT.test(text) ? `${text}\n\n*[stopped]*` : post.marker ? STOPPED_EARLY : '';
+      const body = endedBody(text, { marker: !!post.marker, reason });
       if (body && !await this._postedSince(roomKey, body, row.startedAt)) await this._post(roomKey, self, body, opts);
       return { agentId, text: null };
     }
@@ -1513,11 +1558,14 @@ export class TeamCoordinator {
       else if (a?.type === 'person') author = { type: 'person', personId: a.personId, name: a.name || label };
       else {
         const remote = a?.agentId && TeamCoordinator.isRemote(a.agentId);
-        author = { type: 'agent', agentId: a?.agentId || null, ...(a?.agentId ? { ref: this._ref(a.agentId) } : {}), name: label || 'Agent', ownerId: remote ? this.remote?.ownerOf?.(a.agentId) || null : self, ...(a?.actingFor ? { actingFor: a.actingFor } : {}), ...(a?.via ? { via: a.via } : {}) };
+        author = { type: 'agent', agentId: a?.agentId || null, ...(a?.agentId ? { ref: this._ref(a.agentId) } : {}), name: label || 'Agent', ownerId: remote ? this._ownerOf(a.agentId) : self, ...(a?.actingFor ? { actingFor: a.actingFor } : {}), ...(a?.via ? { via: a.via } : {}) };
       }
       entries.push({ id, ts, text: body, author });
     }
     const agents = await this._roomAgents(room);
+    // Whether each of this gateway's agents answers this person (the host decides; their copy can't know).
+    const answers = new Map(await Promise.all(agents.filter(a => !TeamCoordinator.isRemote(a.agentId))
+      .map(async a => [a.agentId, await this.remote?.sharesAgentWith?.(a.agentId, `person:${person.personId}`).catch(() => true) ?? true])));
     const title = await this._roomRealTitle(room.roomKey);
     this._titles.set(room.roomKey, title);
     return {
@@ -1528,7 +1576,7 @@ export class TeamCoordinator {
         discuss: room.discuss,
         members: agents.map(a => {
           const remote = TeamCoordinator.isRemote(a.agentId);
-          return { agentId: a.agentId, ref: this._ref(a.agentId), handle: a.handle, name: remote ? a.name : `${a.name} · ${this.remote?.labelOf?.(self, this._hostName()) || this._hostName().split(/\s+/)[0]}`, ownerId: remote ? this.remote?.ownerOf?.(a.agentId) || null : self };
+          return { agentId: a.agentId, ref: this._ref(a.agentId), handle: a.handle, name: remote ? a.name : `${a.name} · ${this.remote?.labelOf?.(self, this._hostName()) || this._hostName().split(/\s+/)[0]}`, ownerId: remote ? this.remote?.ownerOf?.(a.agentId) || null : self, ...(answers.get(a.agentId) === false ? { available: false } : {}) };
         }),
         people: [{ personId: self, name: this._hostName(), host: true }, ...room.people.map(p => ({ personId: p.personId, name: p.name }))],
       },
@@ -1736,7 +1784,7 @@ export class TeamCoordinator {
     return {
       discuss: !!v.discuss,
       // Keyed by the room-wide ref (the host's `main` and this gateway's `main` are different agents).
-      agents: (v.members || []).map(m => ({ agentId: m.ref || m.agentId, workKey: null, handle: m.handle || null, remote: true, name: m.name, ownerName: null, available: !v.ended, mine: !!m.localAgentId })),
+      agents: (v.members || []).map(m => ({ agentId: m.ref || m.agentId, workKey: null, handle: m.handle || null, remote: true, name: m.name, ownerName: null, available: !v.ended && m.available !== false, mine: !!m.localAgentId })),
       people: (v.people || []).map(p => ({ personId: p.personId, name: p.name, ...(p.host ? { host: true } : {}), ...(p.personId === me ? { me: true } : {}) })),
       replica: { hostName: v.name, hostId: v.gatewayId, ended: v.ended || null },
     };
@@ -1788,7 +1836,7 @@ export class TeamCoordinator {
     const view = {
       title,
       discuss: !!v.discuss,
-      members: (Array.isArray(v.members) ? v.members : []).slice(0, 50).map(m => ({ agentId: clean(m?.agentId, 200), ...(m?.ref ? { ref: clean(m.ref, 240) } : {}), name: clean(m?.name) || 'Agent', ...(m?.handle ? { handle: String(m.handle).toLowerCase().replace(/[^\w.-]/g, '').slice(0, 80) || null } : {}), ownerId: clean(m?.ownerId, 100) || null })).filter(m => m.agentId),
+      members: (Array.isArray(v.members) ? v.members : []).slice(0, 50).map(m => ({ agentId: clean(m?.agentId, 200), ...(m?.ref ? { ref: clean(m.ref, 240) } : {}), name: clean(m?.name) || 'Agent', ...(m?.handle ? { handle: String(m.handle).toLowerCase().replace(/[^\w.-]/g, '').slice(0, 80) || null } : {}), ownerId: clean(m?.ownerId, 100) || null, ...(m?.available === false ? { available: false } : {}) })).filter(m => m.agentId),
       people: (Array.isArray(v.people) ? v.people : []).slice(0, 50).map(x => ({ personId: clean(x?.personId, 100), name: clean(x?.name) || 'Someone', ...(x?.host ? { host: true } : {}) })).filter(x => x.personId),
     };
     await this._replicaOwnMembers(key, view, fromGw);
@@ -1819,7 +1867,10 @@ export class TeamCoordinator {
       const claimsMe = a.type === 'person' && a.personId === me;
       const claimsMyAgent = a.type === 'agent' && (a.ownerId === me || (!!me && !!ref && ref.startsWith(`${me}:`)));
       const mine = claimsMe && this._takeVouch(fromGw, roomId, 'person', text);
-      const myAgent = claimsMyAgent && !!ref && mineRefs.has(ref) && this._takeVouch(fromGw, roomId, ref, text);
+      // Ours: exactly what this gateway sent (its vouch is the proof, also once the agent is no longer shared). Nothing
+      // else, stop markers included: the host's words, however they're shaped, are the host's.
+      const ours = !!ref && (mineRefs.has(ref) || ref.startsWith(`${me}:`));
+      const myAgent = claimsMyAgent && ours && this._takeVouch(fromGw, roomId, ref, text);
       const forged = (claimsMe && !mine) || (claimsMyAgent && !myAgent);
       if (!mine && a.type !== 'system') fromOthers = true;
       const name = a.type === 'system' ? 'System' : clean(a.name) || (a.type === 'agent' ? 'Agent' : 'Someone');
@@ -1833,7 +1884,7 @@ export class TeamCoordinator {
       this.store.recordEntry(key, res.messageId, a.type === 'system' ? { type: 'system', ts }
         : mine ? { type: 'user', ts }
         : a.type === 'person' ? { type: 'person', agentId: forged ? fromGw : clean(a.personId, 100), actingFor: label, ts }
-        : { type: 'agent', agentId: ref, ref: a.ref ? clean(a.ref, 240) : null, ownerId, actingFor: !myAgent && !forged && a.actingFor ? clean(a.actingFor, 60) : null, ts, via: forged ? null : copyVia(a.via) });
+        : { type: 'agent', agentId: forged ? null : ref, ref: !forged && a.ref ? clean(a.ref, 240) : null, ownerId, actingFor: !myAgent && !forged && a.actingFor ? clean(a.actingFor, 60) : null, ts, via: forged ? null : copyVia(a.via) });
     }
     if (p.reactions && typeof p.reactions === 'object') this._replicaReactions(key, p.reactions);
     if (fromOthers) this._markUnread(key); // someone else's words (or their agents'): a badge on the copy
@@ -1997,6 +2048,8 @@ export class TeamCoordinator {
       for (const m of this.store.getRoom(room.roomKey).members) {
         if (TeamCoordinator.isRemote(m.agentId) && !live.has(m.agentId)) await this.removeAgent(room.roomKey, m.agentId, { reason: 'ended' }).catch(e => this.log.warn?.(`[team] ${e.message}`));
       }
+      // Whom our agents answer may have changed for the people still here: their copies show it without a new message.
+      this._pushSoon(room.roomKey);
     }
   }
 
