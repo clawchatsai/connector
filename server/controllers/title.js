@@ -29,14 +29,17 @@ export function createCompletion(llm, { systemPrompt, purpose, maxTokens }) {
   return async function complete(message, { model } = {}) {
     const base = { messages: [{ role: 'user', content: message }], systemPrompt, purpose, maxTokens, ...(model ? { model } : {}) };
     try {
-      return await llm.complete(base);
+      const result = await llm.complete(base);
+      // The host resolves rather than throws when every credential for the direct transport failed (no API
+      // key, an unreachable provider URL): a CLI-runtime gateway still answers in isolated mode.
+      if (result?.stopReason !== 'error') return result;
     } catch (err) {
       // Not a transport problem: isolated mode fails the same way. LLM_RUNTIME_LIFECYCLE (2026.11.5+): the plugin or
       // model runtime is reloading; the host says to retry from a fresh plugin operation, not inside this one.
       // 2026.11.6 reports a retired runtime (plugin reload) by message only.
       if (['LLM_COMPLETION_NOT_AUTHORIZED', 'LLM_RUNTIME_LIFECYCLE', 'LLM_COMPLETION_ABORTED'].includes(err?.code) || /runtime is no longer active/i.test(err?.message || '')) throw err;
-      return await llm.complete({ ...base, maxTokens: undefined, execution: { mode: 'isolated-agent-runtime', timeoutMs: TIMEOUT_MS } });
     }
+    return await llm.complete({ ...base, maxTokens: undefined, execution: { mode: 'isolated-agent-runtime', timeoutMs: TIMEOUT_MS } });
   };
 }
 

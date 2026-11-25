@@ -24,14 +24,14 @@ function fakeLlm(...replies) {
   };
 }
 
-function setup({ llm = fakeLlm(reply()), since = 1000, legacy = [] } = {}) {
+function setup({ llm = fakeLlm(reply()), since = 1000, legacy = [], model } = {}) {
   const search = new SearchStore(null);
   let clock = 5000;
   const db = new Database(':memory:');
   const tags = createTagStore(() => db, { now: () => clock });
   const indexer = new EventEmitter();
   tags.setMeta('since', since);
-  const tagger = new Tagger({ tags, search, indexer, llm, legacy: () => legacy, logger: quiet, now: () => clock, quietMs: 5, gapMs: 0, sweepMs: 60_000 });
+  const tagger = new Tagger({ tags, search, indexer, llm, model, legacy: () => legacy, logger: quiet, now: () => clock, quietMs: 5, gapMs: 0, sweepMs: 60_000 });
   const chat = (key, n, { stamp = 2000, title = 'A chat', text = i => `message ${i} about the backup` } = {}) => {
     search.upsertChat({ key, title, stamp });
     search.writeDocs(key, Array.from({ length: n }, (_, i) => ({ messageId: `${key}-${i}`, kind: 'message', role: i % 2 ? 'assistant' : 'user', ts: i, text: text(i) })),
@@ -53,7 +53,7 @@ test('a new chat is tagged once it has 6 messages and went quiet; short chats ar
   assert.equal(t.tags.get(A).messages, 6);
   assert.equal(t.tags.get(B), null);
   assert.equal(t.llm.calls.length, 1);
-  assert.equal(t.llm.calls[0].model, 'anthropic/claude-haiku-4-5-20251001');
+  assert.equal(t.llm.calls[0].model, 'anthropic/claude-haiku-5-5');
   assert.equal(t.llm.calls[0].purpose, 'clawchats.tags');
   // Searchable: by tag word, by summary, and #tag lists it.
   assert.equal(t.search.search({ q: 'proxm' }).results[0].tagMatch, true);
@@ -101,7 +101,7 @@ test('cheap model not allowed: refused before inference, the default model tags;
   t.chat(A, 6);
   t.indexer.emit('synced', A);
   await t.settle();
-  assert.deepEqual(llm.calls.map(c => c.model ?? null), ['anthropic/claude-haiku-4-5-20251001', null]);
+  assert.deepEqual(llm.calls.map(c => c.model ?? null), ['anthropic/claude-haiku-5-5', null]);
   assert.equal(t.tags.get(A).model, 'anthropic/claude-opus-5-5');
   const s = t.tagger.status();
   assert.equal(s.cheapModelRefused, true);
@@ -119,15 +119,15 @@ test('a cheap model whose provider fails falls through to the next one', async (
   const llm = { calls: [], async complete(p) {
     this.calls.push(p.model ?? null);
     if (p.model?.startsWith('anthropic/')) return { stopReason: 'error', errorMessage: 'No API key found for provider anthropic' };
-    return { text: reply(), provider: 'claude-cli', model: 'claude-haiku-4-5-20251001' };
+    return { text: reply(), provider: 'claude-cli', model: 'claude-haiku-5-5' };
   } };
   const t = setup({ llm });
   t.tagger.start();
   t.chat(A, 6);
   t.indexer.emit('synced', A);
   await t.settle();
-  assert.deepEqual(llm.calls, ['anthropic/claude-haiku-4-5-20251001', 'claude-cli/claude-haiku-4-5-20251001']);
-  assert.equal(t.tags.get(A).model, 'claude-cli/claude-haiku-4-5-20251001');
+  assert.deepEqual(llm.calls, ['anthropic/claude-haiku-5-5', 'anthropic/claude-haiku-5-5', 'claude-cli/claude-haiku-5-5']); // direct, agent runtime, next candidate
+  assert.equal(t.tags.get(A).model, 'claude-cli/claude-haiku-5-5');
   t.tagger.close();
 });
 
@@ -167,7 +167,7 @@ test('failures back off and show in status; a gateway reload is not a failure', 
   await t.settle();
   const row = t.tags.get(A);
   // Direct, then the isolated retry (createCompletion); never the pricier default.
-  assert.deepEqual([...new Set(llm.calls.map(c => c.model ?? null))], ['anthropic/claude-haiku-4-5-20251001'], 'transient: no fall-through to a pricier model');
+  assert.deepEqual([...new Set(llm.calls.map(c => c.model ?? null))], ['anthropic/claude-haiku-5-5'], 'transient: no fall-through to a pricier model');
   assert.equal(row.attempts, 1);
   assert.match(row.error, /rate limited/);
   assert.equal(t.tagger.status().failed, 1);
@@ -191,6 +191,40 @@ test('failures back off and show in status; a gateway reload is not a failure', 
   t.tagger.close(); u.tagger.close();
 });
 
+test("the owner's tag model (config, e.g. a gateway alias) is the only one asked for; a change applies to the next chat", async () => {
+  const llm = { calls: [], async complete(p) { this.calls.push(p.model ?? null); return { text: reply(), provider: 'anthropic', model: 'claude-haiku-5-5' }; } };
+  let configured = 'haiku';
+  const t = setup({ llm, model: () => configured });
+  t.tagger.start();
+  t.chat(A, 6);
+  t.indexer.emit('synced', A);
+  await t.settle();
+  assert.deepEqual(llm.calls, ['haiku']);
+  assert.equal(t.tags.get(A).model, 'anthropic/claude-haiku-5-5');
+  assert.equal(t.tagger.status().requestedModel, 'haiku');
+  configured = 'sonnet';
+  t.chat(B, 6);
+  t.indexer.emit('synced', B);
+  await t.settle();
+  assert.equal(llm.calls.at(-1), 'sonnet');
+  configured = null; // none configured: the built-in cheap models
+  assert.equal(t.tagger.status().requestedModel, 'anthropic/claude-haiku-5-5');
+  t.tagger.close();
+});
+
+test("the owner's tag model refused by the gateway: the default model tags, no built-in model is tried instead", async () => {
+  const refused = Object.assign(new Error('model override not allowed'), { code: 'LLM_COMPLETION_NOT_AUTHORIZED' });
+  const llm = fakeLlm(refused, reply());
+  const t = setup({ llm, model: () => 'haiku' });
+  t.tagger.start();
+  t.chat(A, 6);
+  t.indexer.emit('synced', A);
+  await t.settle();
+  assert.deepEqual(llm.calls.map(c => c.model ?? null), ['haiku', null]);
+  assert.equal(t.tagger.status().cheapModelRefused, true);
+  t.tagger.close();
+});
+
 test('model check: the first usable model is found once, before any chat is tagged', async () => {
   const refused = Object.assign(new Error('override not allowed'), { code: 'LLM_COMPLETION_NOT_AUTHORIZED' });
   const t = setup({ llm: fakeLlm(refused, '{}') });
@@ -202,10 +236,10 @@ test('model check: the first usable model is found once, before any chat is tagg
   await t.tagger.probe();
   assert.equal(t.llm.calls.length, calls, 'once');
   // A model this gateway doesn't know: the next candidate.
-  const unknown = { calls: [], async complete(p) { this.calls.push(p.model ?? null); if (p.model?.startsWith('anthropic/')) throw new Error('Unknown model: anthropic/claude-haiku-4-5-20251001'); return { text: '{}', provider: 'claude-cli', model: 'claude-haiku-4-5-20251001' }; } };
+  const unknown = { calls: [], async complete(p) { this.calls.push(p.model ?? null); if (p.model?.startsWith('anthropic/')) throw new Error('Unknown model: anthropic/claude-haiku-5-5'); return { text: '{}', provider: 'claude-cli', model: 'claude-haiku-5-5' }; } };
   const u = setup({ llm: unknown });
   await u.tagger.probe();
-  assert.equal(u.tagger.status().model, 'claude-cli/claude-haiku-4-5-20251001');
+  assert.equal(u.tagger.status().model, 'claude-cli/claude-haiku-5-5');
   assert.equal(u.tagger.status().cheapModelRefused, false);
 });
 

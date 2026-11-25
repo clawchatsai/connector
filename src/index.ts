@@ -23,6 +23,8 @@ import { registerHandoff as registerHandoffJs } from '../server/handoff.js';
 import { registerProgressReminder as registerProgressReminderJs, blockedLogLine } from '../server/progress-reminder.js';
 // @ts-expect-error server/ is plain JS without type declarations; the hook registers in register()
 import { registerProjectInstructions as registerProjectInstructionsJs } from '../server/project-instructions.js';
+// @ts-expect-error — server/tags/model.js is plain JS with no .d.ts
+import { tagsModelFromConfig } from '../server/tags/model.js';
 import type { PluginConfig } from './plugin-config.js';
 import { SignalingClient } from './signaling-client.js';
 // Lazy-imported after ensureNativeModules() builds the native binary.
@@ -516,6 +518,8 @@ async function runClawChats(ctx: PluginServiceContext, api: PluginApi): Promise<
     authToken:    process.env.CLAWCHATS_AUTH_TOKEN || '', // P2P: DataChannel is the auth boundary
     gatewayToken,  // For WS auth to local OpenClaw gateway
     llm:           api.runtime?.llm, // host-run completions (chat-title fallback, /api/title)
+    // Chat tags: the owner's model for them (plugins.entries.connector.config.tags.model; a gateway alias works).
+    tagsModel:     () => tagsModelFromConfig(api.config, PLUGIN_ID),
     progressCardReminder: () => _progressReminder, // /api/health: the browser explains a blocked reminder
     projectInstructions: () => _projectInstructions, // /api/health: Project settings says when instructions are inactive
     // Dashboard widgets: the gateway's sandbox listener (/api/gw-board reads its proxy shell there).

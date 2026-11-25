@@ -10,10 +10,12 @@
 // Input: the chat's text from the search index, so tagging never reads the gateway itself. Output:
 // the tag store (store.js, global.db), copied into the index (chat_meta) so search matches it.
 //
-// Model: a host-run completion (api.runtime.llm.complete, no session). A cheap model is asked for
-// first (CHEAP_MODELS); the gateway only allows that when the owner set
-// plugins.entries.connector.llm.allowModelOverride + allowedModels, otherwise the call is refused
-// before any inference and the gateway's default model is used. One chat at a time.
+// Model: a host-run completion (api.runtime.llm.complete, no session). The owner's choice comes first:
+// plugins.entries.connector.config.tags.model, any model ref the gateway resolves, including one of its
+// aliases (`haiku`), so a model upgrade is made in one place. Without it a cheap model is asked for
+// (CHEAP_MODELS). Either needs plugins.entries.connector.llm.allowModelOverride (+ allowedModels when the
+// owner restricts it), otherwise the call is refused before any inference and the gateway's default
+// model is used. One chat at a time.
 
 import { createCompletion } from '../controllers/title.js';
 import { SYSTEM_PROMPT, buildPrompt, condense, parseReply, estimateCost, isSubscription } from './model.js';
@@ -24,7 +26,7 @@ const REGROW_MIN = 10;
 const QUIET_MS = 2 * 60 * 1000;
 const SWEEP_MS = 10 * 60 * 1000;
 const GAP_MS = 1500;                       // between two completions
-const CHEAP_MODELS = ['anthropic/claude-haiku-4-5-20251001', 'claude-cli/claude-haiku-4-5-20251001'];
+const CHEAP_MODELS = ['anthropic/claude-haiku-5-5', 'claude-cli/claude-haiku-5-5'];
 const MODEL_RECHECK_MS = 6 * 60 * 60 * 1000; // a refused model is tried again after this
 const BACKOFF_MS = [5 * 60_000, 30 * 60_000, 3 * 60 * 60_000, 24 * 60 * 60_000];
 const backoffMs = attempts => BACKOFF_MS[Math.min(Math.max(attempts, 1) - 1, BACKOFF_MS.length - 1)];
@@ -47,11 +49,12 @@ export class Tagger {
    * @param {import('../search/store.js').SearchStore} o.search
    * @param {import('../search/indexer.js').SearchIndexer} o.indexer
    * @param {{ complete?: Function }} o.llm  api.runtime.llm
+   * @param {() => (string | null | undefined)} [o.model]  the owner's tag model (config), read at each call
    * @param {() => Array<{ key, summary, keywords, messages, taggedAt }>} [o.legacy]  pre-gateway summaries
    * @param {(frame: object) => void} [o.notify]
    */
-  constructor({ tags, search, indexer, llm, legacy = () => [], notify = () => {}, logger = console, now = () => Date.now(), quietMs = QUIET_MS, gapMs = GAP_MS, sweepMs = SWEEP_MS }) {
-    Object.assign(this, { tags, search, indexer, llm, legacy, notify, log: logger, now, quietMs, gapMs, sweepMs });
+  constructor({ tags, search, indexer, llm, model = () => null, legacy = () => [], notify = () => {}, logger = console, now = () => Date.now(), quietMs = QUIET_MS, gapMs = GAP_MS, sweepMs = SWEEP_MS }) {
+    Object.assign(this, { tags, search, indexer, llm, configuredModel: model, legacy, notify, log: logger, now, quietMs, gapMs, sweepMs });
     this.complete = typeof llm?.complete === 'function' ? createCompletion(llm, { systemPrompt: SYSTEM_PROMPT, purpose: 'clawchats.tags', maxTokens: 400 }) : null;
     this.timers = new Map();   // key -> debounce timer
     this.queue = new Set();
@@ -237,9 +240,18 @@ export class Tagger {
     return row;
   }
 
-  /** The completion on the first cheap model the gateway allows, else on its default model. */
+  /** The owner's tag model when one is configured, else the cheap models: asked for in this order. */
+  _candidates() {
+    let chosen = null;
+    try { chosen = this.configuredModel(); } catch { /* config unreadable: the built-in choice */ }
+    chosen = typeof chosen === 'string' ? chosen.trim() : '';
+    return chosen ? [chosen] : CHEAP_MODELS;
+  }
+
+  /** The completion on the first candidate the gateway allows, else on its default model. */
   async _complete(prompt) {
-    for (const model of CHEAP_MODELS) {
+    const candidates = this._candidates();
+    for (const model of candidates) {
       if (this._refused(model)) continue;
       try {
         const result = await this.complete(prompt, { model });
@@ -249,7 +261,7 @@ export class Tagger {
       } catch (e) {
         if (isLifecycle(e) || TRANSIENT_CODES.has(e?.code) || TRANSIENT.test(e?.message || '')) throw e; // retried later, same model
         // No override permission: refused before any inference, for every model.
-        if (e?.code === 'LLM_COMPLETION_NOT_AUTHORIZED') { for (const m of CHEAP_MODELS) this.refused.set(m, this.now()); }
+        if (e?.code === 'LLM_COMPLETION_NOT_AUTHORIZED') { for (const m of candidates) this.refused.set(m, this.now()); }
         else this.refused.set(model, this.now());
         this.log.info?.(`[tags] ${model} unavailable here (${e?.code || e?.message}); trying the next`);
       }
@@ -314,12 +326,13 @@ export class Tagger {
       if (r?.error) failed++;
     }
     const costs = [...rows.values()].filter(r => r.source === 'auto' && r.costUsd != null).sort((a, b) => b.taggedAt - a.taggedAt).slice(0, SAMPLE_COSTS);
-    const cheapModelRefused = CHEAP_MODELS.every(m => this._refused(m));
-    const model = this.lastModel || (cheapModelRefused ? null : CHEAP_MODELS[0]);
+    const candidates = this._candidates();
+    const cheapModelRefused = candidates.every(m => this._refused(m));
+    const model = this.lastModel || (cheapModelRefused ? null : candidates[0]);
     const costUsd = isSubscription(model) ? null : costs.length >= 3 ? costs.reduce((n, r) => n + r.costUsd, 0) / costs.length * history.length : estimateCost(history.map(c => c.chars || 0), model);
     return {
       enabled: this.enabled, available: !!this.complete,
-      model: this.lastModel, cheapModelRefused, subscription: isSubscription(model),
+      model: this.lastModel, requestedModel: candidates[0], cheapModelRefused, subscription: isSubscription(model),
       tagged, failed, waiting: this.queue.size, working: this.current,
       lastError: this.lastError,
       backfill: { state: this.backfill, chats: history.length, costUsd: costUsd == null ? null : Math.round(costUsd * 100) / 100 },

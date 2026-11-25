@@ -36,6 +36,15 @@ test('falls back to isolated agent-runtime mode when direct completion fails (CL
   assert.equal(calls[1].execution.mode, 'isolated-agent-runtime');
 });
 
+test('a direct completion that resolves with a provider error (no key, unreachable provider) also falls back to isolated mode', async () => {
+  const calls = [];
+  const handler = createTitleHandler({ complete: async p => { calls.push(p); return p.execution ? { text: 'Proxmox backups' } : { stopReason: 'error', errorMessage: 'connect ECONNREFUSED 127.0.0.1:18801' }; } });
+  const r = await call(handler, { message: 'hi there' });
+  assert.equal(r.body.title, 'Proxmox backups');
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].execution.mode, 'isolated-agent-runtime');
+});
+
 test('authorization failures are not retried; bad input is rejected', async () => {
   let n = 0;
   const handler = createTitleHandler({ complete: async () => { n++; throw Object.assign(new Error('denied'), { code: 'LLM_COMPLETION_NOT_AUTHORIZED' }); } });
