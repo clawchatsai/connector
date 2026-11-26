@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeTag, normalizeTags, condense, buildPrompt, parseReply, effectiveTags, estimateCost } from './model.js';
+import { normalizeTag, normalizeTags, condense, buildPrompt, parseReply, effectiveTags, estimateCost, tagsModelFromConfig } from './model.js';
 
 test('normalizeTag: one lowercase hyphenated token; noise and junk dropped', () => {
   assert.equal(normalizeTag('#Laser Show'), 'laser-show');
@@ -70,4 +70,14 @@ test('estimateCost: known cheap model priced, others unknown', () => {
   assert.equal(estimateCost([4000], 'anthropic/claude-opus-5-5'), null);
   assert.equal(estimateCost([4000], null), null);
   assert.equal(estimateCost([4000], 'claude-cli/claude-haiku-4-5-20251001'), null, 'subscription');
+});
+
+test('tagsModelFromConfig: the owner\'s tag model from the gateway config, else null', () => {
+  const cfg = model => ({ plugins: { entries: { connector: { config: { tags: { model } } } } } });
+  assert.equal(tagsModelFromConfig(cfg(' haiku '), 'connector'), 'haiku');
+  assert.equal(tagsModelFromConfig(cfg('anthropic/claude-haiku-5-5'), 'connector'), 'anthropic/claude-haiku-5-5');
+  assert.equal(tagsModelFromConfig(cfg(''), 'connector'), null);
+  assert.equal(tagsModelFromConfig(cfg(42), 'connector'), null);
+  assert.equal(tagsModelFromConfig({ plugins: { entries: { connector: { config: {} } } } }, 'connector'), null);
+  assert.equal(tagsModelFromConfig(undefined, 'connector'), null);
 });

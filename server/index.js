@@ -151,7 +151,7 @@ export function createApp(config = {}) {
   if (searchIndexer) {
     try {
       tagger = new Tagger({
-        tags: tagStore, search: searchStore, indexer: searchIndexer, llm: config.llm,
+        tags: tagStore, search: searchStore, indexer: searchIndexer, llm: config.llm, model: config.tagsModel,
         legacy: () => readLegacyThreadSummaries(DATA_DIR), notify: frame => broadcast(JSON.stringify(frame)),
       });
       tagger.start();

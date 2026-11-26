@@ -119,6 +119,15 @@ export function effectiveTags({ auto = [], added = [], removed = [] }) {
 // Per million tokens, for the backfill estimate before any chat was tagged (afterwards: measured cost).
 const PRICES = { 'claude-haiku-4-5': { input: 1, output: 5 } };
 
+/**
+ * The owner's model for tags from the gateway config (plugins.entries.<pluginId>.config.tags.model), or null.
+ * Any model ref the gateway resolves: `provider/model`, or one of its aliases (`haiku`).
+ */
+export function tagsModelFromConfig(cfg, pluginId) {
+  const model = cfg?.plugins?.entries?.[pluginId]?.config?.tags?.model;
+  return typeof model === 'string' && model.trim() ? model.trim() : null;
+}
+
 /** Whether `model` runs on a CLI subscription (no per-token price). */
 export const isSubscription = model => /^claude-cli\//.test(String(model || ''));
 
