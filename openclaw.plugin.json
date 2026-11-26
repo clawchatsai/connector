@@ -8,7 +8,7 @@
   },
   "reload": { "turnHandover": true },
   "contracts": {
-    "tools": ["handoff"]
+    "tools": ["handoff", "clawchats_link", "clawchats_messages"]
   },
   "configSchema": {
     "type": "object",

@@ -42,6 +42,7 @@ import { readLegacyThreadSummaries } from './store/legacy-threads.js';
 import { checkRepoDoc } from './peer/notes-sync.js';
 import { connectorVersion } from './peer/version.js';
 import { createHelperSessions } from './helper-sessions.js';
+import { createChatLinks } from './chat-link.js';
 import { send, sendError, parseBody, uuid, matchRoute, setCors } from './util/http.js';
 
 // PORT is passed via createApp(config.port); env var is read by plugin host (src/index.ts).
@@ -123,6 +124,13 @@ export function createApp(config = {}) {
   // approval-client connection stays up with no tab open, so approvals wait for an answer from the phone.
   const push = createPush({ dataDir: DATA_DIR, lens: gatewayClient.lens, request: gwRequest, gatewayId: () => config.peer?.gatewayId?.() || '', requestVapid: config.push?.requestVapid });
   gatewayClient.lens.onRow = (key, row) => push.notifier.noteRow(key, row);
+  // Chat links for agents (the clawchats_link tool): where the owner's ClawChats is served, as their browser reports it.
+  const chatLinks = createChatLinks({
+    dataDir: DATA_DIR,
+    gatewayId: () => config.peer?.gatewayId?.() || '',
+    sessionExists: async key => { try { return !!(await gatewayClient.request('sessions.describe', { key }, 5000))?.session; } catch { return null; } },
+    history: (key, page) => gatewayClient.request('chat.history', { sessionKey: key, maxBytes: 512 * 1024, ...page }, 10000),
+  });
   let releasePushApprovals = null;
   const syncPushApprovals = () => {
     const want = push.store.list().some(d => d.prefs.approvals);
@@ -293,6 +301,10 @@ export function createApp(config = {}) {
       // Settings & misc
       if (method === 'GET' && urlPath === '/api/settings') return handleGetSettings(req, res);
       if (method === 'PUT' && urlPath === '/api/settings') return await handleSaveSettings(req, res, parseBody);
+      if (method === 'PUT' && urlPath === '/api/app-base') {
+        const { base } = await parseBody(req);
+        return chatLinks.setBase(base) ? send(res, 200, { ok: true }) : sendError(res, 400, 'base must be an https app address ending in /');
+      }
       if (method === 'POST' && urlPath === '/api/transcribe') return await handleTranscribe(req, res, { openaiApiKey });
       if (method === 'GET' && urlPath === '/api/health') return send(res, 200, { ok: true, workspace: getWorkspaces().active, uptime: process.uptime(), progressCardReminder: config.progressCardReminder?.(), projectInstructions: config.projectInstructions?.() });
       if (method === 'GET' && urlPath === '/api/agents') return handleAgents(req, res);
@@ -572,6 +584,7 @@ export function createApp(config = {}) {
     projectInstructions,
     peerKey,
     push,
+    chatLinks,
     setupBrowserWs,
     debugLogger,
     dataDir: DATA_DIR,
