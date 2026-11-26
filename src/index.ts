@@ -19,6 +19,8 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 // @ts-expect-error server/ is plain JS without type declarations; imported statically because tools register in register()
 import { registerHandoff as registerHandoffJs } from '../server/handoff.js';
+// @ts-expect-error server/ is plain JS without type declarations; the tool registers in register()
+import { registerChatLink as registerChatLinkJs } from '../server/chat-link.js';
 // @ts-expect-error server/ is plain JS without type declarations; the hook registers in register()
 import { registerProgressReminder as registerProgressReminderJs, blockedLogLine } from '../server/progress-reminder.js';
 // @ts-expect-error server/ is plain JS without type declarations; the hook registers in register()
@@ -92,6 +94,8 @@ interface AppInstance {
     acceptsPeer: (shareId: string, requesterGatewayId: string) => boolean;
   } | null;
   peerKey: { publicKey: string; fingerprint: string; sign: (data: string) => string };
+  /** Chat links (server/chat-link.js): the clawchats_link tool's app base and link builder. */
+  chatLinks: unknown;
 }
 
 /**
@@ -1798,6 +1802,9 @@ const plugin: OpenClawPluginDefinition = {
 
     // `handoff` agent tool: a HANDOFF_* secret piped once into a local command (owner turns only)
     (registerHandoffJs as (a: PluginApi, o: { stateDir: string }) => void)(api, { stateDir: stateRoot() });
+
+    // `clawchats_link` agent tool: a link that opens a chat in ClawChats (server/chat-link.js)
+    (registerChatLinkJs as (a: PluginApi, get: () => unknown) => void)(api, () => app?.chatLinks ?? null);
 
     // Progress-card reminder for claude-cli chats, which OpenClaw doesn't remind (opt-in: allowConversationAccess)
     _progressReminder = (registerProgressReminderJs as (a: PluginApi, id: string) => string)(api, PLUGIN_ID);
